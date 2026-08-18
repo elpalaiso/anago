@@ -22,7 +22,7 @@
 - [x] `proto.rs`: 컨트롤 API 타입 정의 — JoinRequest/JoinResponse/PeerInfo/PeersResponse/ApiError — 필드 확정만
 - [x] `proto.rs`: 각 타입의 to_json/from_json 구현 + 라운드트립·누락 필드·타입 불일치 유닛 테스트
 - [x] `subnet.rs` 확장: CIDR 문자열 파싱(`10.100.0.0/24`), 서버 주소(.1) 계산, 잘못된 CIDR 거부 — 기존 `next_free_octet`과 결합한 할당 함수 + 유닛 테스트
-- [ ] `code.rs`: 조인 코드 형식(`CODE-XXXX` 문자열 규약, 혼동 문자 제외 charset) 정의 + 형식 검증 함수 + 유닛 테스트 (난수 생성은 바이너리 책임, 코어는 형식/검증만)
+- [x] `code.rs`: 조인 코드 형식(`XXXX-XXXX` 문자열 규약 — DESIGN §7.2, 혼동 문자 제외 charset) 정의 + 형식 검증 함수 + 유닛 테스트 (난수 생성은 바이너리 책임, 코어는 형식/검증만)
 - [ ] `code.rs`: 코드 수명 판정 순수 함수 — `is_valid(code, issued_at, now, ttl, used)` 형태로 만료·1회용 소진을 판정 + 경계값 유닛 테스트
 - [ ] `name.rs`: 기기 이름 검증/정규화(길이, 허용 문자, 소문자화 등) + 상태 내 중복 판정 + 유닛 테스트
 - [ ] `token.rs`: 기기 토큰 형식 검증 + 상수시간 비교 함수 + 유닛 테스트 (해싱은 A단계 결정에 따라 바이너리 측)
@@ -49,7 +49,7 @@
 - [ ] 서버 wg 인터페이스 반영: 상태 변경 시 서버 wg 설정 재생성 + `wg syncconf`(또는 wg-quick) 적용, `ip_forward` 확인/안내
 - [ ] `anago server init` 조립: 키쌍 생성 → 상태 파일 초기 생성 → DNS 수동 안내 출력(A 레코드 문구, 서버 공인 IP 조회는 실패해도 진행) → 방화벽 체크리스트(:443, :51820/udp) → 첫 조인 코드 출력
 - [ ] `--no-systemd` 포그라운드 실행 경로 + systemd 유닛 파일 생성/설치(유닛 텍스트 생성은 순수 함수 + 유닛 테스트)
-- [ ] `anago code`: 서버 로컬에서 상태 파일에 코드 발급·저장·출력(`anago join <domain> CODE-XXXX` 형태로 복붙 가능하게)
+- [ ] `anago code`: 서버 로컬에서 상태 파일에 코드 발급·저장·출력(`anago join <domain> 7QX4-M2KD` 형태로 복붙 가능하게 — 형식은 DESIGN §7.2)
 
 ## E. 클라이언트 — join / ls / rm
 

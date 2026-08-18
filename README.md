@@ -13,7 +13,7 @@ anago server init --domain net.example.com
 # → 조인 코드 출력
 
 # 각 기기에서 (1회)
-anago join net.example.com CODE-XXXX
+anago join net.example.com 7QX4-M2KD
 anago ls
 ping 10.100.0.2        # 어디에 있든 기기끼리 연결
 ```

@@ -457,7 +457,7 @@ mod tests {
     #[test]
     fn join_carries_a_public_key_and_answers_with_a_token() {
         let request = JoinRequest {
-            code: "CODE-7QX4".to_string(),
+            code: "7QX4-M2KD".to_string(),
             name: "맥북".to_string(),
             public_key: "SERVERkey+abc/def=".to_string(),
         };
@@ -517,7 +517,7 @@ mod tests {
 
     fn sample_join_request() -> JoinRequest {
         JoinRequest {
-            code: "CODE-7QX4".to_string(),
+            code: "7QX4-M2KD".to_string(),
             name: "맥북".to_string(),
             public_key: "aGVsbG8gd2c=".to_string(),
         }
@@ -593,6 +593,13 @@ mod tests {
     }
 
     #[test]
+    fn the_sample_code_is_a_real_join_code() {
+        // Keeps these fixtures from drifting away from the format
+        // `code.rs` enforces (DESIGN.md §7.2).
+        assert!(crate::code::JoinCode::parse(&sample_join_request().code).is_ok());
+    }
+
+    #[test]
     fn every_error_code_survives_a_round_trip() {
         for code in ALL_CODES {
             let error = ApiError::new(code, "boom");
@@ -614,7 +621,7 @@ mod tests {
         // rename here is a protocol change, so it has to be visible.
         assert_eq!(
             json::to_string(&sample_join_request().to_json()),
-            r#"{"code":"CODE-7QX4","name":"맥북","public_key":"aGVsbG8gd2c="}"#
+            r#"{"code":"7QX4-M2KD","name":"맥북","public_key":"aGVsbG8gd2c="}"#
         );
         assert_eq!(
             json::to_string(&ApiError::new(ErrorCode::Unauthorized, "no token").to_json()),
@@ -625,7 +632,7 @@ mod tests {
     #[test]
     fn missing_fields_name_the_field() {
         let body = Value::obj([
-            ("code", Value::str("CODE-7QX4")),
+            ("code", Value::str("7QX4-M2KD")),
             ("name", Value::str("맥북")),
         ]);
         let e = JoinRequest::from_json(&body).unwrap_err();
@@ -652,7 +659,7 @@ mod tests {
     fn type_mismatches_are_rejected_not_coerced() {
         // A number where a string belongs must not become "51820".
         let body = Value::obj([
-            ("code", Value::str("CODE-7QX4")),
+            ("code", Value::str("7QX4-M2KD")),
             ("name", Value::Int(51820)),
             ("public_key", Value::str("aGVsbG8gd2c=")),
         ]);
@@ -668,7 +675,7 @@ mod tests {
 
         // null is a value, not an absent field.
         let body = Value::obj([
-            ("code", Value::str("CODE-7QX4")),
+            ("code", Value::str("7QX4-M2KD")),
             ("name", Value::Null),
             ("public_key", Value::str("aGVsbG8gd2c=")),
         ]);
