@@ -8,6 +8,7 @@ pub mod json;
 pub mod name;
 pub mod proto;
 pub mod subnet;
+pub mod token;
 
 #[cfg(test)]
 mod tests {
