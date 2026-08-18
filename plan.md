@@ -38,7 +38,7 @@
 - [x] CLI 디스패치와 도움말: `server init|status`, `code`, `join`, `ls`, `rm` 라우팅 + M0 미구현 서브커맨드의 명확한 안내 문구
 - [x] 경로 해석 씸: 서버 `/var/lib/anago/`, 클라 `~/.config/anago/`, `/etc/wireguard/anago.conf` — env/HOME 의존부를 순수 함수(입력으로 받은 base 경로)로 분리 + 유닛 테스트
 - [x] 파일 유틸: 원자적 쓰기(tmp+rename), 0600 퍼미션 설정(unix), flock 기반 상태 파일 잠금 — 임시 디렉터리 대상 테스트
-- [ ] `wg`/`wg-quick` 래퍼: 존재 확인과 설치 안내(맥 brew / 리눅스 배포판), `wg genkey`/`wg pubkey` 호출로 키쌍 생성 (커맨드 조립부는 순수 함수로 분리해 테스트)
+- [x] `wg`/`wg-quick` 래퍼: 존재 확인과 설치 안내(맥 brew / 리눅스 배포판), `wg genkey`/`wg pubkey` 호출로 키쌍 생성 (커맨드 조립부는 순수 함수로 분리해 테스트)
 
 ## D. 서버 — 컨트롤 플레인
 

@@ -17,6 +17,8 @@ mod cli;
 mod fsutil;
 #[allow(dead_code)]
 mod paths;
+#[allow(dead_code)]
+mod wg;
 
 use cli::Command;
 
