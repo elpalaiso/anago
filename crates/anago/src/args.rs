@@ -22,10 +22,13 @@ pub enum FlagKind {
 }
 
 /// One flag a command accepts.
+///
+/// Long names only. The two single-letter forms anago has, `-h` and
+/// `-V`, are answered before parsing (see `cli::parse`), so there is no
+/// alias machinery here to keep in sync.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Flag {
     pub name: &'static str,
-    pub short: Option<char>,
     pub kind: FlagKind,
 }
 
@@ -33,7 +36,6 @@ impl Flag {
     pub fn boolean(name: &'static str) -> Flag {
         Flag {
             name,
-            short: None,
             kind: FlagKind::Boolean,
         }
     }
@@ -41,15 +43,8 @@ impl Flag {
     pub fn value(name: &'static str) -> Flag {
         Flag {
             name,
-            short: None,
             kind: FlagKind::Value,
         }
-    }
-
-    /// Adds a single-letter alias: `-h` for `--help`.
-    pub fn short(mut self, short: char) -> Flag {
-        self.short = Some(short);
-        self
     }
 }
 
@@ -171,16 +166,8 @@ fn is_flag_like(arg: &str) -> bool {
 }
 
 fn find_flag<'a>(spec: &'a [Flag], token: &str) -> Option<&'a Flag> {
-    if let Some(name) = token.strip_prefix("--") {
-        return spec.iter().find(|flag| flag.name == name);
-    }
-    let short = token.strip_prefix('-')?;
-    let mut chars = short.chars();
-    let (letter, rest) = (chars.next()?, chars.next());
-    if rest.is_some() {
-        return None; // `-abc` bundles are not a thing here.
-    }
-    spec.iter().find(|flag| flag.short == Some(letter))
+    let name = token.strip_prefix("--")?;
+    spec.iter().find(|flag| flag.name == name)
 }
 
 /// Why the command line could not be read.
@@ -229,8 +216,6 @@ mod tests {
             Flag::value("subnet"),
             Flag::value("port"),
             Flag::boolean("no-systemd"),
-            Flag::boolean("help").short('h'),
-            Flag::boolean("version").short('V'),
         ]
     }
 
@@ -273,12 +258,15 @@ mod tests {
     }
 
     #[test]
-    fn short_aliases_work_where_they_are_declared() {
-        assert!(parse(&["-h"]).unwrap().is_set("help"));
-        assert!(parse(&["-V"]).unwrap().is_set("version"));
-        // Undeclared shorts and bundles are not invented.
+    fn single_dash_tokens_are_unknown_flags() {
+        // `-h`/`-V` never reach the parser; anything else short is a
+        // typo rather than an alias this module should invent.
         assert_eq!(parse(&["-x"]), Err(ArgError::Unknown("-x".to_string())));
         assert_eq!(parse(&["-hV"]), Err(ArgError::Unknown("-hV".to_string())));
+        assert_eq!(
+            parse(&["-domain"]),
+            Err(ArgError::Unknown("-domain".to_string()))
+        );
     }
 
     #[test]
