@@ -3,6 +3,7 @@
 //! (DESIGN.md §4 principle 4). The binary crate is a thin shell around
 //! these pure functions.
 
+pub mod json;
 pub mod subnet;
 
 #[cfg(test)]
