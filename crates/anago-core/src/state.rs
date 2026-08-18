@@ -5,6 +5,10 @@
 //! definition. The binary supplies the atomic write and the lock; what
 //! it gets from core is text in, value out.
 //!
+//! The transitions the server performs on it — redeeming a code to
+//! register a device, removing one — are here too, as functions that
+//! either change the whole state or none of it.
+//!
 //! Decoding validates every field against the rules of the type that
 //! owns it — a subnet through [`Subnet`], a name through
 //! [`DeviceName`], a hash through [`TokenHash`]. Unknown fields are
@@ -14,10 +18,10 @@
 use std::fmt;
 use std::net::Ipv4Addr;
 
-use crate::code::{IssuedCode, JoinCode};
+use crate::code::{CodeStatus, IssuedCode, JoinCode};
 use crate::json::{self, Object, Value};
-use crate::name::DeviceName;
-use crate::proto::{self, DecodeError};
+use crate::name::{self, DeviceName};
+use crate::proto::{self, DecodeError, ErrorCode};
 use crate::subnet::Subnet;
 use crate::token::TokenHash;
 
@@ -346,6 +350,125 @@ impl fmt::Display for StateError {
 }
 
 impl std::error::Error for StateError {}
+
+// -------------------------------------------------------- transitions
+
+/// What a device offers when it registers: the code it was given, the
+/// name it wants, its wg public key, and the hash of the token the
+/// server is about to hand it (§7.1 — the plaintext is never stored).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Registration {
+    pub code: JoinCode,
+    pub name: DeviceName,
+    pub public_key: String,
+    pub token_hash: TokenHash,
+}
+
+/// Why a registration was turned down.
+///
+/// The server answers all of these with one `invalid_code`/`name_taken`
+/// on the wire via [`JoinRejection::error_code`]; the detail is for its
+/// own log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JoinRejection {
+    /// No code by that name was ever issued here.
+    UnknownCode,
+    /// The code exists but cannot be redeemed now.
+    CodeNotUsable(CodeStatus),
+    /// Another device already answers to that name.
+    NameTaken,
+    /// Every host address in the subnet is handed out.
+    SubnetFull,
+}
+
+impl JoinRejection {
+    /// The wire code for this rejection. Every code-related refusal
+    /// collapses to `invalid_code`: telling an unauthenticated caller
+    /// whether a code was unknown, spent, or merely late only helps
+    /// them probe (§8).
+    pub fn error_code(&self) -> ErrorCode {
+        match self {
+            JoinRejection::UnknownCode | JoinRejection::CodeNotUsable(_) => ErrorCode::InvalidCode,
+            JoinRejection::NameTaken => ErrorCode::NameTaken,
+            JoinRejection::SubnetFull => ErrorCode::SubnetFull,
+        }
+    }
+}
+
+impl fmt::Display for JoinRejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            JoinRejection::UnknownCode => write!(f, "no such join code"),
+            JoinRejection::CodeNotUsable(status) => write!(f, "join code is {status}"),
+            JoinRejection::NameTaken => write!(f, "a device with that name is already registered"),
+            JoinRejection::SubnetFull => write!(f, "no free address left in the subnet"),
+        }
+    }
+}
+
+impl ServerState {
+    /// The device registered under `name`, if any.
+    pub fn peer(&self, name: &DeviceName) -> Option<&Peer> {
+        self.peers.iter().find(|peer| peer.name == *name)
+    }
+
+    /// Redeems a join code and registers a device: allocates the lowest
+    /// free address, marks the code used at `now`, and appends the peer.
+    ///
+    /// All or nothing. A rejection leaves the state byte-identical — in
+    /// particular a name collision does **not** burn the code, because
+    /// the person's next move is to retry with another name and they
+    /// would find their code gone.
+    pub fn add_peer(
+        &mut self,
+        registration: Registration,
+        now: i64,
+    ) -> Result<Peer, JoinRejection> {
+        let index = self
+            .codes
+            .iter()
+            .position(|issued| issued.code == registration.code)
+            .ok_or(JoinRejection::UnknownCode)?;
+        let status = self.codes[index].status(now);
+        if !status.is_usable() {
+            return Err(JoinRejection::CodeNotUsable(status));
+        }
+        if name::is_taken(
+            self.peers.iter().map(|peer| peer.name.as_str()),
+            &registration.name,
+        ) {
+            return Err(JoinRejection::NameTaken);
+        }
+        let used: Vec<Ipv4Addr> = self.peers.iter().map(|peer| peer.address).collect();
+        let address = self
+            .subnet
+            .allocate(&used)
+            .ok_or(JoinRejection::SubnetFull)?;
+
+        // Past every check: now the state may change.
+        self.codes[index].used_at = Some(now);
+        let peer = Peer {
+            name: registration.name,
+            public_key: registration.public_key,
+            address,
+            token_hash: registration.token_hash,
+            created_at: now,
+            last_seen: None,
+        };
+        self.peers.push(peer.clone());
+        Ok(peer)
+    }
+
+    /// Removes a device, returning what was removed — `None` if no such
+    /// name, so `anago rm typo` can say so instead of reporting success.
+    ///
+    /// Its address goes back into the pool for the next join, and its
+    /// token dies with it: nothing is left to match against (§7.1).
+    pub fn remove_peer(&mut self, name: &DeviceName) -> Option<Peer> {
+        let index = self.peers.iter().position(|peer| peer.name == *name)?;
+        Some(self.peers.remove(index))
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -684,5 +807,237 @@ mod tests {
         // The state file itself does carry the key — that is the point
         // of 0600 — so serialization still writes it.
         assert!(state.to_json_string().contains("cHJpdmF0ZSBrZXk="));
+    }
+
+    // --------------------------------------------------- transitions
+
+    fn device(name: &str) -> DeviceName {
+        DeviceName::parse(name).unwrap()
+    }
+
+    fn registration(code: &str, name: &str) -> Registration {
+        Registration {
+            code: JoinCode::parse(code).unwrap(),
+            name: device(name),
+            public_key: format!("{name}-key"),
+            token_hash: hash("ef"),
+        }
+    }
+
+    /// A server with one live code and no devices yet.
+    fn fresh() -> ServerState {
+        let mut state = empty();
+        state.codes = vec![IssuedCode::issue(
+            JoinCode::parse("7QX4-M2KD").unwrap(),
+            NOW,
+            DEFAULT_TTL_SECS,
+        )];
+        state
+    }
+
+    #[test]
+    fn a_join_allocates_an_address_and_spends_the_code() {
+        let mut state = fresh();
+        let peer = state
+            .add_peer(registration("7QX4-M2KD", "macbook"), NOW + 5)
+            .unwrap();
+
+        assert_eq!(peer.address, ip("10.100.0.2"));
+        assert_eq!(peer.name, device("macbook"));
+        assert_eq!(peer.created_at, NOW + 5);
+        assert_eq!(peer.last_seen, None);
+        assert_eq!(state.peers, vec![peer.clone()]);
+        assert_eq!(state.peer(&device("macbook")), Some(&peer));
+
+        // The code is spent, and spent codes stay in the file (§9.1).
+        assert_eq!(state.codes[0].used_at, Some(NOW + 5));
+        assert_eq!(state.codes[0].status(NOW + 6), CodeStatus::Used);
+        assert_eq!(state.codes.len(), 1);
+    }
+
+    #[test]
+    fn a_second_device_gets_the_next_address() {
+        let mut state = fresh();
+        state.codes.push(IssuedCode::issue(
+            JoinCode::parse("HJKM-NPQR").unwrap(),
+            NOW,
+            DEFAULT_TTL_SECS,
+        ));
+        state
+            .add_peer(registration("7QX4-M2KD", "macbook"), NOW)
+            .unwrap();
+        let second = state
+            .add_peer(registration("HJKM-NPQR", "데스크톱"), NOW)
+            .unwrap();
+        assert_eq!(second.address, ip("10.100.0.3"));
+        assert_eq!(state.peers.len(), 2);
+    }
+
+    #[test]
+    fn one_code_registers_one_device() {
+        let mut state = fresh();
+        state
+            .add_peer(registration("7QX4-M2KD", "macbook"), NOW)
+            .unwrap();
+        // Same code again: single use, so it is spent now.
+        assert_eq!(
+            state.add_peer(registration("7QX4-M2KD", "desktop"), NOW),
+            Err(JoinRejection::CodeNotUsable(CodeStatus::Used))
+        );
+        assert_eq!(state.peers.len(), 1);
+    }
+
+    #[test]
+    fn an_unknown_or_expired_code_registers_nothing() {
+        let mut state = fresh();
+        assert_eq!(
+            state.add_peer(registration("HJKM-NPQR", "macbook"), NOW),
+            Err(JoinRejection::UnknownCode)
+        );
+        // The code exists but its 15 minutes are up.
+        assert_eq!(
+            state.add_peer(registration("7QX4-M2KD", "macbook"), NOW + DEFAULT_TTL_SECS),
+            Err(JoinRejection::CodeNotUsable(CodeStatus::Expired))
+        );
+        assert!(state.peers.is_empty());
+        assert_eq!(state.codes[0].used_at, None);
+    }
+
+    #[test]
+    fn a_duplicate_name_is_refused_without_burning_the_code() {
+        let mut state = fresh();
+        state
+            .add_peer(registration("7QX4-M2KD", "macbook"), NOW)
+            .unwrap();
+        state.codes.push(IssuedCode::issue(
+            JoinCode::parse("HJKM-NPQR").unwrap(),
+            NOW,
+            DEFAULT_TTL_SECS,
+        ));
+
+        let before = state.clone();
+        assert_eq!(
+            state.add_peer(registration("HJKM-NPQR", "MacBook"), NOW),
+            Err(JoinRejection::NameTaken)
+        );
+        // Byte-identical: the retry with another name must still work.
+        assert_eq!(state, before);
+        assert_eq!(state.codes[1].used_at, None);
+
+        let peer = state
+            .add_peer(registration("HJKM-NPQR", "macbook-2"), NOW)
+            .unwrap();
+        assert_eq!(peer.address, ip("10.100.0.3"));
+    }
+
+    #[test]
+    fn a_full_subnet_refuses_the_join_and_keeps_the_code() {
+        let mut state = fresh();
+        state.peers = (2..=254)
+            .map(|octet| Peer {
+                name: device(&format!("device-{octet}")),
+                public_key: format!("key-{octet}"),
+                address: ip(&format!("10.100.0.{octet}")),
+                token_hash: hash("ab"),
+                created_at: NOW,
+                last_seen: None,
+            })
+            .collect();
+        assert_eq!(state.peers.len(), 253);
+
+        let before = state.clone();
+        assert_eq!(
+            state.add_peer(registration("7QX4-M2KD", "one-too-many"), NOW),
+            Err(JoinRejection::SubnetFull)
+        );
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn rejections_carry_the_wire_code_the_server_answers_with() {
+        // Nothing about *which* way a code failed reaches the caller.
+        assert_eq!(
+            JoinRejection::UnknownCode.error_code(),
+            ErrorCode::InvalidCode
+        );
+        assert_eq!(
+            JoinRejection::CodeNotUsable(CodeStatus::Expired).error_code(),
+            ErrorCode::InvalidCode
+        );
+        assert_eq!(
+            JoinRejection::CodeNotUsable(CodeStatus::Used).error_code(),
+            ErrorCode::InvalidCode
+        );
+        assert_eq!(JoinRejection::NameTaken.error_code(), ErrorCode::NameTaken);
+        assert_eq!(
+            JoinRejection::SubnetFull.error_code(),
+            ErrorCode::SubnetFull
+        );
+
+        assert_eq!(JoinRejection::UnknownCode.to_string(), "no such join code");
+        assert_eq!(
+            JoinRejection::CodeNotUsable(CodeStatus::Expired).to_string(),
+            "join code is expired"
+        );
+    }
+
+    #[test]
+    fn removing_a_device_frees_its_address() {
+        let mut state = fresh();
+        state.codes.push(IssuedCode::issue(
+            JoinCode::parse("HJKM-NPQR").unwrap(),
+            NOW,
+            DEFAULT_TTL_SECS,
+        ));
+        let first = state
+            .add_peer(registration("7QX4-M2KD", "macbook"), NOW)
+            .unwrap();
+
+        let removed = state.remove_peer(&device("macbook")).unwrap();
+        assert_eq!(removed, first);
+        assert!(state.peers.is_empty());
+        assert_eq!(state.peer(&device("macbook")), None);
+
+        // .2 is free again for the next device.
+        let next = state
+            .add_peer(registration("HJKM-NPQR", "desktop"), NOW)
+            .unwrap();
+        assert_eq!(next.address, ip("10.100.0.2"));
+    }
+
+    #[test]
+    fn removing_a_name_that_is_not_there_changes_nothing() {
+        let mut state = sample();
+        let before = state.clone();
+        assert_eq!(state.remove_peer(&device("phone")), None);
+        assert_eq!(state, before);
+
+        // Only the named device goes.
+        assert_eq!(
+            state.remove_peer(&device("macbook")).unwrap().address,
+            ip("10.100.0.2")
+        );
+        assert_eq!(state.peers.len(), 1);
+        assert_eq!(state.peers[0].name, device("맥북"));
+    }
+
+    #[test]
+    fn a_state_survives_a_round_trip_after_transitions() {
+        let mut state = fresh();
+        state
+            .add_peer(registration("7QX4-M2KD", "macbook"), NOW)
+            .unwrap();
+        state.remove_peer(&device("macbook"));
+        state.codes.push(IssuedCode::issue(
+            JoinCode::parse("HJKM-NPQR").unwrap(),
+            NOW,
+            DEFAULT_TTL_SECS,
+        ));
+        state
+            .add_peer(registration("HJKM-NPQR", "맥북"), NOW + 1)
+            .unwrap();
+
+        let text = state.to_json_string();
+        assert_eq!(ServerState::parse(&text).unwrap(), state);
     }
 }

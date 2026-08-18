@@ -27,7 +27,7 @@
 - [x] `name.rs`: 기기 이름 검증/정규화(길이, 허용 문자, 소문자화 등) + 상태 내 중복 판정 + 유닛 테스트
 - [x] `token.rs`: 기기 토큰 형식 검증 + 상수시간 비교 함수 + 유닛 테스트 (해싱은 A단계 결정에 따라 바이너리 측)
 - [x] `state.rs`: 서버 상태 모델(서브넷, 서버 키쌍, 포트, 도메인, 피어 목록, 발급 코드) 타입 정의 + json.rs 기반 직렬화/역직렬화 + 라운드트립 유닛 테스트
-- [ ] `state.rs`: 상태 전이 순수 함수 — `add_peer`(IP 할당·이름 중복·코드 소진 반영), `remove_peer` + 유닛 테스트(중복 이름, 서브넷 소진, 없는 이름 제거)
+- [x] `state.rs`: 상태 전이 순수 함수 — `add_peer`(IP 할당·이름 중복·코드 소진 반영), `remove_peer` + 유닛 테스트(중복 이름, 서브넷 소진, 없는 이름 제거)
 - [ ] `wgconf.rs`: 서버측 wg 설정 생성 순수 함수(`[Interface]` + 피어별 `[Peer]`, AllowedIPs = /32) + 스냅샷 유닛 테스트
 - [ ] `wgconf.rs`: 클라이언트측 wg 설정 생성 순수 함수(Address, PrivateKey 자리, 서버 Peer: 공개키·엔드포인트·`AllowedIPs = <subnet>`·`PersistentKeepalive = 25`) + 유닛 테스트
 - [ ] `render.rs`: `anago ls` 출력 표 렌더링 순수 함수(이름·IP·공개키 축약·마지막 핸드셰이크 표기, 빈 목록 처리) + 유닛 테스트
