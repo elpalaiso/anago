@@ -6,6 +6,7 @@
 pub mod acme;
 pub mod code;
 pub mod dns;
+pub mod dnswire;
 pub mod json;
 pub mod name;
 pub mod proto;

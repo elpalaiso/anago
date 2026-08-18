@@ -19,6 +19,10 @@ mod cli;
 mod client;
 mod code;
 mod diagnostics;
+// Watching for a DNS-01 record to be served. Used by the ACME slice
+// that lands next, alongside `cfapi`'s challenge record.
+#[allow(dead_code)]
+mod dnsprobe;
 mod init;
 mod join;
 mod ls;

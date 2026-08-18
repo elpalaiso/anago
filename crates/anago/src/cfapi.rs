@@ -28,6 +28,7 @@ use std::fmt;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
+use anago_core::acme;
 use anago_core::dns::{self, Record, Refusal, Upsert};
 
 use crate::client::{self, Body, ClientError, HeaderValue, Method, Request};
@@ -357,6 +358,14 @@ pub struct Zone {
     pub name: String,
     /// `active` when Cloudflare is actually serving this zone's DNS.
     pub status: String,
+    /// The nameservers Cloudflare answers for this zone with.
+    ///
+    /// Carried because a DNS-01 challenge has to be watched at the
+    /// servers that will actually be asked — Cloudflare's own API can
+    /// only say that it stored the record (`dnsprobe`). Empty when the
+    /// answer did not name any, which leaves the wait blind rather than
+    /// failing it.
+    pub name_servers: Vec<String>,
 }
 
 /// The names to ask about, most specific first (§6.1).
@@ -415,6 +424,7 @@ pub fn parse_zones(status: u16, body: &str) -> Result<Vec<Zone>, CfError> {
                 id: string_at(zone, "id", "zone", status)?,
                 name: string_at(zone, "name", "zone", status)?,
                 status: string_at(zone, "status", "zone", status)?,
+                name_servers: name_servers_at(zone),
             })
         })
         .collect()
@@ -601,6 +611,7 @@ pub fn parse_records(status: u16, body: &str, name: &str) -> Result<Vec<Record>,
             id: string_at(item, "id", "record", status)?,
             content: string_at(item, "content", "record", status)?,
             proxied: proxied_at(item, &kind, status)?,
+            comment: comment_at(item),
             kind,
         });
     }
@@ -615,8 +626,41 @@ pub fn parse_record(status: u16, body: &str) -> Result<Record, CfError> {
         id: string_at(&result, "id", "record", status)?,
         content: string_at(&result, "content", "record", status)?,
         proxied: proxied_at(&result, &kind, status)?,
+        comment: comment_at(&result),
         kind,
     })
+}
+
+/// The zone's nameservers, when the answer names them.
+///
+/// Missing is not an error: a zone that Cloudflare has not taken over
+/// yet has none, and that case is already refused for being inactive.
+/// What is here only decides whether the DNS-01 wait can see anything.
+fn name_servers_at(zone: &serde_json::Value) -> Vec<String> {
+    zone.get("name_servers")
+        .and_then(serde_json::Value::as_array)
+        .map(|servers| {
+            servers
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A record's comment, if it has a usable one.
+///
+/// Absent, `null`, and empty are one thing here — no marker — because
+/// what the caller asks is "did anago write this?", and all three
+/// answer no.
+fn comment_at(record: &serde_json::Value) -> Option<String> {
+    record
+        .get("comment")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|comment| !comment.is_empty())
+        .map(str::to_string)
 }
 
 /// The one spelling of a DNS name anago sends and compares.
@@ -841,15 +885,7 @@ pub fn apply_record(
     // "spelled differently".
     let name = dns_name(name)?;
     let authorization = token.header().map_err(CfError::Client)?;
-    let listed = client::send(&Request {
-        method: Method::Get,
-        host: API_HOST,
-        port: 443,
-        path: &records_query(zone_id, &name),
-        body: None,
-        authorization: Some(&authorization),
-    })
-    .map_err(CfError::Client)?;
+    let listed = get(&authorization, &records_query(zone_id, &name))?;
     let records = parse_records(listed.status, &listed.body, &name)?;
 
     match dns::decide(&records, desired, cached_id) {
@@ -910,6 +946,324 @@ fn write_record(
     })
     .map_err(CfError::Client)?;
     parse_record(response.status, &response.body)
+}
+
+// ------------------------------------------- DNS-01 challenge record
+
+/// TTL for a challenge record. Sixty seconds, because the record is
+/// created, checked, and deleted within a few minutes and a long TTL
+/// only means a resolver holds an answer that no longer exists.
+pub const CHALLENGE_TTL: i64 = 60;
+
+/// The name a DNS-01 challenge goes on, in the spelling anago sends.
+pub fn challenge_name(domain: &str) -> Result<String, CfError> {
+    dns_name(&acme::dns01_record_name(&dns_name(domain)?))
+}
+
+/// What anago writes at the start of every challenge record's comment.
+///
+/// The marker is what makes cleanup **specific**. DNS-01 puts several
+/// TXT values on one name legitimately — a wildcard order and a plain
+/// one validating at the same time is the documented case — so a record
+/// at `_acme-challenge.<domain>` is not anago's by virtue of being
+/// there, and deleting it on that basis would break somebody else's
+/// issuance mid-flight.
+///
+/// A comment rather than a tag: record comments are available on every
+/// Cloudflare plan, and tags are not.
+pub const CHALLENGE_MARKER: &str = "anago DNS-01 challenge";
+
+/// How long a challenge record can be in use before anago is willing to
+/// call one **its own** litter.
+///
+/// The marker alone cannot say that. It proves anago wrote the record,
+/// not that the run which wrote it has finished with it — and two
+/// anago runs on one zone is not exotic: the renewal timer firing while
+/// somebody types `server renew` is exactly it. Sweeping on the marker
+/// alone means the second run deletes the first run's live challenge
+/// and fails its issuance.
+///
+/// So a record is swept only once it is older than any run could still
+/// be using it. Ten minutes is generous for a wait capped at a minute
+/// plus a validation measured in seconds, and short enough that litter
+/// does not outlive the next renewal.
+pub const CHALLENGE_LIFETIME_SECS: i64 = 10 * 60;
+
+/// The comment for a record published now.
+///
+/// The time is in the comment because it is the one place anago can
+/// keep it and read it back without a date parser: Cloudflare's own
+/// `created_on` is RFC 3339, and anago has no library that reads one
+/// (§10.2). The process id is there for a person reading the dashboard
+/// and wondering what left it; nothing reads it back.
+pub fn challenge_comment(now: i64) -> String {
+    format!("{CHALLENGE_MARKER} at={now} pid={}", std::process::id())
+}
+
+/// When anago wrote a record, from its comment.
+///
+/// `None` means "cannot tell" — a comment anago did not write, or one
+/// somebody has edited. Cleanup treats that as a record to leave alone,
+/// the same way it treats a stranger's.
+pub fn written_at(comment: &str) -> Option<i64> {
+    if !comment.starts_with(CHALLENGE_MARKER) {
+        return None;
+    }
+    comment
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("at="))
+        .and_then(|stamp| stamp.parse().ok())
+}
+
+/// The body that publishes a challenge.
+pub fn txt_body(name: &str, value: &str, now: i64) -> String {
+    serde_json::json!({
+        "type": "TXT",
+        "name": name,
+        "content": value,
+        "ttl": CHALLENGE_TTL,
+        "comment": challenge_comment(now),
+    })
+    .to_string()
+}
+
+/// The records a sweep removes: TXT records **anago wrote**.
+///
+/// Not "everything at the name". Several TXT values on one
+/// `_acme-challenge` name is a documented, ordinary state — Let's
+/// Encrypt names validating a wildcard and a non-wildcard order at the
+/// same time — so another client's challenge is not a conflict to
+/// resolve, it is somebody's certificate mid-issue. Deleting it would
+/// break their validation and anago would never know it had.
+///
+/// What anago does have to remove is its own litter: a run that died
+/// between creating a record and deleting it leaves one behind, nobody
+/// else is coming for it, and the id was deliberately not kept in the
+/// state file so that the next run finds these by looking rather than
+/// by inheriting a ghost (§9.1). Left alone they accumulate, and
+/// [Let's Encrypt rejects the answer once it grows too
+/// big](https://letsencrypt.org/docs/challenge-types/#dns-01-challenge)
+/// — so the cleanup matters, and so does its aim.
+///
+/// Two things have to be true, and the second is the one that is easy
+/// to miss:
+///
+/// 1. **anago wrote it** — [`CHALLENGE_MARKER`]. A record with no
+///    comment, or somebody else's, is left where it is: leaving one
+///    costs a stale record that does not stop this validation, and
+///    removing one costs a stranger their certificate.
+/// 2. **No anago run can still be using it** —
+///    [`CHALLENGE_LIFETIME_SECS`]. The marker says who wrote the
+///    record, not whether they are done with it, and two anago runs on
+///    one zone is an ordinary Tuesday: the renewal timer fires while
+///    somebody is typing `server renew`. Sweeping on the marker alone,
+///    the second run deletes the first's live challenge and fails its
+///    issuance — a stranger's certificate broken by the rule that was
+///    written to protect it, except the stranger is us.
+///
+/// A record whose comment carries no readable time is left alone. Not
+/// being able to tell how old something is, is not a reason to delete
+/// it.
+pub fn stale_challenges(records: &[Record], now: i64) -> Vec<&Record> {
+    records
+        .iter()
+        .filter(|record| is_txt(record) && past_lifetime(record, now))
+        .collect()
+}
+
+fn past_lifetime(record: &Record, now: i64) -> bool {
+    record
+        .comment
+        .as_deref()
+        .and_then(written_at)
+        .is_some_and(|written| now.saturating_sub(written) > CHALLENGE_LIFETIME_SECS)
+}
+
+fn is_txt(record: &Record) -> bool {
+    record.kind.eq_ignore_ascii_case("TXT")
+}
+
+/// A published DNS-01 challenge record, which removes itself.
+///
+/// The point of the type is the [`Drop`]: between publishing a record
+/// and validating a certificate there are a dozen ways out — an ACME
+/// error, a timeout, `?` three calls down, a panic — and every one of
+/// them must still take the record with it. A record left behind is a
+/// TXT entry on a person's domain that nothing will ever come back for.
+///
+/// [`Challenge::remove`] is the ordinary way out, and it reports what
+/// went wrong. `Drop` is the one that cannot report anything, so it
+/// says its piece on stderr and carries on: by then the run is already
+/// failing, and a cleanup error is not the news.
+pub struct Challenge<'a> {
+    token: &'a Token,
+    zone_id: String,
+    name: String,
+    /// `None` once the record is gone — the disarmed state, so `Drop`
+    /// after an explicit [`Challenge::remove`] does nothing.
+    record_id: Option<String>,
+}
+
+impl<'a> Challenge<'a> {
+    /// Sweeps anago's own leftovers at the name, then publishes (§9.1).
+    ///
+    /// The sweep comes first on purpose, and it is deliberately narrow:
+    /// a leftover record does not stop this validation — an ACME server
+    /// accepts the name if *any* TXT on it matches — so the reason to
+    /// remove one is that nothing else ever will. That reason applies
+    /// only to records anago wrote **and** is long since done with; a
+    /// challenge another run published a minute ago is neither. See
+    /// [`stale_challenges`].
+    ///
+    /// Two runs of anago on one zone still want serializing at a higher
+    /// level — the issuance slice takes a lock, so the renewal timer
+    /// and a hand-typed `server renew` do not both order certificates
+    /// (§9.1). The rule here is what keeps the *records* safe when they
+    /// overlap anyway, on this host or another.
+    ///
+    /// **Human verification needed**: these calls need a real zone.
+    pub fn publish(
+        token: &'a Token,
+        zone_id: &str,
+        domain: &str,
+        value: &str,
+        now: i64,
+    ) -> Result<Challenge<'a>, CfError> {
+        let name = challenge_name(domain)?;
+        let authorization = token.header().map_err(CfError::Client)?;
+
+        let listed = get(&authorization, &records_query(zone_id, &name))?;
+        let records = parse_records(listed.status, &listed.body, &name)?;
+        for stale in stale_challenges(&records, now) {
+            delete_record(&authorization, zone_id, &stale.id)?;
+        }
+
+        let created = write_record(
+            &authorization,
+            Method::Post,
+            &records_path(zone_id),
+            &txt_body(&name, value, now),
+        )?;
+        Ok(Challenge {
+            token,
+            zone_id: zone_id.to_string(),
+            name,
+            record_id: Some(created.id),
+        })
+    }
+
+    /// `_acme-challenge.<domain>`, as published.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Removes the record and says so if it could not.
+    ///
+    /// **The guard is disarmed only by a delete that worked.** Taking
+    /// the id first and then failing would be the worst of both ways
+    /// out: the record is still there, `Drop` has nothing left to try,
+    /// and the warning naming the record to delete by hand never
+    /// prints. A failure here leaves the challenge armed, so the `Drop`
+    /// at the end of this call tries once more and, if that fails too,
+    /// says which record was left behind.
+    ///
+    /// **Human verification needed**: needs a real zone.
+    pub fn remove(mut self) -> Result<(), CfError> {
+        let Some(record_id) = self.record_id.clone() else {
+            return Ok(());
+        };
+        let removed = self
+            .token
+            .header()
+            .map_err(CfError::Client)
+            .and_then(|authorization| delete_record(&authorization, &self.zone_id, &record_id));
+        self.settle(removed)
+    }
+
+    /// Disarms the guard if — and only if — the record is gone.
+    ///
+    /// Split out from [`Challenge::remove`] so that the rule can be
+    /// tested without a network: which of the two states this leaves
+    /// behind is the whole contract.
+    fn settle(&mut self, removed: Result<(), CfError>) -> Result<(), CfError> {
+        if removed.is_ok() {
+            self.record_id = None;
+        }
+        removed
+    }
+}
+
+impl Drop for Challenge<'_> {
+    fn drop(&mut self) {
+        let Some(record_id) = self.record_id.take() else {
+            return;
+        };
+        let removed = self
+            .token
+            .header()
+            .map_err(CfError::Client)
+            .and_then(|authorization| delete_record(&authorization, &self.zone_id, &record_id));
+        if let Err(e) = removed {
+            eprintln!("anago: warning: the DNS-01 challenge record could not be removed: {e}");
+            eprintln!(
+                "       delete the TXT record {record_id} at {} in the Cloudflare dashboard; \
+                 nothing needs it after validation",
+                self.name
+            );
+        }
+    }
+}
+
+impl fmt::Debug for Challenge<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Challenge")
+            .field("name", &self.name)
+            .field("record_id", &self.record_id)
+            .finish()
+    }
+}
+
+/// Deletes one record, and treats "it is not there" as done.
+///
+/// A cleanup path that fails because the thing it wanted gone is
+/// already gone is a cleanup path people learn to ignore.
+fn delete_record(
+    authorization: &HeaderValue,
+    zone_id: &str,
+    record_id: &str,
+) -> Result<(), CfError> {
+    let response = client::send(&Request {
+        method: Method::Delete,
+        host: API_HOST,
+        port: 443,
+        path: &record_path(zone_id, record_id),
+        body: None,
+        authorization: Some(authorization),
+    })
+    .map_err(CfError::Client)?;
+    parse_delete(response.status, &response.body)
+}
+
+/// Reads a delete answer. 404 is success — see [`delete_record`].
+pub fn parse_delete(status: u16, body: &str) -> Result<(), CfError> {
+    if status == 404 {
+        return Ok(());
+    }
+    parse_result(status, body)?;
+    Ok(())
+}
+
+/// One GET, with the two error conversions every caller here repeats.
+fn get(authorization: &HeaderValue, path: &str) -> Result<client::Response, CfError> {
+    client::send(&Request {
+        method: Method::Get,
+        host: API_HOST,
+        port: 443,
+        path,
+        body: None,
+        authorization: Some(authorization),
+    })
+    .map_err(CfError::Client)
 }
 
 /// The line that explains why the manual DNS step is still there (§6.1).
@@ -1660,9 +2014,15 @@ mod tests {
                 id: "023e105f4ecef8ad9ca31a8372d0c353".to_string(),
                 name: "example.com".to_string(),
                 status: "active".to_string(),
+                name_servers: vec![
+                    "tim.ns.cloudflare.com".to_string(),
+                    "walt.ns.cloudflare.com".to_string(),
+                ],
             }]
         );
-        // And the fields around it — nameservers, meta, result_info —
+        // The nameservers come along because a DNS-01 challenge has to
+        // be watched at the servers that will actually be asked. The
+        // fields around them — meta, result_info, development_mode —
         // are none of anago's business.
         assert_eq!(pick(zones, "example.com").unwrap().unwrap().id.len(), 32);
     }
@@ -1700,11 +2060,13 @@ mod tests {
                 id: "z1".to_string(),
                 name: "example.com".to_string(),
                 status: "active".to_string(),
+                name_servers: Vec::new(),
             },
             Zone {
                 id: "z2".to_string(),
                 name: "example.com".to_string(),
                 status: "active".to_string(),
+                name_servers: Vec::new(),
             },
         ];
         let error = pick(zones, "example.com").unwrap_err();
@@ -1894,6 +2256,7 @@ mod tests {
                     kind: "TXT".to_string(),
                     content: "v=spf1 -all".to_string(),
                     proxied: false,
+                    comment: None,
                 },
             ]
         );
@@ -2169,6 +2532,245 @@ mod tests {
         }
         .to_string()
         .contains("DNS only"));
+    }
+
+    // --------------------------------------------- DNS-01 challenge
+
+    /// A key authorization digest: base64url of a SHA-256, 43 chars.
+    const DIGEST: &str = "toxT9dGLhpBGCM3EhdcQoULLTuF-eqAaOJyBBnA_AbY";
+    const CHALLENGE: &str = "_acme-challenge.net.example.com";
+
+    fn txt_record(id: &str, content: &str) -> String {
+        record_json(id, "TXT", CHALLENGE, content, "")
+    }
+
+    fn commented_txt(id: &str, content: &str, comment: &str) -> String {
+        record_json(id, "TXT", CHALLENGE, content, "")
+            .replace(r#""ttl":1,"#, &format!(r#""ttl":1,"comment":"{comment}","#))
+    }
+
+    #[test]
+    fn the_challenge_goes_on_the_name_rfc_8555_names() {
+        assert_eq!(challenge_name("NET.Example.com.").unwrap(), CHALLENGE);
+        // The same ASCII rule as every other name anago sends.
+        assert!(matches!(
+            challenge_name("맥북.example.com"),
+            Err(CfError::NotAscii(_))
+        ));
+    }
+
+    #[test]
+    fn the_challenge_record_is_a_short_lived_txt() {
+        // Created, checked, and deleted within minutes — a long TTL
+        // only means a resolver holds an answer that is already gone.
+        let body: serde_json::Value =
+            serde_json::from_str(&txt_body(CHALLENGE, DIGEST, NOW)).unwrap();
+        assert_eq!(body["type"], "TXT");
+        assert_eq!(body["name"], CHALLENGE);
+        assert_eq!(body["content"], DIGEST);
+        assert_eq!(body["ttl"], CHALLENGE_TTL);
+        const { assert!(CHALLENGE_TTL <= 300, "a challenge record is not a fixture") };
+    }
+
+    /// A fixed "now" for the sweep tests, and the ages around it.
+    const NOW: i64 = 1_755_561_600;
+    const LIVE: i64 = NOW - 30;
+    const LITTER: i64 = NOW - CHALLENGE_LIFETIME_SECS - 60;
+
+    #[test]
+    fn a_sweep_removes_anagos_own_leftovers_and_leaves_the_rest_alone() {
+        // Several TXT values on one _acme-challenge name is a state
+        // DNS-01 documents, not a conflict: a wildcard order and a
+        // plain one validate at the same time. So "everything at this
+        // name" is somebody's certificate mid-issue, and the marker is
+        // what makes cleanup specific.
+        let records = parse_records(
+            200,
+            &listing(&[
+                commented_txt(
+                    "t1",
+                    "left-over-from-a-crashed-run",
+                    &challenge_comment(LITTER),
+                ),
+                txt_record("t2", "another-clients-challenge"),
+                commented_txt("t3", "someones-verification", "google-site-verification"),
+                record_json("a1", "A", CHALLENGE, HUB_IP, r#""proxied":false,"#),
+            ]),
+            CHALLENGE,
+        )
+        .unwrap();
+
+        let swept: Vec<&str> = stale_challenges(&records, NOW)
+            .iter()
+            .map(|record| record.id.as_str())
+            .collect();
+        assert_eq!(swept, ["t1"], "only the record anago wrote");
+        // The cost of leaving one is a stale record that does not stop
+        // this validation; the cost of removing one is a stranger's
+        // failed issuance.
+        for spared in ["t2", "t3", "a1"] {
+            assert!(
+                !swept.contains(&spared),
+                "{spared} is not anago's to delete"
+            );
+        }
+    }
+
+    #[test]
+    fn a_challenge_another_run_is_still_using_is_not_litter() {
+        // The renewal timer firing while somebody types `server renew`
+        // is an ordinary Tuesday. The marker says anago wrote the
+        // record, not that anago is done with it — sweeping on the
+        // marker alone, the second run deletes the first's live
+        // challenge and fails its issuance.
+        let records = parse_records(
+            200,
+            &listing(&[
+                commented_txt("live", "the-other-runs-digest", &challenge_comment(LIVE)),
+                commented_txt("old", "a-dead-runs-digest", &challenge_comment(LITTER)),
+            ]),
+            CHALLENGE,
+        )
+        .unwrap();
+
+        let swept: Vec<&str> = stale_challenges(&records, NOW)
+            .iter()
+            .map(|record| record.id.as_str())
+            .collect();
+        assert_eq!(swept, ["old"]);
+
+        // The boundary itself: a record exactly at the lifetime is
+        // still somebody's, one second past it is not.
+        let at_the_edge = parse_records(
+            200,
+            &listing(&[commented_txt(
+                "edge",
+                "d",
+                &challenge_comment(NOW - CHALLENGE_LIFETIME_SECS),
+            )]),
+            CHALLENGE,
+        )
+        .unwrap();
+        assert!(stale_challenges(&at_the_edge, NOW).is_empty());
+        assert_eq!(stale_challenges(&at_the_edge, NOW + 1).len(), 1);
+    }
+
+    #[test]
+    fn a_record_whose_age_cannot_be_read_is_left_alone() {
+        // Not being able to tell how old something is, is not a reason
+        // to delete it — including a stamp from the future, which is a
+        // clock that disagrees rather than a record that is finished.
+        let records = parse_records(
+            200,
+            &listing(&[
+                commented_txt("edited", "d", CHALLENGE_MARKER),
+                commented_txt("nonsense", "d", &format!("{CHALLENGE_MARKER} at=soon")),
+                commented_txt("future", "d", &challenge_comment(NOW + 3600)),
+            ]),
+            CHALLENGE,
+        )
+        .unwrap();
+        assert!(stale_challenges(&records, NOW).is_empty());
+    }
+
+    #[test]
+    fn a_published_challenge_carries_the_marker_and_the_time() {
+        // Without both on the way in, the sweep above has nothing to
+        // aim at: no marker and the litter is permanent, no time and it
+        // cannot tell litter from a challenge in use.
+        let body: serde_json::Value =
+            serde_json::from_str(&txt_body(CHALLENGE, DIGEST, NOW)).unwrap();
+        let comment = body["comment"].as_str().unwrap();
+        assert!(comment.starts_with(CHALLENGE_MARKER), "{comment}");
+        assert_eq!(written_at(comment), Some(NOW));
+        assert!(comment.contains("pid="), "{comment}");
+        assert!(comment.len() <= 100, "Cloudflare caps a comment: {comment}");
+
+        // And it survives the round trip: what Cloudflare hands back is
+        // what the next run reads.
+        let written = parse_record(
+            200,
+            &single(commented_txt("t1", DIGEST, &challenge_comment(LITTER))),
+        )
+        .unwrap();
+        assert_eq!(
+            written_at(written.comment.as_deref().unwrap()),
+            Some(LITTER)
+        );
+        assert_eq!(stale_challenges(&[written], NOW)[0].id, "t1");
+    }
+
+    #[test]
+    fn a_comment_that_is_not_anagos_has_no_time_to_read() {
+        assert_eq!(written_at("google-site-verification at=1"), None);
+        assert_eq!(written_at(""), None);
+    }
+
+    #[test]
+    fn deleting_a_record_that_is_already_gone_is_not_a_failure() {
+        // A cleanup path that fails because the thing it wanted gone is
+        // already gone is a cleanup path people learn to ignore.
+        assert_eq!(
+            parse_delete(404, r#"{"success":false,"errors":[]}"#),
+            Ok(())
+        );
+        assert_eq!(
+            parse_delete(200, r#"{"success":true,"errors":[],"result":{"id":"t1"}}"#),
+            Ok(())
+        );
+        // A permission problem still is one.
+        let refused = parse_delete(403, r#"{"success":false,"errors":[{"message":"no"}]}"#);
+        assert!(matches!(refused, Err(CfError::Forbidden(_))));
+        assert!(refused
+            .unwrap_err()
+            .to_string()
+            .contains("Zone → DNS → Edit"));
+    }
+
+    #[test]
+    fn only_a_delete_that_worked_disarms_the_cleanup() {
+        // The failure this protects: take the id first, then fail, and
+        // the record is still there while `Drop` has nothing left to
+        // try and the warning naming it never prints — the one path
+        // the whole guard exists for, gone silently.
+        let token = Token::parse("cf-api-token", Source::Flag).unwrap();
+        let mut challenge = Challenge {
+            token: &token,
+            zone_id: ZONE.to_string(),
+            name: CHALLENGE.to_string(),
+            record_id: Some("t1".to_string()),
+        };
+
+        let failed = challenge.settle(Err(CfError::Forbidden("nope".to_string())));
+        assert!(failed.is_err());
+        assert_eq!(
+            challenge.record_id.as_deref(),
+            Some("t1"),
+            "a failed delete leaves the record to be tried again and reported"
+        );
+
+        assert!(challenge.settle(Ok(())).is_ok());
+        assert_eq!(
+            challenge.record_id, None,
+            "a delete that worked is not tried twice"
+        );
+        assert_eq!(challenge.name(), CHALLENGE);
+        // No id, so no call — this drop is a no-op, network or not.
+        drop(challenge);
+    }
+
+    #[test]
+    fn a_challenge_never_prints_the_token() {
+        let token = Token::parse("cf-api-token", Source::Flag).unwrap();
+        let challenge = Challenge {
+            token: &token,
+            zone_id: ZONE.to_string(),
+            name: CHALLENGE.to_string(),
+            record_id: None,
+        };
+        let shown = format!("{challenge:?}");
+        assert!(!shown.contains("cf-api-token"), "{shown}");
+        assert!(shown.contains(CHALLENGE), "{shown}");
     }
 
     #[test]

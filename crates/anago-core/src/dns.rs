@@ -31,6 +31,16 @@ pub struct Record {
     pub content: String,
     /// Whether the orange cloud is on.
     pub proxied: bool,
+    /// The record's comment, as Cloudflare stores it.
+    ///
+    /// Nothing in the judgement below reads it. It is here because it
+    /// is the only way a caller can tell **its own** records from
+    /// somebody else's at the same name: DNS-01 puts several TXT values
+    /// on one name legitimately (a wildcard and a non-wildcard order at
+    /// once), so "everything at this name" is not a safe thing to
+    /// delete, and a marker written at creation is what makes cleanup
+    /// specific rather than destructive.
+    pub comment: Option<String>,
 }
 
 impl Record {
@@ -41,6 +51,7 @@ impl Record {
             kind: "A".to_string(),
             content: content.into(),
             proxied: false,
+            comment: None,
         }
     }
 
@@ -243,6 +254,7 @@ mod tests {
             kind: kind.to_string(),
             content: content.to_string(),
             proxied: false,
+            comment: None,
         }
     }
 
