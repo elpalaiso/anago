@@ -171,12 +171,80 @@ anago rm <이름>                    # 기기 제거 (서버 반영)
 
 ## 9. 서버 상태와 설정
 
-- 상태: `/var/lib/anago/state.json` — 서브넷, 서버 키쌍, 피어 목록
-  (이름·공개키·IP·토큰 해시·마지막 sync), 발급된 조인 코드. 단일 파일,
-  원자적 쓰기(tmp+rename). DB 없음.
-- 인증서: `/var/lib/anago/tls/` (ACME 계정·인증서·키).
-- 클라: `~/.config/anago/`(도메인·기기 토큰), wg 설정은
-  `/etc/wireguard/anago.conf`(wg-quick 규약 위임).
+- 상태: `/var/lib/anago/state.json` — 단일 파일, 원자적 쓰기
+  (tmp+rename), 0600, 동시 쓰기는 flock으로 직렬화. DB 없음.
+- 인증서: M0는 `--tls-cert/--tls-key`로 받은 **기존 인증서 경로를
+  상태에 기록만** 한다(파일은 복사하지 않는다). M1의 ACME 발급물은
+  `/var/lib/anago/tls/`(계정·인증서·키).
+- 클라: `~/.config/anago/device.json`(도메인·기기 토큰·할당 IP·서버
+  공개키), 0600. wg 개인키는 여기 두지 않는다 — wg 설정
+  `/etc/wireguard/anago.conf`(wg-quick 규약 위임)에만 있고 기기를
+  떠나지 않는다.
+
+### 9.1 M0 상태 파일 스키마
+
+`version`은 1로 고정한다. **읽을 때 `version`이 1이 아니면 에러로
+중단**(구버전 바이너리가 신버전 상태를 덮어쓰는 사고 방지), 모르는
+필드는 무시한다. 시각은 전부 **Unix epoch 초(정수)** — 미니 JSON에
+날짜 파싱을 들이지 않기 위해서다.
+
+```json
+{
+  "version": 1,
+  "domain": "net.example.com",
+  "subnet": "10.100.0.0/24",
+  "listen_port": 51820,
+  "api_port": 443,
+  "tls_cert_path": "/etc/ssl/anago/fullchain.pem",
+  "tls_key_path": "/etc/ssl/anago/privkey.pem",
+  "server": {
+    "private_key": "<wg base64>",
+    "public_key": "<wg base64>",
+    "address": "10.100.0.1"
+  },
+  "peers": [
+    {
+      "name": "macbook",
+      "public_key": "<wg base64>",
+      "address": "10.100.0.2",
+      "token_hash": "<§7의 M0 결정에 따른 문자열>",
+      "created_at": 1755500000,
+      "last_seen": 1755500600
+    }
+  ],
+  "codes": [
+    {
+      "code": "CODE-XXXX",
+      "issued_at": 1755499000,
+      "expires_at": 1755499900,
+      "used_at": null
+    }
+  ]
+}
+```
+
+| 필드 | 타입 | 의미 |
+|---|---|---|
+| `version` | 정수 | 스키마 버전. M0 = 1. 불일치는 에러 |
+| `domain` | 문자열 | `server init --domain` 값. 클라 엔드포인트 조립에 사용 |
+| `subnet` | 문자열 | CIDR. M0는 /24만 허용 |
+| `listen_port` | 정수 | wg UDP 포트(기본 51820) |
+| `api_port` | 정수 | 컨트롤 API TCP 포트(기본 443) |
+| `tls_cert_path` / `tls_key_path` | 문자열 | M0에서 지정받은 인증서·키 경로 |
+| `server.private_key` / `public_key` | 문자열 | 서버 wg 키쌍(`wg genkey`/`wg pubkey` 산출물, base64) |
+| `server.address` | 문자열 | 서버 사설 IP = 서브넷의 .1 |
+| `peers[]` | 배열 | 등록 기기. 이름은 유일(§8 `rm`의 키) |
+| `peers[].token_hash` | 문자열 | 기기 토큰 검증값. 형식·해시 여부는 §7에서 확정 |
+| `peers[].created_at` | 정수 | join 성공 시각 |
+| `peers[].last_seen` | 정수 \| null | 마지막 인증된 API 호출 시각. 아직 없으면 null |
+| `codes[]` | 배열 | 발급된 조인 코드. 소진·만료된 항목도 감사 목적으로 남긴다 |
+| `codes[].used_at` | 정수 \| null | 소진 시각. null이면 미사용 |
+
+M0에는 `endpoint`·`last_handshake` 필드가 **없다**. 허브-스포크에서
+기기 엔드포인트는 서버가 wg 커널에서 관측하는 값이고(`anago ls`는
+`wg show`에서 읽는다), 기기 관측 엔드포인트 보고는 M2의
+`/api/v1/endpoint`가 생길 때 스키마와 함께 들어온다. 그때
+`version`을 올린다.
 
 ## 10. 기술 스택
 
@@ -187,8 +255,42 @@ anago rm <이름>                    # 기기 제거 (서버 반영)
 | ACME | instant-acme (또는 동급) | HTTP-01 기본, DNS-01(Cloudflare) 지원 |
 | Cloudflare | 얇은 REST 호출 (reqwest 없이 가능하면 hyper 직접) | A 레코드 upsert + DNS-01 TXT |
 | wg 제어 | `wg`/`wg-quick` CLI 래핑 | 위임 원칙. boringtun 내장은 백로그(비-커널 환경) |
-| 직렬화 | serde + serde_json | 바이너리 크레이트에만 |
+| 직렬화 | **anago-core의 수제 미니 JSON (순수 std)** | serde 미사용 — §10.1 |
 | anago-core | 순수 std | 설정 생성·IP 할당·코드 검증·프로토콜 타입 — 전부 순수 함수로 유닛 테스트 |
+
+### 10.1 직렬화 결정: serde를 쓰지 않는다
+
+**anago의 프로토콜 타입과 서버 상태 파일은 anago-core에 넣은 수제
+미니 JSON 인코더/파서(순수 std)로 직렬화한다. serde·serde_json은
+쓰지 않는다.**
+
+이유는 하나다. §4 원칙 4와 §8이 "스키마의 원본은 anago-core의 타입"
+이라고 못박았는데 core는 순수 std라 serde를 쓸 수 없다. 그러면 남는
+선택지는 (a) 타입을 core와 바이너리에 이중으로 두고 손으로 동기화
+하거나, (b) 스키마 원본을 바이너리로 옮겨 원칙 4를 깨거나, (c) core
+안에서 직렬화까지 끝내는 것뿐이다. (a)는 두 정의가 어긋나는 순간
+프로토콜이 조용히 깨지고, (b)는 원본 위치를 뒤집는 설계 변경이다.
+(c)를 고른다: 필요한 JSON 표면이 작고(위 스키마 + §8의 4개 타입),
+전부 순수 함수라 유닛 테스트가 그대로 게이트가 된다.
+
+미니 JSON의 지원 범위를 좁게 고정한다 — 범용 JSON 라이브러리를
+만들 생각이 없다:
+
+- 값: 객체·배열·문자열·정수·불·널. **부동소수는 지원하지 않는다**
+  (소수점·지수 표기는 파싱 에러). 스키마에 실수가 필요해지면 이
+  문서를 먼저 고친다.
+- 정수는 `u64`/`i64` 범위. 범위를 넘으면 에러.
+- 문자열은 UTF-8, `\u` 이스케이프 디코딩 지원. 출력은 필요한 문자만
+  이스케이프.
+- 객체의 중복 키는 에러(마지막 값 채택 같은 조용한 처리 금지).
+- 출력은 **결정적**이다: 필드는 타입에 선언된 순서로 나간다. 상태
+  파일은 사람이 읽고 고칠 수 있게 2칸 들여쓰기, API 응답은 압축 형식.
+
+serde가 다시 논의되는 경우는 하나뿐이다: M1에서 ACME·Cloudflare의
+**제3자 JSON 스키마**를 다뤄야 할 때. 그건 남의 스키마이고 바이너리
+크레이트에만 필요하므로 이 결정과 충돌하지 않는다 — 그때 가서
+바이너리 의존성으로 추가할지 판단한다. anago 자신의 프로토콜·상태가
+serde로 넘어가는 일은 없다.
 
 ## 11. 마일스톤
 
