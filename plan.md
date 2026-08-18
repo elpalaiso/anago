@@ -20,7 +20,7 @@
 - [x] `json.rs`: 최소 JSON 값 타입 + 파서(객체/배열/문자열/숫자/불/널, 이스케이프 처리) — 파싱 유닛 테스트
 - [x] `json.rs`: JSON 직렬화(문자열 이스케이프, 결정적 키 순서) + 라운드트립 유닛 테스트, 잘못된 입력에 대한 에러 케이스 테스트
 - [x] `proto.rs`: 컨트롤 API 타입 정의 — JoinRequest/JoinResponse/PeerInfo/PeersResponse/ApiError — 필드 확정만
-- [ ] `proto.rs`: 각 타입의 to_json/from_json 구현 + 라운드트립·누락 필드·타입 불일치 유닛 테스트
+- [x] `proto.rs`: 각 타입의 to_json/from_json 구현 + 라운드트립·누락 필드·타입 불일치 유닛 테스트
 - [ ] `subnet.rs` 확장: CIDR 문자열 파싱(`10.100.0.0/24`), 서버 주소(.1) 계산, 잘못된 CIDR 거부 — 기존 `next_free_octet`과 결합한 할당 함수 + 유닛 테스트
 - [ ] `code.rs`: 조인 코드 형식(`CODE-XXXX` 문자열 규약, 혼동 문자 제외 charset) 정의 + 형식 검증 함수 + 유닛 테스트 (난수 생성은 바이너리 책임, 코어는 형식/검증만)
 - [ ] `code.rs`: 코드 수명 판정 순수 함수 — `is_valid(code, issued_at, now, ttl, used)` 형태로 만료·1회용 소진을 판정 + 경계값 유닛 테스트
