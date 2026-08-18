@@ -138,6 +138,40 @@ pub fn parse_key(output: &str) -> Result<String, WgError> {
     }
 }
 
+/// One peer line from `wg show <iface> dump`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DumpPeer {
+    pub public_key: String,
+    /// Unix seconds of the last handshake; `None` for wg's `0`, which
+    /// means "never".
+    pub last_handshake: Option<i64>,
+}
+
+/// Parses `wg show <iface> dump`.
+///
+/// Tab-separated, one peer per line, with the interface itself on the
+/// first line — which is why that line is skipped rather than parsed as
+/// a peer with a very short key. Lines that do not fit the shape are
+/// ignored: a future wg that adds a column should not break `anago ls`.
+pub fn parse_dump(text: &str) -> Vec<DumpPeer> {
+    text.lines()
+        .skip(1)
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            let public_key = fields.next()?;
+            // preshared key, endpoint, allowed ips, then the handshake.
+            let handshake: i64 = fields.nth(3)?.trim().parse().ok()?;
+            if public_key.is_empty() {
+                return None;
+            }
+            Some(DumpPeer {
+                public_key: public_key.to_string(),
+                last_handshake: (handshake > 0).then_some(handshake),
+            })
+        })
+        .collect()
+}
+
 /// Which install instructions to print.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
@@ -458,6 +492,36 @@ mod tests {
             message,
             "expected a WireGuard key (44 base64 characters), got 53 characters"
         );
+    }
+
+    #[test]
+    fn a_dump_yields_one_entry_per_peer() {
+        // Real shape: interface line first, then peers, tab separated.
+        let text = "\
+c2VydmVyIHByaXZhdGU=\tc2VydmVyIHB1YmxpYw==\t51820\toff
+bWFjYm9vaw==\t(none)\t203.0.113.9:44321\t10.100.0.2/32\t1755500600\t1024\t2048\t25
+ZGVza3RvcA==\t(none)\t(none)\t10.100.0.3/32\t0\t0\t0\toff
+";
+        let peers = parse_dump(text);
+        assert_eq!(peers.len(), 2, "the interface line is not a peer");
+        assert_eq!(peers[0].public_key, "bWFjYm9vaw==");
+        assert_eq!(peers[0].last_handshake, Some(1_755_500_600));
+        // wg prints 0 for a peer it has never heard from.
+        assert_eq!(peers[1].public_key, "ZGVza3RvcA==");
+        assert_eq!(peers[1].last_handshake, None);
+    }
+
+    #[test]
+    fn a_dump_that_does_not_fit_is_skipped_rather_than_guessed_at() {
+        assert!(parse_dump("").is_empty());
+        // Interface line only.
+        assert!(parse_dump("priv\tpub\t51820\toff\n").is_empty());
+        // Short lines, and a handshake that is not a number.
+        let text = "iface\nshort\tline\nkey\t(none)\t(none)\t10.0.0.2/32\tlater\n";
+        assert!(parse_dump(text).is_empty());
+        // An extra column at the end does not stop the parse.
+        let text = "iface\nkey\t(none)\t(none)\t10.0.0.2/32\t1755500600\t1\t2\t25\textra\n";
+        assert_eq!(parse_dump(text)[0].last_handshake, Some(1_755_500_600));
     }
 
     #[test]

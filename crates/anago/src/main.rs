@@ -18,6 +18,7 @@ mod client;
 mod code;
 mod init;
 mod join;
+mod ls;
 // Path rules and file handling are complete and unit-tested; the
 // slices that read and write those files (server init, join) land next,
 // so both modules are briefly ahead of their callers.
@@ -78,7 +79,7 @@ fn main() {
             }
         },
         Command::Join(args) => join_device(&args),
-        Command::Ls => not_yet_built("anago ls"),
+        Command::Ls => list_devices(),
         Command::Rm(_) => not_yet_built("anago rm"),
     }
 }
@@ -178,6 +179,29 @@ fn join_device(args: &cli::Join) -> ! {
             }
             eprint!("{report}");
             std::process::exit(EXIT_FAILED);
+        }
+        Err(e) => {
+            eprintln!("anago: {e}");
+            std::process::exit(EXIT_FAILED);
+        }
+    }
+}
+
+/// `anago ls` — from the state file on the hub, from the API on a
+/// device.
+fn list_devices() -> ! {
+    // The config directory is resolved lazily: a hub reads its own
+    // state file, and asking for HOME first would break `anago ls` in
+    // cron or a bare service environment.
+    match ls::run(
+        std::path::Path::new(paths::DEFAULT_SERVER_ROOT),
+        std::path::Path::new(paths::DEFAULT_WG_DIR),
+        paths::client_config_dir_from_env,
+        now(),
+    ) {
+        Ok(table) => {
+            print!("{table}");
+            std::process::exit(0);
         }
         Err(e) => {
             eprintln!("anago: {e}");

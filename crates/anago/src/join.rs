@@ -15,7 +15,7 @@ use std::path::Path;
 use anago_core::code::JoinCode;
 use anago_core::json::{self, Value};
 use anago_core::name::DeviceName;
-use anago_core::proto::{self, ApiError, ErrorCode, JoinRequest, JoinResponse, PATH_JOIN};
+use anago_core::proto::{self, ErrorCode, JoinRequest, JoinResponse, PATH_JOIN};
 use anago_core::state::PrivateKey;
 use anago_core::subnet::Subnet;
 use anago_core::token::DeviceToken;
@@ -29,10 +29,22 @@ use crate::wg::{self, WgError};
 /// Schema version of `device.json`.
 pub const SCHEMA_VERSION: i64 = 1;
 
+/// What to say about a device file from before `api_port` was stored.
+///
+/// Only the repair that works: a re-join would be turned away by
+/// `check_not_joined` while this file and the wg config are still
+/// there, and the hub would refuse the name it already has registered.
+const MISSING_PORT: &str = "no api_port — this file was written by an earlier build that did \
+     not record which port it joined on. Add \"api_port\": <port> to this file: the port the \
+     hub serves its API on, which is 443 unless `server init --api-port` said otherwise";
+
 /// What a joined device keeps (§9.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceConfig {
     pub domain: String,
+    /// The control-API port this device reached the hub on — `ls` and
+    /// `rm` have to use the same one, and it is not always 443 (§9.2).
+    pub api_port: u16,
     pub name: String,
     pub address: String,
     pub subnet: String,
@@ -45,9 +57,10 @@ pub struct DeviceConfig {
 
 impl DeviceConfig {
     /// Built from the hub's answer plus the domain the person typed.
-    pub fn from_response(domain: &str, response: JoinResponse) -> DeviceConfig {
+    pub fn from_response(domain: &str, api_port: u16, response: JoinResponse) -> DeviceConfig {
         DeviceConfig {
             domain: domain.to_string(),
+            api_port,
             name: response.name,
             address: response.address,
             subnet: response.subnet,
@@ -62,6 +75,7 @@ impl DeviceConfig {
         Value::obj([
             ("version", Value::Int(SCHEMA_VERSION)),
             ("domain", Value::str(self.domain.as_str())),
+            ("api_port", Value::Int(i64::from(self.api_port))),
             ("name", Value::str(self.name.as_str())),
             ("address", Value::str(self.address.as_str())),
             ("subnet", Value::str(self.subnet.as_str())),
@@ -97,8 +111,22 @@ impl DeviceConfig {
         let field = |name: &str| -> Result<String, JoinError> {
             proto::string_field(obj, name).map_err(|e| JoinError::DeviceFile(e.to_string()))
         };
+        // Absent is "unknown", and stays unknown: an earlier build
+        // took `--api-port` without recording it, so a file missing
+        // this field may belong to a hub on any port. Calling 443 anyway
+        // would fail in a way that looks like the hub being down, so
+        // the read fails instead and says how to repair the file
+        // (§9.2).
+        let api_port = obj
+            .get("api_port")
+            .ok_or_else(|| JoinError::DeviceFile(MISSING_PORT.to_string()))?
+            .as_i64()
+            .and_then(|port| u16::try_from(port).ok())
+            .filter(|port| *port > 0)
+            .ok_or_else(|| JoinError::DeviceFile("api_port is not a port".to_string()))?;
         Ok(DeviceConfig {
             domain: field("domain")?,
+            api_port,
             name: field("name")?,
             address: field("address")?,
             subnet: field("subnet")?,
@@ -127,6 +155,11 @@ impl DeviceConfig {
                 .map_err(|e| JoinError::BadResponse(format!("server public key: {e}")))?,
             server_endpoint: checked_endpoint(&self.server_endpoint)?,
         })
+    }
+
+    /// The port `ls` and `rm` call the hub on.
+    pub fn api_port(&self) -> u16 {
+        self.api_port
     }
 
     /// The hub's private address, parsed. `None` only for a file that
@@ -226,28 +259,27 @@ pub fn hostname() -> Option<String> {
     String::from_utf8(buffer[..end].to_vec()).ok()
 }
 
-/// What to tell the person when the hub says no.
+/// What to tell the person when the hub refuses a join.
 ///
-/// The wire carries a machine-readable code (§8); this turns it into
-/// the next thing to try.
+/// The reading is shared with the other commands ([`client::describe`]);
+/// only the advice below is about joining.
 pub fn explain(status: u16, body: &str) -> String {
-    let parsed = json::parse(body)
-        .ok()
-        .and_then(|value| ApiError::from_json(&value).ok());
-    let Some(error) = parsed else {
-        return format!("the hub refused the join (HTTP {status}): {}", body.trim());
-    };
-    let advice = match error.code {
-        ErrorCode::InvalidCode => {
+    let failure = client::describe(status, body);
+    let advice = match failure.code {
+        Some(ErrorCode::InvalidCode) => {
             " — codes are single use and expire; run `anago code` on the server for another"
         }
-        ErrorCode::NameTaken => " — pick another with --name, or `anago rm` the old device",
-        ErrorCode::InvalidName => " — see the name rules in the docs (letters, digits, - and _)",
-        ErrorCode::SubnetFull => " — every address is taken; remove a device first",
-        ErrorCode::InvalidPublicKey => " — this looks like a bug in anago, not something you did",
+        Some(ErrorCode::NameTaken) => " — pick another with --name, or `anago rm` the old device",
+        Some(ErrorCode::InvalidName) => {
+            " — see the name rules in the docs (letters, digits, - and _)"
+        }
+        Some(ErrorCode::SubnetFull) => " — every address is taken; remove a device first",
+        Some(ErrorCode::InvalidPublicKey) => {
+            " — this looks like a bug in anago, not something you did"
+        }
         _ => "",
     };
-    format!("{}{advice}", error.message)
+    format!("the hub refused the join: {}{advice}", failure.message)
 }
 
 /// What a successful join produced.
@@ -304,7 +336,10 @@ pub fn run(
     // races surface here, while the code is still unspent; the writes
     // afterwards go into files this process already owns. The
     // reservation deletes itself unless the join finishes.
-    let mut reservation = Reservation::claim(&[wg_config_path, &client_paths.device_file()])?;
+    let mut reservation = Reservation::claim(&Targets {
+        wg_config: wg_config_path.to_path_buf(),
+        device_file: client_paths.device_file(),
+    })?;
 
     let (private_key, public_key) = wg::generate_keypair().map_err(JoinError::Wg)?;
     let body = request_body(code, &name, &public_key);
@@ -330,6 +365,7 @@ pub fn run(
     match finish(
         &response.body,
         domain,
+        api_port,
         private_key,
         client_paths,
         wg_config_path,
@@ -347,6 +383,7 @@ pub fn run(
 fn finish(
     body: &str,
     domain: &str,
+    api_port: u16,
     private_key: PrivateKey,
     client_paths: &ClientPaths,
     wg_config_path: &Path,
@@ -355,7 +392,7 @@ fn finish(
     let answer =
         JoinResponse::from_json(&value).map_err(|e| JoinError::BadResponse(e.to_string()))?;
 
-    let config = DeviceConfig::from_response(domain, answer);
+    let config = DeviceConfig::from_response(domain, api_port, answer);
     // Validated before a byte is written: nothing from the hub reaches
     // a root-owned file unparsed.
     config.validate()?;
@@ -464,16 +501,16 @@ struct Reservation {
 }
 
 impl Reservation {
-    fn claim(paths: &[&Path]) -> Result<Reservation, JoinError> {
+    fn claim(targets: &Targets) -> Result<Reservation, JoinError> {
         let mut reservation = Reservation {
             paths: Vec::new(),
             committed: false,
         };
-        for path in paths {
-            claim_one(path)?;
+        for path in [&targets.wg_config, &targets.device_file] {
+            claim_one(path, targets)?;
             // Pushed after the claim, so a failure only cleans up what
             // this call actually took.
-            reservation.paths.push(path.to_path_buf());
+            reservation.paths.push(path.clone());
         }
         Ok(reservation)
     }
@@ -483,9 +520,31 @@ impl Reservation {
     }
 }
 
+/// The two files a join needs, together — every message about one of
+/// them has to be able to name the other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Targets {
+    pub wg_config: std::path::PathBuf,
+    pub device_file: std::path::PathBuf,
+}
+
+impl Targets {
+    /// The error for a path that is already taken.
+    fn taken(&self, path: &Path) -> JoinError {
+        if path == self.wg_config {
+            JoinError::ConfigExists(path.display().to_string())
+        } else {
+            JoinError::AlreadyJoined {
+                device_file: self.device_file.display().to_string(),
+                wg_config: self.wg_config.display().to_string(),
+            }
+        }
+    }
+}
+
 /// Takes one path: creates it, or takes over a claim an earlier run
 /// left behind when it was killed.
-fn claim_one(path: &Path) -> Result<(), JoinError> {
+fn claim_one(path: &Path, targets: &Targets) -> Result<(), JoinError> {
     match fsutil::create_new_private(path, CLAIM_MARKER) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -497,7 +556,7 @@ fn claim_one(path: &Path) -> Result<(), JoinError> {
                     source: e.to_string(),
                 })
             } else {
-                Err(JoinError::AlreadyJoined(path.display().to_string()))
+                Err(targets.taken(path))
             }
         }
         Err(e) => Err(JoinError::Save {
@@ -581,7 +640,10 @@ pub fn check_not_joined(
 ) -> Result<(), JoinError> {
     let device_file = client_paths.device_file();
     if occupied(&device_file) {
-        return Err(JoinError::AlreadyJoined(device_file.display().to_string()));
+        return Err(JoinError::AlreadyJoined {
+            device_file: device_file.display().to_string(),
+            wg_config: wg_config_path.display().to_string(),
+        });
     }
     if occupied(wg_config_path) {
         return Err(JoinError::ConfigExists(
@@ -647,8 +709,14 @@ pub enum JoinError {
     /// The hub answered with something this build cannot read — or
     /// something anago will not put in a config file.
     BadResponse(String),
-    /// This device has already joined a network.
-    AlreadyJoined(String),
+    /// This device has already joined a network. Carries both files,
+    /// because they do not live next to each other and a message that
+    /// says "the one beside it" sends people looking in the wrong
+    /// directory.
+    AlreadyJoined {
+        device_file: String,
+        wg_config: String,
+    },
     /// Another `anago join` is working on this device right now.
     AlreadyRunning,
     /// A WireGuard config with anago's name is already there.
@@ -682,10 +750,15 @@ impl fmt::Display for JoinError {
                 "another `anago join` is already running on this device — \
                  let it finish, or wait for it to fail"
             ),
-            JoinError::AlreadyJoined(path) => write!(
+            JoinError::AlreadyJoined {
+                device_file,
+                wg_config,
+            } => write!(
                 f,
-                "this device has already joined a network — {path} exists. \
-                 Remove it, and `anago rm` this device on the server, to join again"
+                "this device has already joined a network — {device_file} exists. \
+                 To join again: `sudo wg-quick down {wg_config}`, delete {wg_config} \
+                 and {device_file}, and — if the hub still lists this device — \
+                 `anago rm` it there"
             ),
             JoinError::ConfigExists(path) => write!(
                 f,
@@ -708,6 +781,7 @@ impl std::error::Error for JoinError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anago_core::proto::ApiError;
 
     fn response() -> JoinResponse {
         JoinResponse {
@@ -722,7 +796,7 @@ mod tests {
     }
 
     fn config() -> DeviceConfig {
-        DeviceConfig::from_response("net.example.com", response())
+        DeviceConfig::from_response("net.example.com", 443, response())
     }
 
     #[test]
@@ -759,6 +833,32 @@ mod tests {
         let text = config().to_json_string();
         assert!(!text.contains("private"), "{text}");
         assert!(!text.contains("PrivateKey"), "{text}");
+    }
+
+    #[test]
+    fn a_device_file_without_a_port_is_not_assumed_to_mean_443() {
+        // The build before this field existed already accepted
+        // --api-port; it just did not save it. So "absent" means
+        // "unknown", and guessing 443 would fail as though the hub were
+        // down.
+        let text = config()
+            .to_json_string()
+            .replace("  \"api_port\": 443,\n", "");
+        assert!(!text.contains("api_port"), "{text}");
+        let e = DeviceConfig::parse(&text).unwrap_err();
+        let message = e.to_string();
+        assert!(message.contains("earlier build"), "{message}");
+        assert!(message.contains("Add \"api_port\""), "{message}");
+        assert!(message.contains("443"), "the likely value: {message}");
+        // Not a re-join: `check_not_joined` would refuse while these
+        // files exist, and the hub already has the name.
+        assert!(!message.contains("join again"), "{message}");
+
+        // Present but nonsense is still an error.
+        let text = config()
+            .to_json_string()
+            .replace("\"api_port\": 443", "\"api_port\": 0");
+        assert!(DeviceConfig::parse(&text).is_err());
     }
 
     #[test]
@@ -897,6 +997,15 @@ mod tests {
         }
     }
 
+    impl TempDirs {
+        fn targets(&self) -> Targets {
+            Targets {
+                wg_config: self.wg_config.clone(),
+                device_file: self.client.device_file(),
+            }
+        }
+    }
+
     impl Drop for TempDirs {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
@@ -919,7 +1028,7 @@ mod tests {
 
         std::fs::write(dirs.client.device_file(), "{}").unwrap();
         let e = check_not_joined(&dirs.client, &dirs.wg_config).unwrap_err();
-        assert!(matches!(e, JoinError::AlreadyJoined(_)), "{e:?}");
+        assert!(matches!(e, JoinError::AlreadyJoined { .. }), "{e:?}");
         assert!(e.to_string().contains("anago rm"), "{e}");
 
         // And a wg config anago did not write is not ours to replace.
@@ -957,7 +1066,7 @@ mod tests {
         let config = config();
         let e = publish(&config, &profile_of(&config), &dirs.client, &dirs.wg_config).unwrap_err();
         assert!(
-            matches!(e, JoinError::Save { .. } | JoinError::AlreadyJoined(_)),
+            matches!(e, JoinError::Save { .. } | JoinError::AlreadyJoined { .. }),
             "{e:?}"
         );
         assert!(
@@ -967,13 +1076,52 @@ mod tests {
     }
 
     #[test]
+    fn an_already_joined_device_is_told_where_both_files_are() {
+        // The two files are not neighbours — `~/.config/anago` and
+        // `/etc/wireguard` — so "the config beside it" would send
+        // somebody looking in the wrong directory.
+        let e = JoinError::AlreadyJoined {
+            device_file: "/home/jo/.config/anago/device.json".to_string(),
+            wg_config: "/etc/wireguard/anago.conf".to_string(),
+        };
+        let message = e.to_string();
+        assert!(
+            message.contains("/home/jo/.config/anago/device.json"),
+            "{message}"
+        );
+        assert!(
+            message.contains("wg-quick down /etc/wireguard/anago.conf"),
+            "{message}"
+        );
+        assert!(!message.contains("beside it"), "{message}");
+        assert!(message.contains("anago rm"), "{message}");
+    }
+
+    #[test]
+    fn the_device_file_being_taken_names_both_paths() {
+        let dirs = TempDirs::new();
+        std::fs::write(dirs.client.device_file(), "{}").unwrap();
+        let e = check_not_joined(&dirs.client, &dirs.wg_config).unwrap_err();
+        match e {
+            JoinError::AlreadyJoined {
+                device_file,
+                wg_config,
+            } => {
+                assert_eq!(device_file, dirs.client.device_file().display().to_string());
+                assert_eq!(wg_config, dirs.wg_config.display().to_string());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn a_reservation_claims_names_and_gives_them_back_if_the_join_fails() {
         // Claiming before the POST is what turns "the disk is full
         // after the code was spent" into a plain retry.
         let dirs = TempDirs::new();
         let device_file = dirs.client.device_file();
         {
-            let _claim = Reservation::claim(&[&dirs.wg_config, &device_file]).unwrap();
+            let _claim = Reservation::claim(&dirs.targets()).unwrap();
             assert!(dirs.wg_config.exists() && device_file.exists());
         }
         // Dropped without commit: nothing left behind, so the next
@@ -984,7 +1132,11 @@ mod tests {
         );
         assert!(!device_file.exists());
 
-        let mut claim = Reservation::claim(&[&dirs.wg_config]).unwrap();
+        let mut claim = Reservation::claim(&Targets {
+            wg_config: dirs.wg_config.clone(),
+            device_file: dirs.root.join("unused-device.json"),
+        })
+        .unwrap();
         claim.commit();
         drop(claim);
         assert!(dirs.wg_config.exists(), "a committed claim stays");
@@ -996,8 +1148,10 @@ mod tests {
         std::fs::write(&dirs.wg_config, "someone else's interface\n").unwrap();
 
         let device_file = dirs.client.device_file();
-        let e = Reservation::claim(&[&dirs.wg_config, &device_file]).unwrap_err();
-        assert!(matches!(e, JoinError::AlreadyJoined(_)), "{e:?}");
+        let e = Reservation::claim(&dirs.targets()).unwrap_err();
+        // The wg config is the one that was taken, and the error says
+        // so rather than blaming the device file.
+        assert!(matches!(e, JoinError::ConfigExists(_)), "{e:?}");
         assert_eq!(
             std::fs::read_to_string(&dirs.wg_config).unwrap(),
             "someone else's interface\n",
@@ -1055,7 +1209,7 @@ mod tests {
         );
         let answer =
             JoinResponse::from_json(&json::parse(&broken_endpoint).unwrap()).expect("decodes");
-        let config = DeviceConfig::from_response("net.example.com", answer);
+        let config = DeviceConfig::from_response("net.example.com", 443, answer);
         assert!(config.validate().is_ok(), "name and token are fine");
         assert!(
             config.profile(PrivateKey::new("k")).is_err(),
@@ -1084,7 +1238,7 @@ mod tests {
             check_not_joined(&dirs.client, &dirs.wg_config).is_ok(),
             "an unfinished join owns nothing"
         );
-        let mut claim = Reservation::claim(&[&dirs.wg_config, &device_file]).unwrap();
+        let mut claim = Reservation::claim(&dirs.targets()).unwrap();
         claim.commit();
         assert!(dirs.wg_config.exists() && device_file.exists());
 
@@ -1096,7 +1250,11 @@ mod tests {
         std::fs::write(&dirs.wg_config, "").unwrap();
         let e = check_not_joined(&dirs.client, &dirs.wg_config).unwrap_err();
         assert!(matches!(e, JoinError::ConfigExists(_)), "{e:?}");
-        assert!(Reservation::claim(&[&dirs.wg_config]).is_err());
+        assert!(Reservation::claim(&Targets {
+            wg_config: dirs.wg_config.clone(),
+            device_file: dirs.root.join("unused-device.json"),
+        })
+        .is_err());
         assert_eq!(
             std::fs::read_to_string(&dirs.wg_config).unwrap(),
             "",
@@ -1112,9 +1270,13 @@ mod tests {
         assert!(!is_stale_claim(&config.to_json_string()));
 
         let e = check_not_joined(&dirs.client, &dirs.wg_config).unwrap_err();
-        assert!(matches!(e, JoinError::AlreadyJoined(_)), "{e:?}");
-        let e = Reservation::claim(&[&dirs.client.device_file()]).unwrap_err();
-        assert!(matches!(e, JoinError::AlreadyJoined(_)), "{e:?}");
+        assert!(matches!(e, JoinError::AlreadyJoined { .. }), "{e:?}");
+        let e = Reservation::claim(&Targets {
+            wg_config: dirs.root.join("unused.conf"),
+            device_file: dirs.client.device_file(),
+        })
+        .unwrap_err();
+        assert!(matches!(e, JoinError::AlreadyJoined { .. }), "{e:?}");
         // And the real file is still there.
         assert_eq!(
             DeviceConfig::parse(&std::fs::read_to_string(dirs.client.device_file()).unwrap())
@@ -1146,37 +1308,31 @@ mod tests {
 
     #[test]
     fn a_second_join_cannot_delete_the_first_ones_files() {
-        // The sequence the lock exists for, run for real: one thread
-        // completes a join while another tries to start one.
+        // The sequence the lock exists for, without a sleep to make it
+        // happen: one join finishes, then another tries to start.
         let dirs = TempDirs::new();
         let config = config();
         let device_file = dirs.client.device_file();
 
-        let loser = std::thread::scope(|scope| {
-            let winner = scope.spawn(|| {
-                let _lock = acquire_join_lock(&dirs.client).expect("first in");
-                check_not_joined(&dirs.client, &dirs.wg_config).expect("nothing there yet");
-                let mut claim =
-                    Reservation::claim(&[&dirs.wg_config, &device_file]).expect("claimed");
-                publish(&config, &profile_of(&config), &dirs.client, &dirs.wg_config)
-                    .expect("published");
-                claim.commit();
-                // Hold the lock a moment so the other thread is
-                // guaranteed to meet it.
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            });
-            // Runs while the winner holds the lock.
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            let loser = acquire_join_lock(&dirs.client).err();
-            winner.join().unwrap();
-            loser
-        });
+        let lock = acquire_join_lock(&dirs.client).expect("first in");
+        check_not_joined(&dirs.client, &dirs.wg_config).expect("nothing there yet");
+        let mut claim = Reservation::claim(&dirs.targets()).expect("claimed");
+        publish(&config, &profile_of(&config), &dirs.client, &dirs.wg_config).expect("published");
+        claim.commit();
 
-        assert!(
-            matches!(loser, Some(JoinError::AlreadyRunning)),
-            "the second join should have been turned away, got {loser:?}"
-        );
-        // And the winner's files survived.
+        // A second join while the first still holds the lock.
+        assert!(matches!(
+            acquire_join_lock(&dirs.client),
+            Err(JoinError::AlreadyRunning)
+        ));
+        drop(lock);
+
+        // And once the lock is free, the finished files still stop it —
+        // the claim it fails to make must not take them down with it.
+        assert!(matches!(
+            Reservation::claim(&dirs.targets()),
+            Err(JoinError::ConfigExists(_))
+        ));
         assert_eq!(
             DeviceConfig::parse(&std::fs::read_to_string(&device_file).unwrap()).unwrap(),
             config

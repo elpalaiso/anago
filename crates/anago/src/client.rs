@@ -15,6 +15,8 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use anago_core::json;
+use anago_core::proto::{ApiError, ErrorCode};
 use anago_core::token::DeviceToken;
 
 /// How long to wait for the TCP connection.
@@ -352,6 +354,38 @@ fn client_config() -> Result<rustls::ClientConfig, ClientError> {
     Ok(config)
 }
 
+/// A failing answer, read as far as it can be.
+///
+/// Operation-neutral on purpose: `join`, `ls`, and `rm` all get the
+/// same reading and each adds its own advice. Saying "the hub refused
+/// the join" to somebody who ran `anago ls` describes work they never
+/// asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failure {
+    /// `None` when the body was not one of anago's error objects — a
+    /// proxy's HTML, say.
+    pub code: Option<ErrorCode>,
+    /// What to show, before any command-specific advice.
+    pub message: String,
+}
+
+/// Reads a failing response.
+pub fn describe(status: u16, body: &str) -> Failure {
+    match json::parse(body)
+        .ok()
+        .and_then(|value| ApiError::from_json(&value).ok())
+    {
+        Some(error) => Failure {
+            code: Some(error.code),
+            message: error.message,
+        },
+        None => Failure {
+            code: None,
+            message: format!("HTTP {status}: {}", body.trim()),
+        },
+    }
+}
+
 /// Why a call did not happen, in the words the person running `anago
 /// join` needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -586,6 +620,29 @@ mod tests {
             Err(ClientError::Malformed(
                 "chunked responses are not supported"
             ))
+        );
+    }
+
+    #[test]
+    fn a_failing_answer_is_read_without_naming_an_operation() {
+        // Shared by join, ls, and rm — so it says what the hub said,
+        // and nothing about which command asked.
+        let body = json::to_string(
+            &ApiError::new(ErrorCode::Unauthorized, "a valid device token is required").to_json(),
+        );
+        let failure = describe(401, &body);
+        assert_eq!(failure.code, Some(ErrorCode::Unauthorized));
+        assert_eq!(failure.message, "a valid device token is required");
+        assert!(!failure.message.contains("join"), "{}", failure.message);
+
+        // A proxy's HTML still reaches the person, with the status.
+        let failure = describe(502, "<html>bad gateway</html>");
+        assert_eq!(failure.code, None);
+        assert!(failure.message.contains("HTTP 502"), "{}", failure.message);
+        assert!(
+            failure.message.contains("bad gateway"),
+            "{}",
+            failure.message
         );
     }
 
