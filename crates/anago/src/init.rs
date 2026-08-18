@@ -186,6 +186,7 @@ pub fn run(
     let keys = wg::generate_keypair().map_err(InitError::Wg)?;
     let code = secret::new_join_code().map_err(|e| InitError::Io {
         what: "read /dev/urandom",
+        kind: e.kind(),
         source: e.to_string(),
     })?;
     let state = build_state(args, keys, code, now);
@@ -279,11 +280,13 @@ pub fn publish_once(state: &ServerState, root: &Path, wg_dir: &Path) -> Result<(
     // exist first. An empty directory is not a hub — the state file is.
     fsutil::ensure_private_dir(root).map_err(|e| InitError::Io {
         what: "create the state directory",
+        kind: e.kind(),
         source: e.to_string(),
     })?;
     let lock_path = ServerPaths::new(root).state_lock();
     let _lock = fsutil::FileLock::acquire(&lock_path).map_err(|e| InitError::Io {
         what: "take the initialization lock",
+        kind: e.kind(),
         source: e.to_string(),
     })?;
 
@@ -302,6 +305,7 @@ pub fn publish_once(state: &ServerState, root: &Path, wg_dir: &Path) -> Result<(
 pub fn publish(state: &ServerState, root: &Path, wg_dir: &Path) -> Result<(), InitError> {
     fsutil::ensure_private_dir(wg_dir).map_err(|e| InitError::Io {
         what: "create the WireGuard directory",
+        kind: e.kind(),
         source: e.to_string(),
     })?;
     let config_path = paths::wg_config(wg_dir);
@@ -311,6 +315,7 @@ pub fn publish(state: &ServerState, root: &Path, wg_dir: &Path) -> Result<(), In
         } else {
             InitError::Io {
                 what: "write the WireGuard config",
+                kind: e.kind(),
                 source: e.to_string(),
             }
         }
@@ -319,6 +324,7 @@ pub fn publish(state: &ServerState, root: &Path, wg_dir: &Path) -> Result<(), In
     let published = fsutil::ensure_private_dir(root)
         .map_err(|e| InitError::Io {
             what: "create the state directory",
+            kind: e.kind(),
             source: e.to_string(),
         })
         .and_then(|()| {
@@ -329,6 +335,7 @@ pub fn publish(state: &ServerState, root: &Path, wg_dir: &Path) -> Result<(), In
                 } else {
                     InitError::Io {
                         what: "write the state file",
+                        kind: e.kind(),
                         source: e.to_string(),
                     }
                 }
@@ -357,6 +364,7 @@ pub enum InitError {
     Wg(WgError),
     Io {
         what: &'static str,
+        kind: std::io::ErrorKind,
         source: String,
     },
 }
@@ -377,7 +385,10 @@ impl fmt::Display for InitError {
             ),
             InitError::Tls(e) => write!(f, "{e}"),
             InitError::Wg(e) => write!(f, "{e}"),
-            InitError::Io { what, source } => write!(f, "could not {what}: {source}"),
+            InitError::Io { what, kind, source } => f.write_str(&crate::diagnostics::with_advice(
+                format!("could not {what}: {source}"),
+                *kind,
+            )),
         }
     }
 }
@@ -572,12 +583,15 @@ mod tests {
     fn init_errors_say_which_step_failed() {
         let e = InitError::Io {
             what: "write the state file",
+            kind: std::io::ErrorKind::PermissionDenied,
             source: "Permission denied (os error 13)".to_string(),
         };
-        assert_eq!(
-            e.to_string(),
-            "could not write the state file: Permission denied (os error 13)"
+        // The step, the cause, and — for this cause — what to do.
+        assert!(
+            e.to_string().starts_with("could not write the state file"),
+            "{e}"
         );
+        assert!(e.to_string().contains("run this as root"), "{e}");
     }
 
     // ------------------------------------------------ publishing

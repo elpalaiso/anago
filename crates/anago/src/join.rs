@@ -22,6 +22,7 @@ use anago_core::token::DeviceToken;
 use anago_core::wgconf::{self, ClientProfile};
 
 use crate::client::{self, Method, Request};
+use crate::diagnostics::Target;
 use crate::fsutil;
 use crate::paths::ClientPaths;
 use crate::wg::{self, WgError};
@@ -317,6 +318,8 @@ pub fn run(
     };
     fsutil::ensure_private_dir(client_paths.dir()).map_err(|e| JoinError::Save {
         what: "the config directory",
+        target: Target::user_directory(client_paths.dir()),
+        kind: e.kind(),
         source: e.to_string(),
     })?;
     // Declared before the reservation so it outlives it: the claim is
@@ -327,6 +330,8 @@ pub fn run(
     if let Some(parent) = wg_config_path.parent() {
         fsutil::ensure_private_dir(parent).map_err(|e| JoinError::Save {
             what: "the WireGuard directory",
+            target: Target::system_directory(parent),
+            kind: e.kind(),
             source: e.to_string(),
         })?;
     }
@@ -529,6 +534,17 @@ pub struct Targets {
 }
 
 impl Targets {
+    /// How to describe a write to one of these paths, ownership
+    /// included — the wg config is the system's, the device file is
+    /// the person's.
+    fn describe(&self, path: &Path) -> Target {
+        if path == self.wg_config {
+            Target::system_file(path)
+        } else {
+            Target::user_file(path)
+        }
+    }
+
     /// The error for a path that is already taken.
     fn taken(&self, path: &Path) -> JoinError {
         if path == self.wg_config {
@@ -553,6 +569,8 @@ fn claim_one(path: &Path, targets: &Targets) -> Result<(), JoinError> {
                 // Ours to reuse: an unfinished join owns nothing.
                 fsutil::write_private(path, CLAIM_MARKER).map_err(|e| JoinError::Save {
                     what: "a config file",
+                    target: targets.describe(path),
+                    kind: e.kind(),
                     source: e.to_string(),
                 })
             } else {
@@ -561,6 +579,8 @@ fn claim_one(path: &Path, targets: &Targets) -> Result<(), JoinError> {
         }
         Err(e) => Err(JoinError::Save {
             what: "a config file",
+            target: targets.describe(path),
+            kind: e.kind(),
             source: e.to_string(),
         }),
     }
@@ -624,6 +644,8 @@ pub fn acquire_join_lock(client_paths: &ClientPaths) -> Result<fsutil::FileLock,
         Ok(None) => Err(JoinError::AlreadyRunning),
         Err(e) => Err(JoinError::Save {
             what: "the join lock",
+            target: Target::user_file(client_paths.join_lock()),
+            kind: e.kind(),
             source: e.to_string(),
         }),
     }
@@ -680,6 +702,8 @@ fn publish(
     fsutil::write_private(wg_config_path, &wgconf::client_config(profile)).map_err(|e| {
         JoinError::Save {
             what: "the WireGuard config",
+            target: Target::system_file(wg_config_path),
+            kind: e.kind(),
             source: e.to_string(),
         }
     })?;
@@ -689,6 +713,8 @@ fn publish(
         let _ = std::fs::remove_file(wg_config_path);
         return Err(JoinError::Save {
             what: "the device file",
+            target: Target::user_file(device_file.clone()),
+            kind: e.kind(),
             source: e.to_string(),
         });
     }
@@ -721,8 +747,19 @@ pub enum JoinError {
     AlreadyRunning,
     /// A WireGuard config with anago's name is already there.
     ConfigExists(String),
-    /// A file could not be written.
-    Save { what: &'static str, source: String },
+    /// A file could not be written. Carries the `ErrorKind` so the
+    /// message can add what to do — running `anago join` as an
+    /// ordinary user is the usual way to meet this one, since the wg
+    /// config lives in a root-owned directory.
+    Save {
+        what: &'static str,
+        /// What it was writing, and where. A directory that could not
+        /// be created is its own culprit; a file's is the directory
+        /// holding it.
+        target: crate::diagnostics::Target,
+        kind: std::io::ErrorKind,
+        source: String,
+    },
     /// The hub registered this device and the local files could not be
     /// saved — the one failure that leaves the two sides disagreeing.
     SavedNothing { source: String, recovery: String },
@@ -765,7 +802,19 @@ impl fmt::Display for JoinError {
                 "{path} already exists — anago will not replace a WireGuard config \
                  it did not write. Move it aside first"
             ),
-            JoinError::Save { what, source } => write!(f, "could not write {what}: {source}"),
+            JoinError::Save {
+                what,
+                target,
+                kind,
+                source,
+            } => f.write_str(&crate::diagnostics::with_target_advice(
+                format!(
+                    "could not write {what} ({}): {source}",
+                    target.path().display()
+                ),
+                Some(target),
+                *kind,
+            )),
             JoinError::SavedNothing { source, recovery } => write!(
                 f,
                 "the hub registered this device but nothing could be saved locally \

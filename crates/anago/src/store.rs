@@ -143,7 +143,13 @@ impl fmt::Display for StoreError {
                     path.display()
                 )
             }
-            StoreError::Io { path, source, .. } => write!(f, "{}: {source}", path.display()),
+            StoreError::Io { path, kind, source } => {
+                f.write_str(&crate::diagnostics::with_target_advice(
+                    format!("{}: {source}", path.display()),
+                    Some(&crate::diagnostics::Target::system_file(path.clone())),
+                    *kind,
+                ))
+            }
             StoreError::Parse { path, error } => write!(f, "{}: {error}", path.display()),
         }
     }

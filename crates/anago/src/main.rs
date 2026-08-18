@@ -15,6 +15,7 @@ mod cli;
 #[allow(dead_code)]
 mod client;
 mod code;
+mod diagnostics;
 mod init;
 mod join;
 mod ls;
