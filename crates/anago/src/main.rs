@@ -10,6 +10,11 @@
 
 mod args;
 mod cli;
+// The path rules are complete and unit-tested; the slices that read and
+// write those files (server init, join) land next, so the module is
+// briefly ahead of its callers.
+#[allow(dead_code)]
+mod paths;
 
 use cli::Command;
 
