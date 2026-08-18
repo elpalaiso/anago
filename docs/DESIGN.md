@@ -148,26 +148,53 @@ timer는 편의이지 정합성 요건이 아니다 — 이 성질 덕에 클라
 
 ## 8. 인터페이스 스펙 (CLI)
 
+각 줄에 도입 마일스톤을 붙인다. **M0 바이너리는 M0 표면만 구현하고,
+M1+ 서브커맨드·플래그는 "아직 없음(M1에서 들어옴)"이라고 답한다** —
+있는 척하는 no-op보다 낫다.
+
+M0에서 실제로 구현하는 표면:
+
 ```
-anago server init --domain <d> [--cf-token <t>] [--subnet 10.100.0.0/24]
-                  [--port 51820] [--no-systemd]
-anago server status                # 서버에서: 피어·마지막 handshake·트래픽
+anago server init --domain <d> --tls-cert <p> --tls-key <p>
+                  [--subnet 10.100.0.0/24] [--port 51820]
+                  [--api-port 443] [--no-systemd]
+                                   # DNS는 수동 안내(A 레코드 출력), TLS는
+                                   # 기존 인증서 경로 지정 (§11 M0)
 anago code                         # 서버에서: 조인 코드 발급
-anago join <domain> <code> [--name 맥북] [--export qr|conf]
-anago sync                         # 피어 목록 당겨와 wg 설정 갱신 (timer가 부름)
-anago ls                           # 어디서든: 기기 목록·상태 (API 경유)
-anago ping <이름>                  # 사설 IP 조회 + ping 위임
+anago join <domain> <code> [--name 맥북]
+anago ls                           # 기기 목록 (기기에선 API, 서버에선 상태 파일)
 anago rm <이름>                    # 기기 제거 (서버 반영)
 ```
 
+M1 이후로 미루는 표면(설계는 유지, 구현은 나중):
+
+```
+anago server init --cf-token <t>   # M1: Cloudflare A 레코드 자동 생성·DNS-01
+anago server init (--tls-cert/key 생략)  # M1: ACME 자동 발급. M0에선 두 플래그가 필수
+anago sync                         # M1: 피어 목록 당겨와 wg 설정 갱신 (timer가 부름)
+anago join --export qr|conf        # M1: 폰(공식 wg 앱)용 설정 출력
+anago ping <이름>                  # M3: 사설 IP 조회 + ping 위임
+anago server status                # M3: 피어·마지막 handshake·트래픽 대시보드
+```
+
+M0에서 `sync`가 없어도 통신은 된다 — §6.3의 성질 그대로다. 허브가
+피어를 다 알고 서버가 자기 wg 설정을 갱신하므로, 기기 쪽 설정이
+`AllowedIPs = <subnet>` 한 줄이면 새 기기와도 바로 통신된다. 기기
+설정을 다시 만져야 하는 경우는 M2(직결 엔드포인트)부터다.
+
 컨트롤 API(v1, JSON over HTTPS — 스키마는 anago-core의 타입이 원본):
 
-| 메서드/경로 | 인증 | 역할 |
-|---|---|---|
-| POST /api/v1/join | 조인 코드 | 공개키 등록 → IP 할당·서버 정보 응답 |
-| GET  /api/v1/peers | 기기 토큰 | 피어 목록(공개키·IP·이름·엔드포인트) |
-| POST /api/v1/endpoint | 기기 토큰 | (M2) 자기 관측 엔드포인트 보고 |
-| DELETE /api/v1/peers/{name} | 기기 토큰 | 기기 제거 |
+| 메서드/경로 | 마일스톤 | 인증 | 역할 |
+|---|---|---|---|
+| POST /api/v1/join | M0 | 조인 코드 | 공개키 등록 → IP 할당·서버 정보 응답 |
+| GET  /api/v1/peers | M0 | 기기 토큰 | 피어 목록(공개키·IP·이름) |
+| DELETE /api/v1/peers/{name} | M0 | 기기 토큰 | 기기 제거 |
+| POST /api/v1/endpoint | M2 | 기기 토큰 | 자기 관측 엔드포인트 보고 |
+
+M0의 `GET /api/v1/peers` 응답에 엔드포인트 필드는 없다(§9.1과 같은
+이유 — 기기 관측 엔드포인트는 M2에 스키마와 함께 들어온다). `anago
+sync`는 M1이지만 그것이 쓸 엔드포인트는 M0에서 이미 서비스되므로,
+M1은 클라이언트 쪽만 추가하면 된다.
 
 ## 9. 서버 상태와 설정
 

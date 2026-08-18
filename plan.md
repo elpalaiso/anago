@@ -12,11 +12,11 @@
 
 - [x] DESIGN.md §9/§10 갱신: M0 상태 파일 스키마(필드 목록)와 직렬화 결정을 명시 — 프로토콜/상태 타입의 JSON 인코딩은 anago-core의 순수 std 미니 JSON으로 하고 serde는 쓰지 않는다(또는 반대 결정)를 문장으로 확정
 - [x] DESIGN.md §7 갱신: 기기 토큰의 M0 처리 확정 — 해시(sha2 등 바이너리 크레이트) vs 평문 0600 저장 중 하나를 고르고 근거를 적는다. 코어는 형식 검증·상수시간 비교만 담당함을 명시
-- [ ] DESIGN.md §8 갱신: M0에서 실제 구현할 CLI 표면과 API 엔드포인트만 추려 M0/M1 표기를 붙인다(`sync`, `--export`, `/api/v1/endpoint`는 M1+ 표시)
+- [x] DESIGN.md §8 갱신: M0에서 실제 구현할 CLI 표면과 API 엔드포인트만 추려 M0/M1 표기를 붙인다(`sync`, `--export`, `/api/v1/endpoint`는 M1+ 표시)
 
 ## B. anago-core — 순수 함수 기반 (외부 크레이트 금지)
 
-- [ ] `json.rs`: 최소 JSON 값 타입 + 파서(객체/배열/문자열/숫자/불/널, 이스케이프 처리) — 파싱 유닛 테스트
+- [x] `json.rs`: 최소 JSON 값 타입 + 파서(객체/배열/문자열/숫자/불/널, 이스케이프 처리) — 파싱 유닛 테스트
 - [ ] `json.rs`: JSON 직렬화(문자열 이스케이프, 결정적 키 순서) + 라운드트립 유닛 테스트, 잘못된 입력에 대한 에러 케이스 테스트
 - [ ] `proto.rs`: 컨트롤 API 타입 정의 — JoinRequest/JoinResponse/PeerInfo/PeersResponse/ApiError — 필드 확정만
 - [ ] `proto.rs`: 각 타입의 to_json/from_json 구현 + 라운드트립·누락 필드·타입 불일치 유닛 테스트
