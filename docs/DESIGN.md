@@ -385,7 +385,7 @@ M0에는 `endpoint`·`last_handshake` 필드가 **없다**. 허브-스포크에�
 | 영역 | 선택 | 비고 |
 |---|---|---|
 | CLI | 수제 플래그 파서 (krill args.rs 이식) | 의존 최소 — krill에서 검증됨 |
-| 서버 HTTP | tokio + axum + rustls | krill serve 경험 재활용 |
+| 서버 HTTP | tokio + axum + axum-server + rustls(ring) + rustls-pemfile | krill serve 경험 재활용. TLS 백엔드는 **ring** — rustls 기본값인 aws-lc-rs는 C 툴체인(cmake 등)을 요구해 "stock VPS에서 그냥 빌드된다"를 깬다. 압축·트레이싱·multipart는 끄지만 **HTTP/2는 끄지 못한다** — axum-server가 `hyper/http2`와 `hyper-util/server-auto`를 켜기 때문이다. M0 API는 h1/h2 어느 쪽으로 와도 같은 JSON을 답하므로 기능 문제는 아니고, 굳이 h1으로 좁히려면 리스너에서 ALPN을 `http/1.1`만 광고하면 된다 |
 | ACME | instant-acme (또는 동급) | HTTP-01 기본, DNS-01(Cloudflare) 지원 |
 | Cloudflare | 얇은 REST 호출 (reqwest 없이 가능하면 hyper 직접) | A 레코드 upsert + DNS-01 TXT |
 | wg 제어 | `wg`/`wg-quick` CLI 래핑 | 위임 원칙. boringtun 내장은 백로그(비-커널 환경) |

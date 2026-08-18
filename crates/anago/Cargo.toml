@@ -14,4 +14,14 @@ anago-core = { path = "../anago-core" }
 # flock(2) for serializing concurrent joins — std has no file lock
 # (DESIGN.md §10, §13).
 libc = "0.2"
+
+# Control-plane server (DESIGN.md §10). Features are trimmed where we
+# control them — no compression, no tracing, no multipart. HTTP/2 is not
+# one of those places: axum-server enables hyper/http2 and hyper-util's
+# server-auto, so h2 is compiled in whatever axum's own flags say.
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "net", "io-util", "time", "signal"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query"] }
+axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
 # tokio/axum/rustls/serde는 M0 서버 구현이 요구할 때 추가한다 (원칙 4).
