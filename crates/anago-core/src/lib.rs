@@ -12,6 +12,7 @@ pub mod proto;
 pub mod render;
 pub mod state;
 pub mod subnet;
+pub mod sync;
 pub mod token;
 pub mod wgconf;
 
