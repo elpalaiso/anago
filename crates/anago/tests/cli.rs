@@ -65,11 +65,3 @@ fn a_typo_exits_two() {
     assert_eq!(code, 2, "{stderr}");
     assert!(stderr.contains("1-65535"), "{stderr}");
 }
-
-#[test]
-fn an_m0_command_that_is_not_built_yet_exits_one() {
-    // `rm` is the last M0 command still to be wired up.
-    let (code, _, stderr) = run(&["rm", "macbook"]);
-    assert_eq!(code, 1, "{stderr}");
-    assert!(stderr.contains("not implemented yet"), "{stderr}");
-}

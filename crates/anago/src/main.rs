@@ -4,9 +4,8 @@
 //! means, and run it. Routing has no side effects and lives in `cli`,
 //! so this file stays small enough to read in one screen.
 //!
-//! The M0 commands route and validate but have no implementation
-//! behind them yet — the server, join, and state-file slices land
-//! next. They exit non-zero rather than pretending to have worked.
+//! Every M0 command (§8) is wired up: `server init`, `server run`,
+//! `code`, `join`, `ls`, `rm`.
 
 mod activate;
 #[allow(dead_code)]
@@ -19,6 +18,7 @@ mod code;
 mod init;
 mod join;
 mod ls;
+mod rm;
 // Path rules and file handling are complete and unit-tested; the
 // slices that read and write those files (server init, join) land next,
 // so both modules are briefly ahead of their callers.
@@ -80,7 +80,7 @@ fn main() {
         },
         Command::Join(args) => join_device(&args),
         Command::Ls => list_devices(),
-        Command::Rm(_) => not_yet_built("anago rm"),
+        Command::Rm(args) => remove_device(&args),
     }
 }
 
@@ -210,19 +210,33 @@ fn list_devices() -> ! {
     }
 }
 
+/// `anago rm <name>` — locally on the hub, over the API on a device.
+fn remove_device(args: &cli::Rm) -> ! {
+    let wg_config = paths::wg_config(paths::DEFAULT_WG_DIR);
+    match rm::run(
+        &args.name,
+        std::path::Path::new(paths::DEFAULT_SERVER_ROOT),
+        std::path::Path::new(paths::DEFAULT_WG_DIR),
+        paths::client_config_dir_from_env,
+    ) {
+        Ok(removed) => {
+            let device_file = paths::client_config_dir_from_env()
+                .map(|paths| paths.device_file())
+                .unwrap_or_else(|_| std::path::PathBuf::from("~/.config/anago/device.json"));
+            print!("{}", rm::report(&removed, &device_file, &wg_config));
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("anago: {e}");
+            std::process::exit(EXIT_FAILED);
+        }
+    }
+}
+
 /// Unix epoch seconds.
 fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
-}
-
-/// An M0 command that routes and validates but has no implementation
-/// behind it yet. Distinct from `CliError::NotYet`, which is a settled
-/// answer about a later milestone.
-fn not_yet_built(command: &str) -> ! {
-    eprintln!("anago: {command} is not implemented yet — M0 is still being built");
-    eprintln!("the command line was accepted; docs/DESIGN.md §11 has what lands when");
-    std::process::exit(EXIT_FAILED);
 }

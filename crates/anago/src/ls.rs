@@ -32,16 +32,22 @@ pub enum Source {
     Device,
 }
 
-/// Picks a source.
+/// What to tell somebody on a machine that is neither.
+pub const NOT_SET_UP: &str = "this machine is neither a hub nor a joined device — run \
+     `anago server init` here, or `anago join` with a code from one";
+
+/// Picks a source, or `None` when this machine is neither.
 ///
 /// The hub wins when both are present — a hub that also joined itself
 /// is odd, but if it happens the local file is both faster and more
 /// complete than asking itself over TLS.
-pub fn choose_source(has_state: bool, has_device_file: bool) -> Result<Source, LsError> {
+///
+/// Shared with `rm`, which faces exactly the same question.
+pub fn choose_source(has_state: bool, has_device_file: bool) -> Option<Source> {
     match (has_state, has_device_file) {
-        (true, _) => Ok(Source::Server),
-        (false, true) => Ok(Source::Device),
-        (false, false) => Err(LsError::NotSetUp),
+        (true, _) => Some(Source::Server),
+        (false, true) => Some(Source::Device),
+        (false, false) => None,
     }
 }
 
@@ -123,7 +129,7 @@ pub fn run(
         .as_ref()
         .is_some_and(|paths| paths.device_file().exists());
 
-    let rows = match choose_source(has_state, has_device_file)? {
+    let rows = match choose_source(has_state, has_device_file).ok_or(LsError::NotSetUp)? {
         Source::Server => {
             let state = Store::new(server_root).read().map_err(LsError::State)?;
             rows_from_state(&state, handshakes(wg_dir).as_deref())
@@ -242,11 +248,7 @@ pub enum LsError {
 impl fmt::Display for LsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LsError::NotSetUp => write!(
-                f,
-                "this machine is neither a hub nor a joined device — run \
-                 `anago server init` here, or `anago join` with a code from one"
-            ),
+            LsError::NotSetUp => f.write_str(NOT_SET_UP),
             LsError::NoConfigDir(detail) => write!(f, "{detail}"),
             LsError::State(e) => write!(f, "{e}"),
             LsError::DeviceFile(detail) => write!(f, "device file: {detail}"),
@@ -312,11 +314,12 @@ mod tests {
 
     #[test]
     fn the_hub_reads_its_own_file_even_if_it_also_joined() {
-        assert_eq!(choose_source(true, false), Ok(Source::Server));
-        assert_eq!(choose_source(true, true), Ok(Source::Server));
-        assert_eq!(choose_source(false, true), Ok(Source::Device));
-        let e = choose_source(false, false).unwrap_err();
-        assert_eq!(e, LsError::NotSetUp);
+        assert_eq!(choose_source(true, false), Some(Source::Server));
+        assert_eq!(choose_source(true, true), Some(Source::Server));
+        assert_eq!(choose_source(false, true), Some(Source::Device));
+        assert_eq!(choose_source(false, false), None);
+
+        let e = LsError::NotSetUp;
         assert!(e.to_string().contains("anago server init"), "{e}");
         assert!(e.to_string().contains("anago join"), "{e}");
     }
