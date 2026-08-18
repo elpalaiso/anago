@@ -12,8 +12,10 @@
 //! Decoding validates every field against the rules of the type that
 //! owns it — a subnet through [`Subnet`], a name through
 //! [`DeviceName`], a hash through [`TokenHash`]. Unknown fields are
-//! ignored (§9.1), and a `version` that is not [`SCHEMA_VERSION`] stops
-//! the read, so an older binary cannot overwrite a newer file.
+//! ignored (§9.1). Versions are handled in exactly three ways:
+//! [`SCHEMA_VERSION`] reads as written, [`LEGACY_SCHEMA_VERSION`] is
+//! upgraded in memory, and anything else stops the read — so an older
+//! binary cannot overwrite a newer file.
 
 use std::fmt;
 use std::net::Ipv4Addr;
@@ -25,8 +27,14 @@ use crate::proto::{self, DecodeError, ErrorCode};
 use crate::subnet::Subnet;
 use crate::token::TokenHash;
 
-/// Schema version of the state file. M0 writes and accepts 1 only.
-pub const SCHEMA_VERSION: i64 = 1;
+/// Schema version this build writes. M1 = 2 (§9.1).
+pub const SCHEMA_VERSION: i64 = 2;
+
+/// The version M0 wrote: flat `tls_cert_path`/`tls_key_path`, no ACME.
+/// Still read — the upgrade to 2 is total, so there is nothing to ask
+/// about (§9.1) — but never written back until something else changes
+/// the state.
+pub const LEGACY_SCHEMA_VERSION: i64 = 1;
 
 /// The server's wg private key. Debug-redacted like a device token:
 /// this key decrypts every hub-routed packet, so it must not reach a
@@ -48,6 +56,137 @@ impl fmt::Debug for PrivateKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("PrivateKey(redacted)")
     }
+}
+
+/// Which ACME challenge proves control of the domain (§8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Challenge {
+    /// Needs :80 open, leaves no secret on the server.
+    Http01,
+    /// Needs no :80, but a DNS-editing token has to live on the server
+    /// for renewals (§13).
+    Dns01,
+}
+
+impl Challenge {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Challenge::Http01 => "http-01",
+            Challenge::Dns01 => "dns-01",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Challenge> {
+        match text {
+            "http-01" => Some(Challenge::Http01),
+            "dns-01" => Some(Challenge::Dns01),
+            _ => None,
+        }
+    }
+}
+
+/// What anago needs to renew a certificate it issued (§9.1).
+///
+/// `directory` is what separates staging from production, so it is
+/// stored rather than re-derived: a renewal must go back to the same
+/// CA the current certificate came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Acme {
+    pub directory: String,
+    /// `--acme-email`. Only needed to register an account again.
+    pub contact: Option<String>,
+    pub account_key_path: String,
+    pub account_url: String,
+    pub challenge: Challenge,
+    /// When the current certificate was received.
+    pub issued_at: i64,
+    /// When to renew. A decision, not the expiry — the expiry is
+    /// [`Tls::not_after`] (§9.1).
+    pub renew_after: i64,
+}
+
+/// Where the hub's certificate comes from, and — the part that decides
+/// behaviour — **who is allowed to write those files** (§9.1).
+///
+/// The paths are filled either way, so the code that hands PEM files to
+/// rustls never branches on the source. Overwriting a certificate
+/// somebody else manages is not undoable, which is why this distinction
+/// lives in the state file rather than being guessed from the paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TlsSource {
+    /// Paths a person gave with `--tls-cert/--tls-key`. anago reads
+    /// them and never writes them; certbot or whatever else put them
+    /// there owns them.
+    Manual,
+    /// anago issued this certificate and anago renews it.
+    Acme(Acme),
+}
+
+/// The hub's TLS material as the state file records it.
+///
+/// Encoding the source as an enum rather than a tag plus an optional
+/// object makes the one invariant §9.1 states — ACME details exist
+/// exactly when the source is ACME — unrepresentable otherwise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tls {
+    pub cert_path: String,
+    pub key_path: String,
+    /// `notAfter` read out of the certificate, or `None` when it could
+    /// not be read. This value never decides trust — rustls does the
+    /// verifying (§7); it schedules renewal and prints an expiry, so
+    /// failing to read it is safe.
+    pub not_after: Option<i64>,
+    pub source: TlsSource,
+}
+
+impl Tls {
+    /// A certificate a person supplied and keeps up to date themselves.
+    pub fn manual(cert_path: impl Into<String>, key_path: impl Into<String>) -> Tls {
+        Tls {
+            cert_path: cert_path.into(),
+            key_path: key_path.into(),
+            not_after: None,
+            source: TlsSource::Manual,
+        }
+    }
+
+    /// A certificate anago issued through ACME.
+    pub fn acme(cert_path: impl Into<String>, key_path: impl Into<String>, acme: Acme) -> Tls {
+        Tls {
+            cert_path: cert_path.into(),
+            key_path: key_path.into(),
+            not_after: None,
+            source: TlsSource::Acme(acme),
+        }
+    }
+
+    /// The ACME details when this certificate is ours to renew, `None`
+    /// when it is somebody else's file.
+    pub fn renewable(&self) -> Option<&Acme> {
+        match &self.source {
+            TlsSource::Manual => None,
+            TlsSource::Acme(acme) => Some(acme),
+        }
+    }
+}
+
+/// What anago remembers about the Cloudflare side of the domain
+/// (§9.1). Present once a token has been used to touch DNS at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cloudflare {
+    /// The zone the domain lives in. Worth caching: it never changes
+    /// while the domain does, and DNS-01 renewal needs it without
+    /// having to list zones again.
+    pub zone_id: String,
+    /// The A record anago created, so a later upsert edits *that*
+    /// record rather than picking one of several with the same name.
+    /// `None` before one exists, and again once the cache is found to
+    /// be stale (§9.1).
+    pub record_id: Option<String>,
+    /// Where the API token was stored, and `None` when it was not
+    /// stored at all — the token is only kept when DNS-01 renewal will
+    /// need it again (§9.1). Never the token itself.
+    pub token_path: Option<String>,
 }
 
 /// The hub's own wg identity and address.
@@ -82,8 +221,10 @@ pub struct ServerState {
     pub listen_port: u16,
     /// Control API TCP port.
     pub api_port: u16,
-    pub tls_cert_path: String,
-    pub tls_key_path: String,
+    pub tls: Tls,
+    /// `None` when Cloudflare was never used for this domain — the
+    /// manual DNS path of M0 (§6.1).
+    pub cloudflare: Option<Cloudflare>,
     pub server: ServerKeys,
     pub peers: Vec<Peer>,
     /// Issued join codes, spent and expired ones included — the record
@@ -105,8 +246,8 @@ impl ServerState {
             ("subnet", Value::str(self.subnet.to_string())),
             ("listen_port", Value::Int(i64::from(self.listen_port))),
             ("api_port", Value::Int(i64::from(self.api_port))),
-            ("tls_cert_path", Value::str(self.tls_cert_path.as_str())),
-            ("tls_key_path", Value::str(self.tls_key_path.as_str())),
+            ("tls", tls_to_json(&self.tls)),
+            ("cloudflare", cloudflare_to_json(self.cloudflare.as_ref())),
             (
                 "server",
                 Value::obj([
@@ -137,7 +278,7 @@ impl ServerState {
 
         // Version first: on a newer file, nothing below is trustworthy.
         let version = int_field(obj, "version")?;
-        if version != SCHEMA_VERSION {
+        if version != SCHEMA_VERSION && version != LEGACY_SCHEMA_VERSION {
             return Err(StateError::UnsupportedVersion(version));
         }
 
@@ -168,13 +309,143 @@ impl ServerState {
             subnet,
             listen_port: port_field(obj, "listen_port")?,
             api_port: port_field(obj, "api_port")?,
-            tls_cert_path: proto::string_field(obj, "tls_cert_path")?,
-            tls_key_path: proto::string_field(obj, "tls_key_path")?,
+            tls: tls_from_json(obj, version)?,
+            cloudflare: cloudflare_from_json(obj, version)?,
             server,
             peers,
             codes,
         })
     }
+}
+
+fn tls_to_json(tls: &Tls) -> Value {
+    let (source, acme) = match &tls.source {
+        TlsSource::Manual => ("manual", Value::Null),
+        TlsSource::Acme(acme) => ("acme", acme_to_json(acme)),
+    };
+    Value::obj([
+        ("source", Value::str(source)),
+        ("cert_path", Value::str(tls.cert_path.as_str())),
+        ("key_path", Value::str(tls.key_path.as_str())),
+        ("not_after", opt_time(tls.not_after)),
+        ("acme", acme),
+    ])
+}
+
+/// Reads the `tls` object — or, on a version 1 file, the two flat paths
+/// M0 wrote.
+///
+/// The upgrade is total: a file without ACME fields can only have meant
+/// a manually supplied certificate, so there is nothing to ask and
+/// nothing to lose. `not_after` stays `None` because reading is reading
+/// — the expiry gets filled in the next time the certificate is loaded
+/// (§9.1).
+fn tls_from_json(obj: &Object, version: i64) -> Result<Tls, StateError> {
+    if version == LEGACY_SCHEMA_VERSION {
+        return Ok(Tls::manual(
+            proto::string_field(obj, "tls_cert_path")?,
+            proto::string_field(obj, "tls_key_path")?,
+        ));
+    }
+
+    let tls = object_field(obj, "tls")?;
+    let source = proto::string_field(tls, "source").map_err(|e| e.within("tls"))?;
+    let acme = opt_object_field(tls, "acme").map_err(|e| e.within("tls"))?;
+    let source = match (source.as_str(), acme) {
+        ("manual", None) => TlsSource::Manual,
+        ("acme", Some(found)) => TlsSource::Acme(acme_from_json(found)?),
+        // The two contradictions the enum exists to rule out. Guessing
+        // which half is right would either renew somebody else's
+        // certificate or stop renewing ours.
+        ("manual", Some(_)) => {
+            return Err(StateError::bad_value(
+                "tls.acme",
+                "source is \"manual\" but acme details are present".to_string(),
+            ))
+        }
+        ("acme", None) => {
+            return Err(StateError::bad_value(
+                "tls.acme",
+                "source is \"acme\" but acme details are null".to_string(),
+            ))
+        }
+        (other, _) => {
+            return Err(StateError::bad_value(
+                "tls.source",
+                format!("{other:?} is not \"manual\" or \"acme\""),
+            ))
+        }
+    };
+
+    Ok(Tls {
+        cert_path: proto::string_field(tls, "cert_path").map_err(|e| e.within("tls"))?,
+        key_path: proto::string_field(tls, "key_path").map_err(|e| e.within("tls"))?,
+        not_after: opt_int_field(tls, "not_after").map_err(|e| e.within("tls"))?,
+        source,
+    })
+}
+
+fn cloudflare_to_json(cloudflare: Option<&Cloudflare>) -> Value {
+    match cloudflare {
+        None => Value::Null,
+        Some(cf) => Value::obj([
+            ("zone_id", Value::str(cf.zone_id.as_str())),
+            ("record_id", opt_str(cf.record_id.as_deref())),
+            ("token_path", opt_str(cf.token_path.as_deref())),
+        ]),
+    }
+}
+
+/// A version 1 file predates the field entirely, and M0 had no way to
+/// touch Cloudflare, so its absence there means `None` rather than a
+/// missing key (§9.1). From version 2 on the writer always emits it.
+fn cloudflare_from_json(obj: &Object, version: i64) -> Result<Option<Cloudflare>, StateError> {
+    if version == LEGACY_SCHEMA_VERSION {
+        return Ok(None);
+    }
+    let at = |e: DecodeError| e.within("cloudflare");
+    let Some(cf) = opt_object_field(obj, "cloudflare")? else {
+        return Ok(None);
+    };
+    Ok(Some(Cloudflare {
+        zone_id: proto::string_field(cf, "zone_id").map_err(at)?,
+        record_id: opt_string_field(cf, "record_id").map_err(at)?,
+        token_path: opt_string_field(cf, "token_path").map_err(at)?,
+    }))
+}
+
+fn acme_to_json(acme: &Acme) -> Value {
+    Value::obj([
+        ("directory", Value::str(acme.directory.as_str())),
+        ("contact", opt_str(acme.contact.as_deref())),
+        (
+            "account_key_path",
+            Value::str(acme.account_key_path.as_str()),
+        ),
+        ("account_url", Value::str(acme.account_url.as_str())),
+        ("challenge", Value::str(acme.challenge.as_str())),
+        ("issued_at", Value::Int(acme.issued_at)),
+        ("renew_after", Value::Int(acme.renew_after)),
+    ])
+}
+
+fn acme_from_json(obj: &Object) -> Result<Acme, StateError> {
+    let at = |e: DecodeError| e.within("tls.acme");
+    let challenge = proto::string_field(obj, "challenge").map_err(at)?;
+    Ok(Acme {
+        directory: proto::string_field(obj, "directory").map_err(at)?,
+        contact: opt_string_field(obj, "contact").map_err(at)?,
+        account_key_path: proto::string_field(obj, "account_key_path").map_err(at)?,
+        account_url: proto::string_field(obj, "account_url").map_err(at)?,
+        challenge: Challenge::parse(&challenge).ok_or_else(|| {
+            StateError::bad_value(
+                "tls.acme.challenge",
+                format!("{challenge:?} is not \"http-01\" or \"dns-01\""),
+            )
+        })?,
+        issued_at: int_field(obj, "issued_at").map_err(at)?,
+        renew_after: int_field(obj, "renew_after").map_err(at)?,
+    })
 }
 
 fn peer_to_json(peer: &Peer) -> Value {
@@ -237,6 +508,13 @@ fn server_from_json(value: &Value) -> Result<ServerKeys, StateError> {
     })
 }
 
+fn opt_str(text: Option<&str>) -> Value {
+    match text {
+        Some(text) => Value::str(text),
+        None => Value::Null,
+    }
+}
+
 fn opt_time(at: Option<i64>) -> Value {
     match at {
         Some(at) => Value::Int(at),
@@ -260,6 +538,39 @@ fn opt_int_field(obj: &Object, name: &str) -> Result<Option<i64>, DecodeError> {
         Some(Value::Null) => Ok(None),
         Some(found) => found
             .as_i64()
+            .map(Some)
+            .ok_or_else(|| DecodeError::wrong_type(name)),
+    }
+}
+
+/// A string field that is present but may be `null` — `contact`.
+fn opt_string_field(obj: &Object, name: &str) -> Result<Option<String>, DecodeError> {
+    match obj.get(name) {
+        None => Err(DecodeError::missing(name)),
+        Some(Value::Null) => Ok(None),
+        Some(found) => found
+            .as_str()
+            .map(|s| Some(s.to_string()))
+            .ok_or_else(|| DecodeError::wrong_type(name)),
+    }
+}
+
+fn object_field<'a>(obj: &'a Object, name: &str) -> Result<&'a Object, DecodeError> {
+    match obj.get(name) {
+        None => Err(DecodeError::missing(name)),
+        Some(found) => found
+            .as_object()
+            .ok_or_else(|| DecodeError::wrong_type(name)),
+    }
+}
+
+/// An object field that is present but may be `null` — `tls.acme`.
+fn opt_object_field<'a>(obj: &'a Object, name: &str) -> Result<Option<&'a Object>, DecodeError> {
+    match obj.get(name) {
+        None => Err(DecodeError::missing(name)),
+        Some(Value::Null) => Ok(None),
+        Some(found) => found
+            .as_object()
             .map(Some)
             .ok_or_else(|| DecodeError::wrong_type(name)),
     }
@@ -292,9 +603,10 @@ pub enum StateError {
     Json(json::Error),
     /// A field is missing or of the wrong JSON type.
     Shape(DecodeError),
-    /// `version` is not [`SCHEMA_VERSION`]. Refusing beats guessing: a
-    /// newer file half-read and rewritten would lose whatever the newer
-    /// version added.
+    /// `version` is neither [`SCHEMA_VERSION`] nor the readable
+    /// [`LEGACY_SCHEMA_VERSION`]. Refusing beats guessing: a newer file
+    /// half-read and rewritten would lose whatever the newer version
+    /// added.
     UnsupportedVersion(i64),
     /// Right JSON type, but not a valid value for that field — a
     /// malformed subnet, a port above 65535, a name breaking §8.1.
@@ -340,7 +652,8 @@ impl fmt::Display for StateError {
             StateError::Shape(e) => write!(f, "{e}"),
             StateError::UnsupportedVersion(version) => write!(
                 f,
-                "state file is version {version}, this build writes {SCHEMA_VERSION}"
+                "state file is version {version}, this build writes {SCHEMA_VERSION} \
+                 and reads {LEGACY_SCHEMA_VERSION}"
             ),
             StateError::BadValue { field, message } => {
                 write!(f, "field {field:?}: {message}")
@@ -491,8 +804,8 @@ mod tests {
             subnet: Subnet::parse("10.100.0.0/24").unwrap(),
             listen_port: 51820,
             api_port: 443,
-            tls_cert_path: "/etc/ssl/anago/fullchain.pem".to_string(),
-            tls_key_path: "/etc/ssl/anago/privkey.pem".to_string(),
+            tls: Tls::manual("/etc/ssl/anago/fullchain.pem", "/etc/ssl/anago/privkey.pem"),
+            cloudflare: None,
             server: ServerKeys {
                 private_key: PrivateKey::new("cHJpdmF0ZSBrZXk="),
                 public_key: "cHVibGljIGtleQ==".to_string(),
@@ -589,14 +902,14 @@ mod tests {
                 "subnet",
                 "listen_port",
                 "api_port",
-                "tls_cert_path",
-                "tls_key_path",
+                "tls",
+                "cloudflare",
                 "server",
                 "peers",
                 "codes",
             ]
         );
-        assert!(text.starts_with("{\n  \"version\": 1,"));
+        assert!(text.starts_with("{\n  \"version\": 2,"));
     }
 
     #[test]
@@ -608,23 +921,371 @@ mod tests {
     }
 
     #[test]
-    fn a_different_version_stops_the_read() {
+    fn an_unknown_version_stops_the_read() {
+        // 3 is a file from a build that knows something we do not;
+        // 0 is not a version at all. Both refuse rather than guess.
         assert_eq!(
-            err(&with_field("version", Value::Int(2))),
-            StateError::UnsupportedVersion(2)
+            err(&with_field("version", Value::Int(3))),
+            StateError::UnsupportedVersion(3)
         );
         assert_eq!(
             err(&with_field("version", Value::Int(0))),
             StateError::UnsupportedVersion(0)
         );
         assert_eq!(
-            err(&with_field("version", Value::Int(2))).to_string(),
-            "state file is version 2, this build writes 1"
+            err(&with_field("version", Value::Int(3))).to_string(),
+            "state file is version 3, this build writes 2 and reads 1"
         );
         // Shape problems in `version` are still shape problems.
         assert_eq!(
             err(&with_field("version", Value::str("1"))),
             StateError::Shape(DecodeError::wrong_type("version"))
+        );
+    }
+
+    // ------------------------------------------------------------ tls
+
+    fn acme() -> Acme {
+        Acme {
+            directory: "https://acme-v02.api.letsencrypt.org/directory".to_string(),
+            contact: Some("jo@example.com".to_string()),
+            account_key_path: "/var/lib/anago/tls/account.key".to_string(),
+            account_url: "https://acme-v02.api.letsencrypt.org/acme/acct/1234".to_string(),
+            challenge: Challenge::Http01,
+            issued_at: 1755500000,
+            renew_after: 1760684000,
+        }
+    }
+
+    fn issued() -> ServerState {
+        let mut state = sample();
+        state.tls = Tls::acme(
+            "/var/lib/anago/tls/fullchain.pem",
+            "/var/lib/anago/tls/privkey.pem",
+            acme(),
+        );
+        state.tls.not_after = Some(1763276000);
+        state
+    }
+
+    /// Replaces one field inside the `tls` object.
+    fn with_tls_field(key: &str, value: Value) -> Value {
+        let state = issued().to_json();
+        let mut tls = Object::new();
+        for (k, v) in state.get("tls").unwrap().as_object().unwrap().iter() {
+            let v = if k == key { value.clone() } else { v.clone() };
+            tls.insert(k, v).unwrap();
+        }
+        let mut obj = Object::new();
+        for (k, v) in state.as_object().unwrap().iter() {
+            let v = if k == "tls" {
+                Value::Obj(tls.clone())
+            } else {
+                v.clone()
+            };
+            obj.insert(k, v).unwrap();
+        }
+        Value::Obj(obj)
+    }
+
+    /// Replaces one field inside the `tls.acme` object.
+    fn with_acme_field(key: &str, value: Value) -> Value {
+        let state = issued().to_json();
+        let current = state.get("tls").unwrap().get("acme").unwrap();
+        let mut acme = Object::new();
+        for (k, v) in current.as_object().unwrap().iter() {
+            let v = if k == key { value.clone() } else { v.clone() };
+            acme.insert(k, v).unwrap();
+        }
+        with_tls_field("acme", Value::Obj(acme))
+    }
+
+    #[test]
+    fn an_acme_certificate_round_trips() {
+        let state = issued();
+        assert_eq!(ServerState::parse(&state.to_json_string()).unwrap(), state);
+    }
+
+    #[test]
+    fn a_manual_certificate_round_trips() {
+        let state = sample();
+        assert_eq!(ServerState::parse(&state.to_json_string()).unwrap(), state);
+        assert_eq!(state.tls.source, TlsSource::Manual);
+    }
+
+    #[test]
+    fn both_challenges_survive_the_file() {
+        for challenge in [Challenge::Http01, Challenge::Dns01] {
+            let mut state = issued();
+            if let TlsSource::Acme(acme) = &mut state.tls.source {
+                acme.challenge = challenge;
+            }
+            let read = ServerState::parse(&state.to_json_string()).unwrap();
+            assert_eq!(read.tls.renewable().unwrap().challenge, challenge);
+        }
+    }
+
+    #[test]
+    fn a_missing_contact_is_null_not_absent() {
+        let mut state = issued();
+        if let TlsSource::Acme(acme) = &mut state.tls.source {
+            acme.contact = None;
+        }
+        let text = state.to_json_string();
+        assert!(text.contains("\"contact\": null"), "{text}");
+        assert_eq!(ServerState::parse(&text).unwrap(), state);
+    }
+
+    #[test]
+    fn the_tls_object_is_written_in_the_documented_shape() {
+        // §9.1 pins these names and this order.
+        let text = issued().to_json_string();
+        let keys: Vec<&str> = text
+            .lines()
+            .filter(|line| line.starts_with("    \""))
+            .map(|line| line.trim_start().split('"').nth(1).unwrap())
+            .take(5)
+            .collect();
+        assert_eq!(
+            keys,
+            ["source", "cert_path", "key_path", "not_after", "acme"]
+        );
+    }
+
+    #[test]
+    fn a_manual_source_writes_a_null_acme_and_a_null_expiry() {
+        let text = sample().to_json_string();
+        assert!(text.contains("\"source\": \"manual\""), "{text}");
+        assert!(text.contains("\"acme\": null"), "{text}");
+        assert!(text.contains("\"not_after\": null"), "{text}");
+    }
+
+    #[test]
+    fn who_renews_is_the_question_the_source_answers() {
+        assert!(sample().tls.renewable().is_none());
+        assert_eq!(issued().tls.renewable(), Some(&acme()));
+    }
+
+    #[test]
+    fn the_two_contradictions_are_refused() {
+        // Neither half of a mismatch can be trusted: guessing "manual"
+        // stops renewals, guessing "acme" overwrites someone's file.
+        assert_eq!(
+            err(&with_tls_field("source", Value::str("manual"))),
+            StateError::bad_value(
+                "tls.acme",
+                "source is \"manual\" but acme details are present".to_string()
+            )
+        );
+        assert_eq!(
+            err(&with_tls_field("acme", Value::Null)),
+            StateError::bad_value(
+                "tls.acme",
+                "source is \"acme\" but acme details are null".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn an_unknown_source_or_challenge_is_refused() {
+        assert_eq!(
+            err(&with_tls_field("source", Value::str("certbot"))),
+            StateError::bad_value(
+                "tls.source",
+                "\"certbot\" is not \"manual\" or \"acme\"".to_string()
+            )
+        );
+        assert_eq!(
+            err(&with_acme_field("challenge", Value::str("tls-alpn-01"))),
+            StateError::bad_value(
+                "tls.acme.challenge",
+                "\"tls-alpn-01\" is not \"http-01\" or \"dns-01\"".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn tls_fields_are_named_when_they_are_missing_or_mistyped() {
+        assert_eq!(
+            err(&with_tls_field("cert_path", Value::Int(1))),
+            StateError::Shape(DecodeError::wrong_type("cert_path").within("tls"))
+        );
+        assert_eq!(
+            err(&with_tls_field("not_after", Value::str("soon"))),
+            StateError::Shape(DecodeError::wrong_type("not_after").within("tls"))
+        );
+        assert_eq!(
+            err(&with_field("tls", Value::str("/etc/ssl/x.pem"))),
+            StateError::Shape(DecodeError::wrong_type("tls"))
+        );
+    }
+
+    // --------------------------------------------------- cloudflare
+
+    fn cloudflare() -> Cloudflare {
+        Cloudflare {
+            zone_id: "023e105f4ecef8ad9ca31a8372d0c353".to_string(),
+            record_id: Some("372e67954025e0ba6aaa6d586b9e0b59".to_string()),
+            token_path: Some("/var/lib/anago/cf-token".to_string()),
+        }
+    }
+
+    #[test]
+    fn a_cloudflare_block_round_trips() {
+        let mut state = issued();
+        state.cloudflare = Some(cloudflare());
+        assert_eq!(ServerState::parse(&state.to_json_string()).unwrap(), state);
+    }
+
+    #[test]
+    fn a_zone_without_a_record_or_a_stored_token_round_trips() {
+        // The HTTP-01 shape: the zone is known, no record has been made
+        // yet, and the token was used once and forgotten (§9.1).
+        let mut state = issued();
+        state.cloudflare = Some(Cloudflare {
+            record_id: None,
+            token_path: None,
+            ..cloudflare()
+        });
+        let text = state.to_json_string();
+        assert!(text.contains("\"record_id\": null"), "{text}");
+        assert!(text.contains("\"token_path\": null"), "{text}");
+        assert_eq!(ServerState::parse(&text).unwrap(), state);
+    }
+
+    #[test]
+    fn no_cloudflare_is_written_as_null_not_left_out() {
+        let text = sample().to_json_string();
+        assert!(text.contains("\n  \"cloudflare\": null,"), "{text}");
+        assert_eq!(ServerState::parse(&text).unwrap().cloudflare, None);
+    }
+
+    #[test]
+    fn the_cloudflare_block_is_written_in_the_documented_shape() {
+        let mut state = issued();
+        state.cloudflare = Some(cloudflare());
+        let text = state.to_json_string();
+        let start = text.find("\"cloudflare\": {").unwrap();
+        let keys: Vec<&str> = text[start..]
+            .lines()
+            .skip(1)
+            .take(3)
+            .map(|line| line.trim_start().split('"').nth(1).unwrap())
+            .collect();
+        assert_eq!(keys, ["zone_id", "record_id", "token_path"]);
+    }
+
+    #[test]
+    fn cloudflare_fields_are_named_when_they_are_wrong() {
+        let mut state = issued();
+        state.cloudflare = Some(cloudflare());
+        let value = state.to_json();
+        let mut cf = Object::new();
+        for (k, v) in value.get("cloudflare").unwrap().as_object().unwrap().iter() {
+            let v = if k == "zone_id" {
+                Value::Int(1)
+            } else {
+                v.clone()
+            };
+            cf.insert(k, v).unwrap();
+        }
+        let mut obj = Object::new();
+        for (k, v) in value.as_object().unwrap().iter() {
+            let v = if k == "cloudflare" {
+                Value::Obj(cf.clone())
+            } else {
+                v.clone()
+            };
+            obj.insert(k, v).unwrap();
+        }
+        assert_eq!(
+            err(&Value::Obj(obj)),
+            StateError::Shape(DecodeError::wrong_type("zone_id").within("cloudflare"))
+        );
+        assert_eq!(
+            err(&with_field("cloudflare", Value::str("023e105f"))),
+            StateError::Shape(DecodeError::wrong_type("cloudflare"))
+        );
+    }
+
+    #[test]
+    fn a_version_two_file_without_the_key_is_refused() {
+        // The writer always emits it, so an absent key means a file we
+        // did not write — the same rule `last_seen` follows.
+        let mut obj = Object::new();
+        for (k, v) in sample().to_json().as_object().unwrap().iter() {
+            if k != "cloudflare" {
+                obj.insert(k, v.clone()).unwrap();
+            }
+        }
+        assert_eq!(
+            err(&Value::Obj(obj)),
+            StateError::Shape(DecodeError::missing("cloudflare"))
+        );
+    }
+
+    // ------------------------------------------- reading an M0 file
+
+    /// A version 1 file exactly as M0 wrote it.
+    fn legacy_text() -> String {
+        let text = sample().to_json_string();
+        let mut obj = Object::new();
+        for (k, v) in json::parse(&text).unwrap().as_object().unwrap().iter() {
+            match k {
+                "version" => obj.insert("version", Value::Int(1)).unwrap(),
+                "tls" => {
+                    obj.insert("tls_cert_path", Value::str("/etc/ssl/anago/fullchain.pem"))
+                        .unwrap();
+                    obj.insert("tls_key_path", Value::str("/etc/ssl/anago/privkey.pem"))
+                        .unwrap();
+                }
+                // M0 never wrote this key; a v1 file has no trace of it.
+                "cloudflare" => {}
+                _ => obj.insert(k, v.clone()).unwrap(),
+            }
+        }
+        json::to_string_pretty(&Value::Obj(obj))
+    }
+
+    #[test]
+    fn a_version_one_file_upgrades_to_a_manual_certificate() {
+        let read = ServerState::parse(&legacy_text()).unwrap();
+        // The upgrade is total, so it lands on exactly the sample.
+        assert_eq!(read, sample());
+        assert_eq!(read.tls.source, TlsSource::Manual);
+        assert_eq!(read.tls.not_after, None);
+        assert_eq!(read.cloudflare, None);
+    }
+
+    #[test]
+    fn upgrading_does_not_rewrite_the_file() {
+        // Reading is reading (§9.1): the caller gets a value, and the
+        // file on disk is still version 1 until something else saves.
+        let text = legacy_text();
+        let before = text.clone();
+        let _ = ServerState::parse(&text).unwrap();
+        assert_eq!(text, before);
+        assert!(text.contains("\"version\": 1"), "{text}");
+    }
+
+    #[test]
+    fn saving_an_upgraded_state_writes_version_two() {
+        let read = ServerState::parse(&legacy_text()).unwrap();
+        let written = read.to_json_string();
+        assert!(written.starts_with("{\n  \"version\": 2,"), "{written}");
+        assert!(!written.contains("tls_cert_path"), "{written}");
+        // A file stamped 2 has to *be* a version 2 file, absent parts
+        // included — that is what the stamp promises (§9.1).
+        assert!(written.contains("\n  \"cloudflare\": null,"), "{written}");
+        assert_eq!(ServerState::parse(&written).unwrap(), read);
+    }
+
+    #[test]
+    fn a_version_one_file_without_the_old_paths_is_refused() {
+        let text = legacy_text().replace("tls_cert_path", "cert_path");
+        assert_eq!(
+            err(&json::parse(&text).unwrap()),
+            StateError::Shape(DecodeError::missing("tls_cert_path"))
         );
     }
 

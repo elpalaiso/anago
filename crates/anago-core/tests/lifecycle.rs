@@ -17,7 +17,7 @@ use anago_core::json;
 use anago_core::name::DeviceName;
 use anago_core::proto::{JoinResponse, PeerInfo, PeersResponse};
 use anago_core::render::{self, LastHandshake, PeerRow};
-use anago_core::state::{JoinRejection, PrivateKey, Registration, ServerKeys, ServerState};
+use anago_core::state::{JoinRejection, PrivateKey, Registration, ServerKeys, ServerState, Tls};
 use anago_core::subnet::Subnet;
 use anago_core::token::{DeviceToken, TokenHash};
 use anago_core::wgconf::{self, ClientProfile};
@@ -44,8 +44,8 @@ fn fresh_hub() -> ServerState {
         subnet,
         listen_port: 51820,
         api_port: 443,
-        tls_cert_path: "/etc/ssl/anago/fullchain.pem".to_string(),
-        tls_key_path: "/etc/ssl/anago/privkey.pem".to_string(),
+        tls: Tls::manual("/etc/ssl/anago/fullchain.pem", "/etc/ssl/anago/privkey.pem"),
+        cloudflare: None,
         server: ServerKeys {
             private_key: PrivateKey::new(SERVER_PRIVATE),
             public_key: SERVER_PUBLIC.to_string(),

@@ -55,8 +55,8 @@ pub fn run(root: &Path, wg_dir: &Path) -> Result<(), ServeError> {
     wg::check_tools_from_env().map_err(|e| ServeError::Wg(e.to_string()))?;
 
     let loaded = tls::load(
-        Path::new(&state.tls_cert_path),
-        Path::new(&state.tls_key_path),
+        Path::new(&state.tls.cert_path),
+        Path::new(&state.tls.key_path),
     )
     .map_err(|e| ServeError::Tls(e.to_string()))?;
     for warning in &loaded.warnings {
@@ -127,7 +127,7 @@ impl std::error::Error for ServeError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anago_core::state::{PrivateKey, ServerKeys};
+    use anago_core::state::{PrivateKey, ServerKeys, Tls};
     use anago_core::subnet::Subnet;
 
     fn state() -> ServerState {
@@ -136,8 +136,8 @@ mod tests {
             subnet: Subnet::parse("10.100.0.0/24").unwrap(),
             listen_port: 51820,
             api_port: 443,
-            tls_cert_path: "/etc/ssl/anago/fullchain.pem".to_string(),
-            tls_key_path: "/etc/ssl/anago/privkey.pem".to_string(),
+            tls: Tls::manual("/etc/ssl/anago/fullchain.pem", "/etc/ssl/anago/privkey.pem"),
+            cloudflare: None,
             server: ServerKeys {
                 private_key: PrivateKey::new("c2VydmVyIHByaXZhdGU="),
                 public_key: "c2VydmVyIHB1YmxpYw==".to_string(),

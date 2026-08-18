@@ -251,7 +251,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use anago_core::name::DeviceName;
-    use anago_core::state::{Peer, PrivateKey, ServerKeys};
+    use anago_core::state::{Peer, PrivateKey, ServerKeys, Tls};
     use anago_core::subnet::Subnet;
     use anago_core::token::TokenHash;
 
@@ -282,8 +282,8 @@ mod tests {
             subnet: Subnet::parse("10.100.0.0/24").unwrap(),
             listen_port: 51820,
             api_port: 443,
-            tls_cert_path: "/etc/ssl/anago/fullchain.pem".to_string(),
-            tls_key_path: "/etc/ssl/anago/privkey.pem".to_string(),
+            tls: Tls::manual("/etc/ssl/anago/fullchain.pem", "/etc/ssl/anago/privkey.pem"),
+            cloudflare: None,
             server: ServerKeys {
                 private_key: PrivateKey::new("c2VydmVyIHByaXZhdGU="),
                 public_key: "c2VydmVyIHB1YmxpYw==".to_string(),

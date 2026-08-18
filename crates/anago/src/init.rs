@@ -14,7 +14,7 @@ use std::net::{Ipv4Addr, UdpSocket};
 use std::path::{Path, PathBuf};
 
 use anago_core::code::{IssuedCode, JoinCode, DEFAULT_TTL_SECS};
-use anago_core::state::{PrivateKey, ServerKeys, ServerState};
+use anago_core::state::{PrivateKey, ServerKeys, ServerState, Tls};
 use anago_core::wgconf;
 
 use crate::cli::ServerInit;
@@ -38,8 +38,8 @@ pub fn build_state(
         subnet: args.subnet,
         listen_port: args.listen_port,
         api_port: args.api_port,
-        tls_cert_path: args.tls_cert.clone(),
-        tls_key_path: args.tls_key.clone(),
+        tls: Tls::manual(args.tls_cert.clone(), args.tls_key.clone()),
+        cloudflare: None,
         server: ServerKeys {
             private_key,
             public_key,
@@ -435,7 +435,7 @@ mod tests {
             "10.100.0.1".parse::<Ipv4Addr>().unwrap()
         );
         assert_eq!(state.server.public_key, "c2VydmVyIHB1YmxpYw==");
-        assert_eq!(state.tls_cert_path, "/etc/ssl/anago/fullchain.pem");
+        assert_eq!(state.tls.cert_path, "/etc/ssl/anago/fullchain.pem");
         assert!(state.peers.is_empty(), "a fresh hub has no devices");
 
         // One live code, so init can end with a join line (§6.1).
