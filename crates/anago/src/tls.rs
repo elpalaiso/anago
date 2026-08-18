@@ -64,6 +64,12 @@ pub fn load(cert_path: &Path, key_path: &Path) -> Result<LoadedTls, TlsError> {
 
 /// Builds a server config from PEM bytes. Pure — every failure below is
 /// reproducible from a byte slice in a unit test.
+///
+/// Only the tests call it: [`load`] runs the same three steps by hand
+/// so that it can name the file each failure belongs to. This is that
+/// sequence without the blame, which is what makes it usable on a byte
+/// slice with no path behind it.
+#[cfg(test)]
 pub fn build_config(cert_pem: &[u8], key_pem: &[u8]) -> Result<ServerConfig, PemError> {
     let certs = parse_certs(cert_pem)?;
     let key = parse_key(key_pem)?;

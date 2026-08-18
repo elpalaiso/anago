@@ -35,19 +35,9 @@ impl ServerPaths {
         ServerPaths { root: root.into() }
     }
 
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
     /// The single state file (§9).
     pub fn state_file(&self) -> PathBuf {
         self.root.join("state.json")
-    }
-
-    /// Scratch name for the tmp+rename write. Deliberately a sibling of
-    /// the state file: rename is only atomic within one filesystem.
-    pub fn state_tmp(&self) -> PathBuf {
-        self.root.join("state.json.tmp")
     }
 
     /// The flock target that serializes concurrent joins (§13).
@@ -57,12 +47,6 @@ impl ServerPaths {
     /// unlinked inode while the next writer locks the new one.
     pub fn state_lock(&self) -> PathBuf {
         self.root.join("state.lock")
-    }
-
-    /// ACME account and certificates (§9). Empty in M0, which takes
-    /// `--tls-cert`/`--tls-key` and only records those paths.
-    pub fn tls_dir(&self) -> PathBuf {
-        self.root.join("tls")
     }
 }
 
@@ -94,13 +78,6 @@ impl ClientPaths {
     /// config and nowhere else.
     pub fn device_file(&self) -> PathBuf {
         self.dir.join(DEVICE_FILE)
-    }
-
-    /// Serializes `anago join` against itself. Two joins on one device
-    /// would race over the same two files — and the loser's cleanup
-    /// would delete the winner's config.
-    pub fn join_lock(&self) -> PathBuf {
-        self.dir.join(JOIN_LOCK)
     }
 }
 
@@ -285,13 +262,7 @@ mod tests {
     fn server_files_hang_off_the_root_it_is_given() {
         let paths = server();
         assert_eq!(paths.state_file(), Path::new("/var/lib/anago/state.json"));
-        assert_eq!(
-            paths.state_tmp(),
-            Path::new("/var/lib/anago/state.json.tmp")
-        );
         assert_eq!(paths.state_lock(), Path::new("/var/lib/anago/state.lock"));
-        assert_eq!(paths.tls_dir(), Path::new("/var/lib/anago/tls"));
-        assert_eq!(paths.root(), Path::new("/var/lib/anago"));
     }
 
     #[test]
@@ -304,14 +275,6 @@ mod tests {
             Path::new("/tmp/anago-test-123/state.json")
         );
         assert!(paths.state_file().starts_with("/tmp/anago-test-123"));
-    }
-
-    #[test]
-    fn the_temp_file_is_a_sibling_of_the_state_file() {
-        // tmp+rename is only atomic within one filesystem.
-        let paths = server();
-        assert_eq!(paths.state_tmp().parent(), paths.state_file().parent());
-        assert_ne!(paths.state_tmp(), paths.state_file());
     }
 
     #[test]
@@ -353,14 +316,16 @@ mod tests {
     }
 
     #[test]
-    fn the_join_lock_sits_beside_the_device_file() {
-        let paths = ClientPaths::new("/home/jo/.config/anago");
-        assert_eq!(
-            paths.join_lock(),
-            Path::new("/home/jo/.config/anago/join.lock")
-        );
-        assert_eq!(paths.join_lock().parent(), paths.device_file().parent());
-        assert_ne!(paths.join_lock(), paths.device_file());
+    fn the_files_in_the_config_directory_are_named_not_pathed() {
+        // Both are opened relative to a directory descriptor (`openat`
+        // against the handle `join` holds). A name with a separator in
+        // it would escape that directory and put the check and the
+        // write back on different inodes.
+        for name in [DEVICE_FILE, JOIN_LOCK] {
+            assert!(!name.contains('/'), "{name} is a path, not a name");
+            assert_ne!(name, "..");
+        }
+        assert_ne!(DEVICE_FILE, JOIN_LOCK);
     }
 
     #[test]

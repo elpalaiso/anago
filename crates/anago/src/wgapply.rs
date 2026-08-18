@@ -38,16 +38,6 @@ pub enum Action {
     BringUp,
 }
 
-/// [`Action::Sync`] when the interface exists, [`Action::BringUp`] when
-/// it does not.
-pub fn action_for(interface_is_up: bool) -> Action {
-    if interface_is_up {
-        Action::Sync
-    } else {
-        Action::BringUp
-    }
-}
-
 /// What to do, given what the kernel looks like and what was last
 /// applied *successfully*.
 ///
@@ -231,11 +221,15 @@ impl Applier for WgApplier {
     }
 }
 
-/// An applier that does nothing, for `--no-systemd` dry runs and for
-/// tests that must not touch the kernel.
+/// An applier that does nothing, for tests that must not touch the
+/// kernel. The program itself always has a real interface to keep in
+/// step — `--no-systemd` changes who starts the server, not whether
+/// WireGuard is configured.
+#[cfg(test)]
 #[derive(Debug, Default)]
 pub struct NoopApplier;
 
+#[cfg(test)]
 impl Applier for NoopApplier {
     fn apply(&self, _state: &ServerState) -> Result<(), WgError> {
         Ok(())
@@ -356,8 +350,9 @@ mod tests {
     #[test]
     fn a_running_interface_is_synced_rather_than_restarted() {
         // `wg-quick down`/`up` would drop every established tunnel.
-        assert_eq!(action_for(true), Action::Sync);
-        assert_eq!(action_for(false), Action::BringUp);
+        assert_eq!(plan(true, Some("old"), "new"), Some(Action::Sync));
+        // Down is the only reason to bring the interface up.
+        assert_eq!(plan(false, Some("new"), "new"), Some(Action::BringUp));
     }
 
     #[test]

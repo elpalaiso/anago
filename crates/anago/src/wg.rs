@@ -81,11 +81,6 @@ pub fn quick_up(config: &Path) -> Cmd {
     Cmd::with_path(WG_QUICK, &["up"], config)
 }
 
-/// `wg-quick down <config>`.
-pub fn quick_down(config: &Path) -> Cmd {
-    Cmd::with_path(WG_QUICK, &["down"], config)
-}
-
 /// `wg-quick strip <config>` — the same file with the keys plain `wg`
 /// does not understand (`Address`, `DNS`, `PostUp`) removed, which is
 /// what [`syncconf`] must be fed.
@@ -403,10 +398,6 @@ mod tests {
         assert_eq!(
             quick_up(Path::new("/etc/wireguard/anago.conf")).display(),
             "wg-quick up /etc/wireguard/anago.conf"
-        );
-        assert_eq!(
-            quick_down(Path::new("/etc/wireguard/anago.conf")).display(),
-            "wg-quick down /etc/wireguard/anago.conf"
         );
         assert_eq!(
             quick_strip(Path::new("/etc/wireguard/anago.conf")).display(),

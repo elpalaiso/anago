@@ -94,9 +94,7 @@ impl DeviceConfig {
         json::to_string_pretty(&self.to_json())
     }
 
-    /// Reads a device file back. `ls` and `rm` are its callers, and
-    /// they land in the next slice.
-    #[allow(dead_code)]
+    /// Reads a device file back — `ls` and `rm` both start here.
     pub fn parse(text: &str) -> Result<DeviceConfig, JoinError> {
         let value = json::parse(text).map_err(|e| JoinError::DeviceFile(e.to_string()))?;
         let obj = proto::object(&value).map_err(|e| JoinError::DeviceFile(e.to_string()))?;
@@ -881,8 +879,8 @@ pub enum JoinError {
     /// saved — the one failure that leaves the two sides disagreeing.
     SavedNothing { source: String, recovery: String },
     /// An existing `device.json` could not be read — raised by
-    /// [`DeviceConfig::parse`], whose callers land with `ls`/`rm`.
-    #[allow(dead_code)]
+    /// [`DeviceConfig::parse`], and so reached through `ls`/`rm` as
+    /// well as through a re-`join`.
     DeviceFile(String),
 }
 

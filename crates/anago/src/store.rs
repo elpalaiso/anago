@@ -29,6 +29,10 @@ impl Store {
         }
     }
 
+    /// The files this store owns. Only the tests reach for these —
+    /// every path the program uses is reached through the store's own
+    /// methods, so that the lock and the state file cannot drift apart.
+    #[cfg(test)]
     pub fn paths(&self) -> &ServerPaths {
         &self.paths
     }
@@ -116,21 +120,6 @@ pub enum StoreError {
         path: PathBuf,
         error: StateError,
     },
-}
-
-impl StoreError {
-    /// Whether the state file is simply not there yet — the answer
-    /// `anago code` and the API need to say "run `anago server init`
-    /// first" instead of dumping an io error.
-    pub fn is_missing(&self) -> bool {
-        matches!(
-            self,
-            StoreError::Io {
-                kind: io::ErrorKind::NotFound,
-                ..
-            }
-        )
-    }
 }
 
 impl fmt::Display for StoreError {
@@ -245,7 +234,16 @@ mod tests {
     fn a_missing_state_file_says_to_run_init() {
         let temp = TempStore::new();
         let e = temp.store.read().unwrap_err();
-        assert!(e.is_missing());
+        assert!(
+            matches!(
+                e,
+                StoreError::Io {
+                    kind: io::ErrorKind::NotFound,
+                    ..
+                }
+            ),
+            "{e:?}"
+        );
         assert!(e.to_string().contains("anago server init"), "{e}");
     }
 
@@ -259,7 +257,6 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("a directory that does not exist cannot be locked"),
         };
-        assert!(e.is_missing());
         assert!(e.to_string().contains("state.json"), "{e}");
         assert!(!e.to_string().contains("state.lock"), "{e}");
         assert!(e.to_string().contains("anago server init"), "{e}");
@@ -270,7 +267,6 @@ mod tests {
         let temp = TempStore::new();
         fs::write(temp.store.paths().state_file(), "{not json").unwrap();
         let e = temp.store.read().unwrap_err();
-        assert!(!e.is_missing());
         assert!(matches!(e, StoreError::Parse { .. }), "{e:?}");
         assert!(
             e.to_string()

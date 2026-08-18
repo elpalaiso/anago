@@ -8,11 +8,9 @@
 //! `code`, `join`, `ls`, `rm`.
 
 mod activate;
-#[allow(dead_code)]
 mod api;
 mod args;
 mod cli;
-#[allow(dead_code)]
 mod client;
 mod code;
 mod diagnostics;
@@ -23,24 +21,16 @@ mod rm;
 // Path rules and file handling are complete and unit-tested; the
 // slices that read and write those files (server init, join) land next,
 // so both modules are briefly ahead of their callers.
-#[allow(dead_code)]
 mod fsutil;
 // Client-side path resolution and a few server paths are used by the
 // join and serving slices that land next.
-#[allow(dead_code)]
 mod paths;
-#[allow(dead_code)]
 mod secret;
 mod serve;
-#[allow(dead_code)]
 mod store;
-#[allow(dead_code)]
 mod systemd;
-#[allow(dead_code)]
 mod tls;
-#[allow(dead_code)]
 mod wg;
-#[allow(dead_code)]
 mod wgapply;
 
 use cli::Command;

@@ -16,7 +16,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// Mode for files holding secrets: state file, device token, wg config.
@@ -132,17 +132,6 @@ fn sync_parent(path: &Path) {
             let _ = dir.sync_all();
         }
     }
-}
-
-/// Whether `path` is a real directory that `uid` already owns.
-///
-/// Used before a root process writes anything into somebody's home.
-/// `symlink_metadata` deliberately does not follow links: a
-/// `~/.config/anago` pointing at `/etc` is a way to have root apply a
-/// mode — or an owner — somewhere it should never touch.
-pub fn is_owned_directory(path: &Path, uid: u32) -> io::Result<bool> {
-    let meta = fs::symlink_metadata(path)?;
-    Ok(meta.is_dir() && !meta.file_type().is_symlink() && meta.uid() == uid)
 }
 
 /// Creates a file and hands it to `uid`:`gid` through the descriptor it
@@ -534,25 +523,22 @@ pub struct FileLock {
 impl FileLock {
     /// Waits for the lock.
     pub fn acquire(path: &Path) -> io::Result<FileLock> {
-        let file = lock_file(path, None)?;
+        let file = lock_file(path)?;
         flock(&file, libc::LOCK_EX)?;
         Ok(FileLock { file })
     }
 
     /// Takes the lock if it is free, `None` if someone else holds it.
+    ///
+    /// Only tests take a lock this way. Every caller in the program
+    /// waits instead: a `server init` that gave up because another one
+    /// held the lock for a moment would be worse than one that waited.
+    /// Keeping it here — rather than reimplementing `flock` in the
+    /// tests — means the contention they check is this lock, not a
+    /// lookalike.
+    #[cfg(test)]
     pub fn try_acquire(path: &Path) -> io::Result<Option<FileLock>> {
-        FileLock::try_acquire_owned(path, None)
-    }
-
-    /// [`FileLock::try_acquire`], creating the file owned by `owner`
-    /// when it has to be created — a lock in somebody's home is theirs.
-    pub fn try_acquire_owned(
-        path: &Path,
-        owner: Option<(u32, u32)>,
-    ) -> io::Result<Option<FileLock>> {
-        // The owner applies only to a lock file this call creates; an
-        // existing one is never chowned (see `lock_file`).
-        let file = lock_file(path, owner)?;
+        let file = lock_file(path)?;
         match flock(&file, libc::LOCK_EX | libc::LOCK_NB) {
             Ok(()) => Ok(Some(FileLock { file })),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
@@ -571,11 +557,10 @@ impl Drop for FileLock {
 
 /// Opens the lock file, creating it if it is not there.
 ///
-/// `owner` applies only to a file this call creates. An existing one is
-/// opened without following symlinks and never chowned: a `join.lock`
-/// symlinked to `/etc/passwd` would otherwise have root hand that file
-/// to whoever set the link.
-fn lock_file(path: &Path, owner: Option<(u32, u32)>) -> io::Result<File> {
+/// An existing lock file is opened without following symlinks: a
+/// `join.lock` symlinked to `/etc/passwd` would otherwise have root
+/// write to that file instead.
+fn lock_file(path: &Path) -> io::Result<File> {
     match OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -583,12 +568,7 @@ fn lock_file(path: &Path, owner: Option<(u32, u32)>) -> io::Result<File> {
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
     {
-        Ok(file) => {
-            if let Some((uid, gid)) = owner {
-                give_fd_to(&file, uid, gid)?;
-            }
-            Ok(file)
-        }
+        Ok(file) => Ok(file),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => OpenOptions::new()
             .write(true)
             .custom_flags(libc::O_NOFOLLOW)
@@ -872,25 +852,27 @@ mod tests {
     }
 
     #[test]
-    fn a_directory_is_only_accepted_when_the_person_owns_it() {
+    fn a_directory_is_only_opened_when_the_person_owns_it() {
         let dir = TempDir::new();
         let uid = unsafe { libc::getuid() };
-        assert!(is_owned_directory(&dir.path, uid).unwrap());
+        assert!(DirHandle::open_owned(&dir.path, uid).is_ok());
         // Somebody else's: not ours to write into.
-        assert!(!is_owned_directory(&dir.path, uid + 1).unwrap());
+        let e = DirHandle::open_owned(&dir.path, uid + 1).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
 
         // A symlink to a directory is not a directory here, whatever it
-        // points at.
+        // points at — otherwise a `~/.config/anago` aimed at /etc would
+        // have root write there.
         let link = dir.join("link");
         std::os::unix::fs::symlink("/etc", &link).unwrap();
-        assert!(!is_owned_directory(&link, uid).unwrap());
+        assert!(DirHandle::open_owned(&link, uid).is_err());
 
         // A file is not a directory, and a missing path is an error
-        // rather than a false.
+        // rather than a silent success.
         let file = dir.join("file");
         fs::write(&file, "x").unwrap();
-        assert!(!is_owned_directory(&file, uid).unwrap());
-        assert!(is_owned_directory(&dir.join("missing"), uid).is_err());
+        assert!(DirHandle::open_owned(&file, uid).is_err());
+        assert!(DirHandle::open_owned(&dir.join("missing"), uid).is_err());
     }
 
     #[test]
