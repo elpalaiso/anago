@@ -48,7 +48,7 @@ M0의 수동 경로는 **그대로 남긴다** — `--tls-cert/--tls-key`로 기
 ## D. anago 바이너리 — ACME
 
 - [x] ACME 의존성 추가(A단계 결정 반영) + feature 최소화 + ring provider 유지 확인 → `cargo build`·`cargo test` 통과, 코어 의존성 무변경 확인
-- [ ] `acme.rs`(bin): 발급 방식 선택 순수 함수 — `--tls-cert/key` 지정 여부, Cloudflare 토큰 유무, `--acme-staging`을 받아 `수동 인증서 / HTTP-01 / DNS-01`과 디렉터리 URL을 결정 + 유닛 테스트
+- [x] `acme.rs`(bin): 발급 방식 선택 순수 함수 — `--tls-cert/key` 지정 여부, Cloudflare 토큰 유무, `--acme-staging`을 받아 `수동 인증서 / HTTP-01 / DNS-01`과 디렉터리 URL을 결정 + 유닛 테스트
 - [ ] `acme.rs`(bin): 계정 키 생성·저장(`/var/lib/anago/tls/account.key`, 0600) + 디렉터리 조회 + 계정 등록, 기존 계정 재사용 판정 + 순수 부분 유닛 테스트
 - [ ] `acme.rs`(bin): HTTP-01 경로 — :80 임시 리스너(챌린지 응답 전용) 기동·종료, 주문→챌린지→검증 폴링→인증서 수령→`/var/lib/anago/tls/`에 0600 저장. 포트 점유·권한 실패 안내
 - [ ] `acme.rs`(bin): DNS-01 경로 — Cloudflare TXT 챌린지로 :80 없이 발급, 성공·실패 모두에서 TXT 정리, A단계에서 정한 폴백 규칙대로 HTTP-01 전환 여부 구현

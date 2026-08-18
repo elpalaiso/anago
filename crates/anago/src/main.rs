@@ -8,6 +8,10 @@
 //! `code`, `join`, `ls`, `rm`.
 
 mod activate;
+// Which way the hub gets its certificate. `server init` and
+// `server renew` wire it in a later slice.
+#[allow(dead_code)]
+mod acme;
 mod api;
 mod args;
 // Cloudflare: where the token comes from, which zone the domain lives
