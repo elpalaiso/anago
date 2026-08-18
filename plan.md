@@ -43,7 +43,7 @@
 ## D. 서버 — 컨트롤 플레인
 
 - [x] 바이너리 크레이트에 서버 의존성 추가(tokio, axum, rustls 계열) 후 `cargo build` 통과 — 코어는 손대지 않음을 확인
-- [ ] HTTPS 리스너: `--tls-cert/--tls-key` PEM 로드 → rustls 설정, 잘못된 경로·형식에 대한 명확한 에러 (경로 검증·에러 문구는 순수 함수 분리)
+- [x] HTTPS 리스너: `--tls-cert/--tls-key` PEM 로드 → rustls 설정, 잘못된 경로·형식에 대한 명확한 에러 (경로 검증·에러 문구는 순수 함수 분리)
 - [ ] `POST /api/v1/join` 핸들러: 코드 검증 → 이름/공개키 등록 → IP 할당 → 상태 저장(잠금) → JoinResponse (코어 순수 함수 호출부만 얇게)
 - [ ] `GET /api/v1/peers` + `DELETE /api/v1/peers/{name}` 핸들러: 기기 토큰 bearer 인증 → 코어 상태 전이 호출
 - [ ] 서버 wg 인터페이스 반영: 상태 변경 시 서버 wg 설정 재생성 + `wg syncconf`(또는 wg-quick) 적용, `ip_forward` 확인/안내
