@@ -5,18 +5,30 @@
 //! place that knows what those files look like, so a snapshot test is
 //! enough to see any change to them.
 //!
-//! The server file is wg-quick flavoured (`/etc/wireguard/anago.conf`):
-//! it carries `Address`, which plain `wg` does not understand. The
+//! Both files are wg-quick flavoured (`/etc/wireguard/anago.conf`):
+//! they carry `Address`, which plain `wg` does not understand. The
 //! server applies changes with `wg syncconf <iface> <(wg-quick strip
 //! anago)`, which drops those keys for it.
+//!
+//! The two sides are deliberately asymmetric. The hub lists every
+//! device with a `/32`; a device lists only the hub, with the whole
+//! subnet — that single `AllowedIPs` line is what makes hub-and-spoke
+//! work without the device knowing any other device exists (§5).
 //!
 //! Making packets actually cross between two devices also needs
 //! `net.ipv4.ip_forward=1` on the server. That is a sysctl, not a
 //! config line, so it belongs to the binary's setup path rather than
 //! here.
 
-use crate::state::ServerState;
-use crate::subnet::PREFIX_LEN;
+use std::net::Ipv4Addr;
+
+use crate::state::{PrivateKey, ServerState};
+use crate::subnet::{Subnet, PREFIX_LEN};
+
+/// Seconds between keepalives on the device side (§6.3). One config
+/// line is the whole of anago's NAT story: it keeps the mapping open
+/// from behind CGNAT, and it is why a device needs no daemon.
+pub const PERSISTENT_KEEPALIVE_SECS: u32 = 25;
 
 /// The server's `anago.conf`.
 ///
@@ -50,6 +62,46 @@ pub fn server_config(state: &ServerState) -> String {
     out
 }
 
+/// What a device knows about the network after `join` — everything the
+/// client config needs, and nothing about other devices.
+///
+/// `private_key` is generated on the device and never leaves it (§6.2);
+/// it is [`PrivateKey`], so a stray `{:?}` prints `PrivateKey(redacted)`
+/// rather than the key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientProfile {
+    /// This device's address inside the subnet.
+    pub address: Ipv4Addr,
+    pub subnet: Subnet,
+    pub private_key: PrivateKey,
+    pub server_public_key: String,
+    /// `host:port` the device dials, e.g. `net.example.com:51820`.
+    pub server_endpoint: String,
+}
+
+/// The device's `anago.conf`.
+///
+/// One `[Peer]`: the hub. `AllowedIPs` is the whole subnet, so packets
+/// for any device go up the tunnel and the server routes them — which
+/// is why a new device joining needs no change here at all (§6.3).
+pub fn client_config(profile: &ClientProfile) -> String {
+    let mut out = String::new();
+    out.push_str("[Interface]\n");
+    out.push_str("# anago — generated file, edits are overwritten\n");
+    out.push_str(&format!("Address = {}/{PREFIX_LEN}\n", profile.address));
+    out.push_str(&format!("PrivateKey = {}\n", profile.private_key.as_str()));
+
+    out.push_str("\n[Peer]\n");
+    out.push_str("# anago server\n");
+    out.push_str(&format!("PublicKey = {}\n", profile.server_public_key));
+    out.push_str(&format!("Endpoint = {}\n", profile.server_endpoint));
+    out.push_str(&format!("AllowedIPs = {}\n", profile.subnet));
+    out.push_str(&format!(
+        "PersistentKeepalive = {PERSISTENT_KEEPALIVE_SECS}\n"
+    ));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -57,7 +109,6 @@ mod tests {
     use crate::state::{Peer, PrivateKey, ServerKeys, ServerState};
     use crate::subnet::Subnet;
     use crate::token::TokenHash;
-    use std::net::Ipv4Addr;
 
     const NOW: i64 = 1_755_500_000;
 
@@ -193,6 +244,109 @@ AllowedIPs = 10.100.0.3/32
         assert!(config.contains("\n\n[Peer]\n"));
         // Nothing wg would choke on: every non-blank line is a section
         // header, a comment, or `Key = value`.
+        for line in config.lines().filter(|line| !line.is_empty()) {
+            assert!(
+                line.starts_with('[') || line.starts_with("# ") || line.contains(" = "),
+                "unexpected line {line:?}"
+            );
+        }
+    }
+
+    // ------------------------------------------------------- client
+
+    fn profile() -> ClientProfile {
+        ClientProfile {
+            address: ip("10.100.0.2"),
+            subnet: Subnet::parse("10.100.0.0/24").unwrap(),
+            private_key: PrivateKey::new("ZGV2aWNlIHByaXZhdGU="),
+            server_public_key: "c2VydmVyIHB1YmxpYw==".to_string(),
+            server_endpoint: "net.example.com:51820".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_device_config_lists_only_the_hub() {
+        let expected = "\
+[Interface]
+# anago — generated file, edits are overwritten
+Address = 10.100.0.2/24
+PrivateKey = ZGV2aWNlIHByaXZhdGU=
+
+[Peer]
+# anago server
+PublicKey = c2VydmVyIHB1YmxpYw==
+Endpoint = net.example.com:51820
+AllowedIPs = 10.100.0.0/24
+PersistentKeepalive = 25
+";
+        assert_eq!(client_config(&profile()), expected);
+    }
+
+    #[test]
+    fn allowed_ips_is_the_whole_subnet_not_one_address() {
+        // The line that makes hub-and-spoke work: traffic for any
+        // device goes up the tunnel, so a new device joining needs no
+        // change on this one (§6.3).
+        let config = client_config(&profile());
+        assert!(config.contains("AllowedIPs = 10.100.0.0/24\n"), "{config}");
+        assert!(!config.contains("/32"), "{config}");
+        assert_eq!(config.matches("[Peer]").count(), 1);
+    }
+
+    #[test]
+    fn keepalive_is_set_so_the_device_needs_no_daemon() {
+        assert_eq!(PERSISTENT_KEEPALIVE_SECS, 25);
+        assert!(client_config(&profile()).contains("PersistentKeepalive = 25\n"));
+    }
+
+    #[test]
+    fn the_config_follows_the_profile() {
+        let other = ClientProfile {
+            address: ip("192.168.7.9"),
+            subnet: Subnet::parse("192.168.7.0/24").unwrap(),
+            private_key: PrivateKey::new("b3RoZXIga2V5"),
+            server_public_key: "b3RoZXIgc2VydmVy".to_string(),
+            server_endpoint: "vpn.example.org:51999".to_string(),
+        };
+        let config = client_config(&other);
+        assert!(config.contains("Address = 192.168.7.9/24\n"), "{config}");
+        assert!(
+            config.contains("Endpoint = vpn.example.org:51999\n"),
+            "{config}"
+        );
+        assert!(config.contains("AllowedIPs = 192.168.7.0/24\n"), "{config}");
+        assert!(config.contains("PrivateKey = b3RoZXIga2V5\n"), "{config}");
+    }
+
+    #[test]
+    fn the_device_key_does_not_print_itself() {
+        // The config file must carry the key; a debug line must not.
+        let printed = format!("{:?}", profile());
+        assert!(printed.contains("PrivateKey(redacted)"), "{printed}");
+        assert!(!printed.contains("ZGV2aWNlIHByaXZhdGU="), "{printed}");
+        assert!(client_config(&profile()).contains("ZGV2aWNlIHByaXZhdGU="));
+    }
+
+    #[test]
+    fn the_two_sides_mirror_each_other() {
+        // Server: one /32 per device. Device: one peer, whole subnet.
+        let server = server_config(&state(vec![peer("macbook", "bWFjYm9vaw==", "10.100.0.2")]));
+        let client = client_config(&profile());
+        assert!(server.contains("AllowedIPs = 10.100.0.2/32\n"), "{server}");
+        assert!(client.contains("AllowedIPs = 10.100.0.0/24\n"), "{client}");
+        // Only the device side keeps the NAT mapping alive.
+        assert!(!server.contains("PersistentKeepalive"));
+        // Only the server side listens.
+        assert!(server.contains("ListenPort = 51820\n"));
+        assert!(!client.contains("ListenPort"));
+    }
+
+    #[test]
+    fn the_device_file_is_shaped_the_way_wg_expects() {
+        let config = client_config(&profile());
+        assert!(config.starts_with("[Interface]\n"));
+        assert!(config.ends_with("PersistentKeepalive = 25\n"));
+        assert!(config.contains("\n\n[Peer]\n"));
         for line in config.lines().filter(|line| !line.is_empty()) {
             assert!(
                 line.starts_with('[') || line.starts_with("# ") || line.contains(" = "),
