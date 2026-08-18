@@ -439,13 +439,14 @@ join 응답(§8)에 기기가 접속에 쓴 `api_port`를 더해 담는다 — �
 |---|---|---|
 | CLI | 수제 플래그 파서 (krill args.rs 이식) | 의존 최소 — krill에서 검증됨 |
 | 서버 HTTP | tokio + axum + axum-server + rustls(ring) + rustls-pemfile | krill serve 경험 재활용. TLS 백엔드는 **ring** — rustls 기본값인 aws-lc-rs는 C 툴체인(cmake 등)을 요구해 "stock VPS에서 그냥 빌드된다"를 깬다. 압축·트레이싱·multipart는 끄지만 **HTTP/2는 끄지 못한다** — axum-server가 `hyper/http2`와 `hyper-util/server-auto`를 켜기 때문이다. M0 API는 h1/h2 어느 쪽으로 와도 같은 JSON을 답하므로 기능 문제는 아니고, 굳이 h1으로 좁히려면 리스너에서 ALPN을 `http/1.1`만 광고하면 된다 |
-| ACME | instant-acme (또는 동급) | HTTP-01 기본, DNS-01(Cloudflare) 지원 |
-| Cloudflare | 얇은 REST 호출 (reqwest 없이 가능하면 hyper 직접) | A 레코드 upsert + DNS-01 TXT |
+| ACME | **`instant-acme`** (기본 feature off, `ring`+`rcgen`+`hyper-rustls`) | HTTP-01 기본, DNS-01(Cloudflare) 지원. 기본 feature를 그대로 받으면 aws-lc-rs가 딸려와 위 rustls 결정이 무너진다 — §10.2 |
+| Cloudflare | **기존 `client.rs`(블로킹 rustls 클라이언트) 확장** | A 레코드 upsert + DNS-01 TXT. reqwest도 hyper client도 새로 들이지 않는다 — §10.2 |
 | wg 제어 | `wg`/`wg-quick` CLI 래핑 | 위임 원칙. boringtun 내장은 백로그(비-커널 환경) |
-| 직렬화 | **anago-core의 수제 미니 JSON (순수 std)** | serde 미사용 — §10.1 |
+| QR (`--export qr`) | **`qrcodegen`** (바이너리) + 코어의 터미널 렌더링 | 인코딩은 위임, 화면에 그리는 일은 순수 함수 — §10.2 |
+| 직렬화 | **anago-core의 수제 미니 JSON (순수 std)** | anago 자신의 프로토콜·상태 — serde 미사용, §10.1. 제3자(ACME·Cloudflare) JSON만 바이너리에서 `serde_json` — §10.2 |
 | 해시(기기 토큰) | `sha2` (바이너리 직접 의존성) | SHA-256만 사용 — §7.1. 전이 의존성에 기대지 않는다 |
 | 파일 락 | `libc`의 `flock(2)` (바이너리 직접 의존성) | std에 파일 락이 없다 — §13의 동시 join 직렬화 |
-| anago-core | 순수 std | 설정 생성·IP 할당·코드 검증·프로토콜 타입 — 전부 순수 함수로 유닛 테스트 |
+| anago-core | 순수 std | 설정 생성·IP 할당·코드 검증·프로토콜 타입 — 전부 순수 함수로 유닛 테스트. **M1에서도 외부 크레이트 0개** — §10.2 |
 
 ### 10.1 직렬화 결정: serde를 쓰지 않는다
 
@@ -479,9 +480,123 @@ join 응답(§8)에 기기가 접속에 쓴 `api_port`를 더해 담는다 — �
 
 serde가 다시 논의되는 경우는 하나뿐이다: M1에서 ACME·Cloudflare의
 **제3자 JSON 스키마**를 다뤄야 할 때. 그건 남의 스키마이고 바이너리
-크레이트에만 필요하므로 이 결정과 충돌하지 않는다 — 그때 가서
-바이너리 의존성으로 추가할지 판단한다. anago 자신의 프로토콜·상태가
-serde로 넘어가는 일은 없다.
+크레이트에만 필요하므로 이 결정과 충돌하지 않는다. **그 판단은 §10.2
+에서 내렸다 — `serde_json`을 바이너리 직접 의존성으로 두고, 제3자
+응답에만 쓴다.** anago 자신의 프로토콜·상태가 serde로 넘어가는 일은
+없다.
+
+### 10.2 M1 의존성 확정 — ACME·Cloudflare·QR
+
+M1이 새로 들이는 **직접** 의존성은 셋이다: `instant-acme`(ACME),
+`serde_json`(제3자 JSON), `qrcodegen`(QR 인코딩).
+
+**셋 다 `crates/anago` 바이너리 크레이트에만 선언한다. anago-core는
+M1에서도 외부 크레이트를 한 개도 갖지 않는다.** §4 원칙 4의 선은
+마일스톤이 바뀌어도 움직이지 않는다 — 코어가 M1에서 맡는 것도 여전히
+순수 함수뿐이다(갱신 시점 판정, 챌린지 문자열 조립, DNS 레코드 upsert
+판정, sync 판정, QR 렌더링).
+
+#### ACME — `instant-acme`, 기본 feature는 끈다
+
+```toml
+instant-acme = { version = "0.8", default-features = false,
+                 features = ["ring", "rcgen", "hyper-rustls"] }
+```
+
+- **`default-features = false`는 취향이 아니라 요구사항이다.**
+  instant-acme의 기본 feature는 `aws-lc-rs`를 고른다. 그대로 받으면
+  위 표의 rustls 결정(ring)이 무너지고, aws-lc-rs가 요구하는 C
+  툴체인이 "stock VPS에서 그냥 빌드된다"는 이 프로젝트의 배포 전제를
+  깬다. 같은 이유로 rustls를 ring으로 고정했으니 ACME도 같은 백엔드를
+  쓴다 — 한 바이너리 안에 암호 백엔드를 두 벌 넣을 이유가 없다.
+- **`rcgen`**: 인증서 개인키와 CSR을 만든다. `Order::finalize()`가
+  내부에서 키를 생성하고 CSR을 서명해 개인키 PEM을 돌려주므로 우리는
+  `rcgen`을 직접 부르지 않는다(직접 의존성이 아니라 feature다). ASN.1
+  과 서명을 우리가 짜지 않는 것은 §3·§4 원칙 1 그대로다.
+- **`hyper-rustls`**: instant-acme이 자기 HTTP 스택으로 쓴다.
+  `HttpClient` 트레이트가 열려 있어 우리 클라이언트를 꽂고 이 feature를
+  뺄 수도 있지만, 그러자고 async 어댑터를 손으로 짜는 것은 "어려운
+  문제는 위임한다"의 반대 방향이다. hyper·hyper-util은 axum-server
+  때문에 어차피 트리에 있다.
+  - 부작용 하나는 적어 둔다: 이 feature가 `rustls-platform-verifier`를
+    끌고 와서, 한 바이너리 안에 트러스트 루트 경로가 두 벌이 된다(기기
+    쪽 `rustls-native-certs`, ACME 쪽 platform-verifier). ACME는 공개
+    CA(Let's Encrypt)만 상대하므로 §11의 origin-cert 단서와 무관하고,
+    **어느 쪽도 검증을 끄지 않는다**.
+- **켜지 않는 것: `x509-parser`·`time`.** 둘은 ARI(RFC 9773)의 갱신
+  창을 읽기 위한 것이고, 그 대가로 ASN.1 파서 계열이 십수 개 따라온다.
+  M1의 갱신 시점은 ARI 없이 정한다 — 그 규칙(무엇을 상태에 적고 언제
+  갱신하는가)은 §9.1에서 확정한다.
+- **비동기 경계**: instant-acme은 async다. ACME 작업은 언제나 tokio
+  런타임 안에서 돈다 — `server run`은 이미 런타임이 있고, `server init`
+  은 발급 구간에만 런타임을 잠깐 띄운다. HTTP-01 챌린지에 답할 :80
+  리스너도 이미 있는 tokio/axum으로 세운다(새 의존성 없음).
+- **라이선스**: instant-acme은 Apache-2.0이다(anago는 MIT). 퍼미시브라
+  배포에 문제는 없지만 M4의 릴리스 산출물에 NOTICE를 챙겨야 한다.
+
+#### Cloudflare — 새 HTTP 클라이언트를 들이지 않는다
+
+표의 "hyper 직접"을 **기존 `client.rs`(블로킹 rustls 클라이언트) 확장**
+으로 확정한다. `join`/`ls`/`rm`이 이미 쓰는 코드이고, 요청 조립과 응답
+파싱이 순수 함수로 테스트돼 있다. 남은 일은 임의 호스트·헤더·메서드를
+받게 넓히는 것뿐이라 reqwest는 물론 hyper의 클라이언트 API도 새로
+배우지 않는다.
+
+DNS-01 흐름은 async 안에 있으므로 Cloudflare 호출은 `spawn_blocking`
+으로 부른다. 어댑터가 몇 줄이고, 대신 **anago가 밖으로 내는 HTTP는 한
+벌로 유지된다** — 타임아웃·트러스트 루트·에러 문구가 두 군데로 갈라지지
+않는 쪽이 유지비가 싸다.
+
+#### 제3자 JSON — `serde_json`을 바이너리에 직접 선언한다
+
+§10.1이 "serde가 다시 논의되는 경우는 하나뿐"이라며 예약해 둔 그
+순간이다. 여기서 판단한다: **ACME·Cloudflare 응답은 `serde_json`으로
+읽는다.**
+
+왜 코어의 미니 JSON을 쓰지 않는가. 미니 JSON의 엄격함(부동소수 거부,
+중복 키 거부, `i64` 하나)은 **우리 스키마에 대해서는** 옳다 — 스키마를
+우리가 정하니까 좁혀도 안전하다. 남의 스키마에는 정확히 반대로 작용
+한다. Cloudflare 응답의 `meta`처럼 우리가 읽지도 않는 구석에 실수나
+스키마 변경이 하나 들어오면 응답 **전체**가 파싱 에러가 되고, A 레코드
+upsert가 무관한 이유로 죽는다. 남의 JSON에는 관대한 파서가 맞다.
+
+비용은 사실상 0이다: `serde_json`은 instant-acme 때문에 어차피 트리에
+들어온다. 그래도 §7.1의 `sha2`와 같은 이유로 **직접 의존성으로 선언**
+한다 — 전이 의존성에 기대어 남의 크레이트를 부르지 않는다.
+
+선은 그대로 유지된다: **우리 타입을 serde로 정의하지 않는다.** 제3자
+응답은 `serde_json::Value`에서 필요한 필드만 뽑아 즉시 anago-core의
+타입(§8, §9.1)으로 옮긴다. `#[derive(Serialize)]`가 붙은 anago 타입은
+M1에도 없다.
+
+#### QR — `qrcodegen`으로 인코딩, 렌더링은 코어의 순수 함수
+
+인코딩은 **`qrcodegen` 1.8**(MIT, 의존성 0)에 맡긴다. 직접 구현하지
+않는 이유는 §4 원칙 1과 같다 — 리드-솔로몬·마스킹·버전 선택은 이미 잘
+풀린 문제이고, 우리가 다시 풀면 "폰이 스캔을 못 한다"는 형태로만 틀린다.
+게다가 그 실패는 유닛 테스트로 잡히지 않고 실기기에서만 드러난다.
+
+대신 **화면에 그리는 일은 anago-core가 한다**: 바이너리가
+`qrcodegen`에서 모듈 행렬(불리언)을 받아 넘기면, 코어의 순수 함수가
+그것을 터미널 문자열(블록 문자·여백)로 만든다. 크레이트 없이 유닛
+테스트되는 표면이 이쪽이고, 이 분리 덕에 QR 출력의 회귀가 `cargo test`
+에 걸린다.
+
+코어가 인코더까지 갖는 선택지는 버린다. 순수 std로 못 할 일은 아니지만,
+그건 코어를 "우리 규칙을 담는 곳"에서 "우리가 만든 라이브러리를 담는
+곳"으로 바꾸는 변경이다 — §4 원칙 4가 코어에 그어 둔 선은 "외부 크레이트
+금지"이지 "무엇이든 직접 만든다"가 아니다.
+
+#### 새로 들어오는 전이 의존성
+
+위 셋을 더하면 잠금 파일에 **약 20개**가 추가된다(instant-acme,
+`rcgen`, `hyper-rustls`, `rustls-platform-verifier`, `serde_json`,
+`thiserror`, `base64`, `pem` 등). **그중 C 툴체인을 새로 요구하는 것은
+하나도 없다** — aws-lc-rs를 끈 이유가 이것이다. 빌드 스크립트가 있는
+것은 셋뿐이고(`serde_json`·`thiserror`·`zmij`) 전부 rustc 버전을 묻는
+순수 러스트 프로브다. 이 성질은 M4의 "어느 VPS에서나 `cargo build`"를
+지키는 조건이므로, 앞으로 의존성을 더할 때마다 같은 확인을 한다.
+
 
 ## 11. 마일스톤
 
