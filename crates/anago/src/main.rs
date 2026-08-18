@@ -12,6 +12,7 @@
 mod api;
 mod args;
 mod cli;
+mod code;
 mod init;
 // Path rules and file handling are complete and unit-tested; the
 // slices that read and write those files (server init, join) land next,
@@ -65,7 +66,13 @@ fn main() {
         Command::Help(topic) => print!("{}", cli::help(topic.as_deref())),
         Command::ServerInit(args) => server_init(&args),
         Command::ServerRun => server_run(),
-        Command::Code => not_yet_built("anago code"),
+        Command::Code => match code::run(std::path::Path::new(paths::DEFAULT_SERVER_ROOT), now()) {
+            Ok(text) => print!("{text}"),
+            Err(e) => {
+                eprintln!("anago: {e}");
+                std::process::exit(EXIT_FAILED);
+            }
+        },
         Command::Join(_) => not_yet_built("anago join"),
         Command::Ls => not_yet_built("anago ls"),
         Command::Rm(_) => not_yet_built("anago rm"),

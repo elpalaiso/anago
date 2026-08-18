@@ -60,7 +60,14 @@ impl Store {
     pub fn lock(&self) -> Result<Guard<'_>, StoreError> {
         let lock_path = self.paths.state_lock();
         let lock = FileLock::acquire(&lock_path).map_err(|e| StoreError::Io {
-            path: lock_path,
+            // A missing directory means this machine is not a hub, so
+            // name the file that says so rather than the lock nobody
+            // asked about.
+            path: if e.kind() == io::ErrorKind::NotFound {
+                self.paths.state_file()
+            } else {
+                lock_path
+            },
             kind: e.kind(),
             source: e.to_string(),
         })?;
@@ -233,6 +240,22 @@ mod tests {
         let temp = TempStore::new();
         let e = temp.store.read().unwrap_err();
         assert!(e.is_missing());
+        assert!(e.to_string().contains("anago server init"), "{e}");
+    }
+
+    #[test]
+    fn locking_a_machine_that_is_not_a_hub_names_the_state_file() {
+        // The lock file is an implementation detail; "you have not run
+        // server init" is the answer the operator needs.
+        let temp = TempStore::new();
+        let missing = Store::new(temp.root.join("not-a-hub"));
+        let e = match missing.lock() {
+            Err(e) => e,
+            Ok(_) => panic!("a directory that does not exist cannot be locked"),
+        };
+        assert!(e.is_missing());
+        assert!(e.to_string().contains("state.json"), "{e}");
+        assert!(!e.to_string().contains("state.lock"), "{e}");
         assert!(e.to_string().contains("anago server init"), "{e}");
     }
 
