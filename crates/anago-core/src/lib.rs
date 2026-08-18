@@ -3,6 +3,7 @@
 //! (DESIGN.md §4 principle 4). The binary crate is a thin shell around
 //! these pure functions.
 
+pub mod acme;
 pub mod code;
 pub mod json;
 pub mod name;
