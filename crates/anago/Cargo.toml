@@ -29,6 +29,11 @@ rustls-pemfile = "2"
 rustls-native-certs = "0.8"
 # SHA-256 for device-token hashes (DESIGN.md §7.1).
 sha2 = "0.10"
+# Third-party JSON only — Cloudflare's and ACME's schemas, never
+# anago's own (DESIGN.md §10.1, §10.2). The mini JSON in anago-core is
+# deliberately strict, which is right for a schema we define and wrong
+# for one we do not.
+serde_json = "1"
 
 [dev-dependencies]
 # Drives the router in tests without binding a port.

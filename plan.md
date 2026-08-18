@@ -40,7 +40,7 @@ M0의 수동 경로는 **그대로 남긴다** — `--tls-cert/--tls-key`로 기
 ## C. anago 바이너리 — HTTP 클라이언트와 Cloudflare
 
 - [x] `client.rs` 확장: 허브 이외의 호스트(api.cloudflare.com, ACME 디렉터리)로 보내는 GET/POST/PUT/DELETE 요청 지원 — 헤더(Authorization, Content-Type), 응답 본문 크기 상한, 타임아웃. 요청 조립부는 순수 함수로 유닛 테스트
-- [ ] `cfapi.rs`: Cloudflare 토큰 취득 경로 — `--cf-token` / env / 파일(0600) 우선순위 결정 순수 함수 + 토큰 검증 호출 + 권한 부족·만료 시 안내 문구 + 유닛 테스트
+- [x] `cfapi.rs`: Cloudflare 토큰 취득 경로 — `--cf-token` / env / 파일(0600) 우선순위 결정 순수 함수 + 토큰 검증 호출 + 권한 부족·만료 시 안내 문구 + 유닛 테스트
 - [ ] `cfapi.rs`: zone 조회(도메인 → zone id, 서브도메인이면 상위 zone 탐색) + 응답 파싱 + 실패 시 M0 수동 안내로의 폴백 경로 + 픽스처 기반 파싱 유닛 테스트
 - [ ] `cfapi.rs`: A 레코드 목록 조회 → 코어의 upsert 판정 호출 → 생성/수정 실행 + 프록시(주황 구름) 켜짐 거부·경고 + 픽스처 파싱 유닛 테스트
 - [ ] `cfapi.rs`: DNS-01용 TXT 레코드 생성·삭제 + 전파 대기(폴링 간격·타임아웃) — 대기 정책은 순수 함수로 분리해 테스트하고, 실패해도 TXT를 반드시 정리하는 경로를 만든다

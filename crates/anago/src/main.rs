@@ -10,6 +10,11 @@
 mod activate;
 mod api;
 mod args;
+// The Cloudflare front door: where the token comes from and whether it
+// still works. `server init` wires it in with the record calls in the
+// next slice, so the whole module is briefly ahead of its caller.
+#[allow(dead_code)]
+mod cfapi;
 mod cli;
 mod client;
 mod code;
