@@ -10,6 +10,7 @@ pub mod proto;
 pub mod state;
 pub mod subnet;
 pub mod token;
+pub mod wgconf;
 
 #[cfg(test)]
 mod tests {
