@@ -30,6 +30,19 @@ use crate::token::TokenHash;
 /// Schema version this build writes. M1 = 2 (§9.1).
 pub const SCHEMA_VERSION: i64 = 2;
 
+const DAY_SECS: i64 = 86_400;
+
+/// How long before `not_after` the safety net fires (§9.1): time for a
+/// person to notice failing renewals and fix them. It never lands
+/// before `renew_after` at any realistic lifetime, so reaching it means
+/// something is off.
+pub const RENEWAL_LEAD_SECS: i64 = 7 * DAY_SECS;
+
+/// What to assume when the certificate's expiry could not be read: the
+/// shortest lifetime we might be issued, renewed at its two thirds
+/// (§9.1). Not knowing is not a reason to be optimistic.
+pub const UNKNOWN_LIFETIME_RENEW_SECS: i64 = 30 * DAY_SECS;
+
 /// The version M0 wrote: flat `tls_cert_path`/`tls_key_path`, no ACME.
 /// Still read — the upgrade to 2 is total, so there is nothing to ask
 /// about (§9.1) — but never written back until something else changes
@@ -105,6 +118,82 @@ pub struct Acme {
     pub renew_after: i64,
 }
 
+impl Acme {
+    /// Records a fresh issuance: when it happened, and — from the
+    /// certificate's own expiry — when to come back.
+    ///
+    /// The two are set together because a stale `renew_after` beside a
+    /// new `issued_at` is exactly the state that renews too late.
+    pub fn issued(&mut self, at: i64, not_after: Option<i64>) {
+        self.issued_at = at;
+        self.renew_after = renew_after(at, not_after);
+    }
+}
+
+/// When a certificate received at `issued_at` and expiring at
+/// `not_after` should be renewed: **two thirds of its lifetime** (§9.1).
+///
+/// Not a fixed number of days. Let's Encrypt is moving the default
+/// lifetime from 90 days to 64 and then 45, and moves the recommended
+/// renewal with it — day 60 of 90, day 30 of 45. The fraction is what
+/// stays put; "60 days" is a number that only fits a 90-day
+/// certificate.
+///
+/// With no expiry to divide, it assumes the shortest lifetime we might
+/// be handed ([`UNKNOWN_LIFETIME_RENEW_SECS`]).
+pub fn renew_after(issued_at: i64, not_after: Option<i64>) -> i64 {
+    let Some(not_after) = not_after else {
+        return issued_at.saturating_add(UNKNOWN_LIFETIME_RENEW_SECS);
+    };
+    // A certificate that expires before it was issued is nonsense —
+    // a wrong clock, a hand-edited file. The arithmetic lands at or
+    // before `issued_at`, which reads as "renew now": the safe way to
+    // be wrong.
+    let lifetime = not_after.saturating_sub(issued_at);
+    issued_at.saturating_add(lifetime.saturating_mul(2) / 3)
+}
+
+/// **The expiry safety net, on its own**: whether `now` has reached the
+/// last `lead_secs` of a certificate expiring at `expires_at` (§9.1).
+///
+/// This function knows nothing about the stored plan. It is the floor
+/// that holds when the plan is wrong — a `renew_after` computed against
+/// a longer lifetime than the certificate actually has, or a date
+/// somebody edited badly. The boundary is inclusive: at the net's
+/// second, it is due.
+///
+/// A negative lead would push the net past the expiry it guards, so it
+/// counts as none.
+///
+/// Callers holding a whole [`Tls`] want [`Tls::needs_renewal`], which
+/// combines this with the stored decision. This is the piece it is
+/// built from, kept separate so the net can be tested — and reasoned
+/// about — without a state file.
+pub fn needs_renewal(expires_at: i64, now: i64, lead_secs: i64) -> bool {
+    now >= safety_net_at(expires_at, lead_secs)
+}
+
+/// The instant [`needs_renewal`] starts saying yes.
+fn safety_net_at(expires_at: i64, lead_secs: i64) -> i64 {
+    expires_at.saturating_sub(lead_secs.max(0))
+}
+
+/// When renewal is actually due: the stored decision, pulled earlier if
+/// it would otherwise fall inside the safety net (§9.1).
+///
+/// The clamp only bites when `renew_after` is wrong for the certificate
+/// on disk. With no expiry to check against, the stored decision stands
+/// alone — there is nothing to pull it toward.
+///
+/// Callers print this value rather than recomputing it, so what is said
+/// matches what is done.
+pub fn renewal_due(renew_after: i64, not_after: Option<i64>, lead_secs: i64) -> i64 {
+    match not_after {
+        None => renew_after,
+        Some(not_after) => renew_after.min(safety_net_at(not_after, lead_secs)),
+    }
+}
+
 /// Where the hub's certificate comes from, and — the part that decides
 /// behaviour — **who is allowed to write those files** (§9.1).
 ///
@@ -166,6 +255,27 @@ impl Tls {
         match &self.source {
             TlsSource::Manual => None,
             TlsSource::Acme(acme) => Some(acme),
+        }
+    }
+
+    /// When this certificate is due for renewal, or `None` when it is
+    /// not ours to renew — a manual certificate has an owner, and it is
+    /// not anago (§9.1).
+    pub fn renewal_due(&self, lead_secs: i64) -> Option<i64> {
+        let acme = self.renewable()?;
+        Some(renewal_due(acme.renew_after, self.not_after, lead_secs))
+    }
+
+    /// Whether anago should renew this certificate now — the composed
+    /// answer: the stored decision, floored by [`needs_renewal`]'s
+    /// expiry net.
+    ///
+    /// A manual certificate is never due: answering "yes" here would
+    /// overwrite a file somebody else manages.
+    pub fn needs_renewal(&self, now: i64, lead_secs: i64) -> bool {
+        match self.renewal_due(lead_secs) {
+            None => false,
+            Some(due) => now >= due,
         }
     }
 }
@@ -1118,6 +1228,209 @@ mod tests {
             err(&with_field("tls", Value::str("/etc/ssl/x.pem"))),
             StateError::Shape(DecodeError::wrong_type("tls"))
         );
+    }
+
+    // ------------------------------------------------------ renewal
+
+    const DAY: i64 = 86_400;
+    const T0: i64 = 1_755_500_000;
+
+    /// An ACME certificate issued at `issued_at` and expiring at
+    /// `not_after`, with both times recorded the way issuance does.
+    fn issued_tls(issued_at: i64, not_after: Option<i64>) -> Tls {
+        let mut tls = issued().tls;
+        tls.not_after = not_after;
+        if let TlsSource::Acme(acme) = &mut tls.source {
+            acme.issued(issued_at, not_after);
+        }
+        tls
+    }
+
+    #[test]
+    fn renewal_lands_at_two_thirds_of_the_lifetime() {
+        // The three lifetimes Let's Encrypt is moving between, and the
+        // renewal day each one implies (§9.1).
+        for (lifetime_days, renew_day) in [(90, 60), (45, 30), (6, 4)] {
+            assert_eq!(
+                renew_after(T0, Some(T0 + lifetime_days * DAY)),
+                T0 + renew_day * DAY,
+                "{lifetime_days}-day certificate"
+            );
+        }
+        // 64 days does not divide evenly; two thirds of it in seconds
+        // does, and that is what the arithmetic uses.
+        assert_eq!(renew_after(T0, Some(T0 + 64 * DAY)), T0 + 64 * DAY * 2 / 3);
+    }
+
+    #[test]
+    fn an_unreadable_expiry_assumes_the_shortest_lifetime() {
+        assert_eq!(renew_after(T0, None), T0 + 30 * DAY);
+        assert_eq!(UNKNOWN_LIFETIME_RENEW_SECS, 30 * DAY);
+        // Never later than what a real short-lived certificate would
+        // have produced: not knowing must not renew later than knowing.
+        assert!(renew_after(T0, None) <= renew_after(T0, Some(T0 + 45 * DAY)));
+    }
+
+    #[test]
+    fn a_certificate_that_is_already_expired_is_due_at_once() {
+        // A wrong clock or a hand-edited file. Landing at or before the
+        // issue time reads as "renew now", which is the safe way to be
+        // wrong.
+        assert!(renew_after(T0, Some(T0)) <= T0);
+        assert!(renew_after(T0, Some(T0 - 10 * DAY)) <= T0);
+        let expired = issued_tls(T0, Some(T0 - 10 * DAY));
+        assert!(expired.needs_renewal(T0, RENEWAL_LEAD_SECS));
+    }
+
+    // The bare safety net (§9.1), on its own terms.
+
+    #[test]
+    fn the_net_opens_one_lead_before_the_expiry() {
+        let expires_at = T0 + 45 * DAY;
+        let opens = expires_at - RENEWAL_LEAD_SECS;
+        assert!(!needs_renewal(expires_at, opens - 1, RENEWAL_LEAD_SECS));
+        assert!(needs_renewal(expires_at, opens, RENEWAL_LEAD_SECS));
+        assert!(needs_renewal(expires_at, opens + 1, RENEWAL_LEAD_SECS));
+        // And it stays open past the expiry itself.
+        assert!(needs_renewal(
+            expires_at,
+            expires_at + DAY,
+            RENEWAL_LEAD_SECS
+        ));
+    }
+
+    #[test]
+    fn the_net_with_no_lead_is_the_expiry_itself() {
+        let expires_at = T0 + 45 * DAY;
+        assert!(!needs_renewal(expires_at, expires_at - 1, 0));
+        assert!(needs_renewal(expires_at, expires_at, 0));
+        // A negative lead would open the net *after* the expiry it
+        // guards, so it counts as none.
+        assert!(!needs_renewal(expires_at, expires_at - 1, -DAY));
+        assert!(needs_renewal(expires_at, expires_at, -DAY));
+    }
+
+    #[test]
+    fn the_net_saturates_at_the_edges_of_time() {
+        assert!(needs_renewal(i64::MIN, i64::MIN, RENEWAL_LEAD_SECS));
+        assert!(!needs_renewal(i64::MAX, 0, RENEWAL_LEAD_SECS));
+        assert!(needs_renewal(i64::MAX, i64::MAX, RENEWAL_LEAD_SECS));
+    }
+
+    #[test]
+    fn extreme_times_saturate_rather_than_panic() {
+        // Nothing here should overflow on a nonsense file.
+        let _ = renew_after(i64::MAX, Some(i64::MAX));
+        let _ = renew_after(i64::MIN, Some(i64::MAX));
+        let _ = renew_after(i64::MAX, None);
+        let _ = renewal_due(i64::MIN, Some(i64::MIN), RENEWAL_LEAD_SECS);
+        let _ = renewal_due(i64::MAX, Some(i64::MAX), RENEWAL_LEAD_SECS);
+    }
+
+    #[test]
+    fn the_due_second_is_due() {
+        let tls = issued_tls(T0, Some(T0 + 90 * DAY));
+        let due = tls.renewal_due(RENEWAL_LEAD_SECS).unwrap();
+        assert_eq!(due, T0 + 60 * DAY);
+        assert!(!tls.needs_renewal(due - 1, RENEWAL_LEAD_SECS));
+        assert!(tls.needs_renewal(due, RENEWAL_LEAD_SECS));
+        assert!(tls.needs_renewal(due + 1, RENEWAL_LEAD_SECS));
+    }
+
+    #[test]
+    fn without_an_expiry_the_stored_decision_stands_alone() {
+        let stored = T0 + 60 * DAY;
+        assert_eq!(renewal_due(stored, None, RENEWAL_LEAD_SECS), stored);
+    }
+
+    #[test]
+    fn the_safety_net_pulls_a_late_decision_forward() {
+        // The case §9.1 built it for: a `renew_after` computed against a
+        // 90-day lifetime sitting on a 45-day certificate.
+        let not_after = T0 + 45 * DAY;
+        let stale = T0 + 60 * DAY; // past the expiry entirely
+        assert_eq!(
+            renewal_due(stale, Some(not_after), RENEWAL_LEAD_SECS),
+            not_after - RENEWAL_LEAD_SECS
+        );
+        // Which is exactly where the bare net opens.
+        assert!(needs_renewal(
+            not_after,
+            not_after - RENEWAL_LEAD_SECS,
+            RENEWAL_LEAD_SECS
+        ));
+    }
+
+    #[test]
+    fn the_safety_net_does_not_fire_on_a_healthy_certificate() {
+        // At every lifetime, two thirds comes before the last week.
+        for lifetime_days in [45, 64, 90] {
+            let not_after = T0 + lifetime_days * DAY;
+            let planned = renew_after(T0, Some(not_after));
+            assert_eq!(
+                renewal_due(planned, Some(not_after), RENEWAL_LEAD_SECS),
+                planned,
+                "{lifetime_days}-day certificate"
+            );
+        }
+    }
+
+    #[test]
+    fn the_lead_is_a_boundary_of_its_own() {
+        let not_after = T0 + 45 * DAY;
+        let stale = not_after + DAY;
+        // No lead: the net sits exactly on the expiry.
+        assert_eq!(renewal_due(stale, Some(not_after), 0), not_after);
+        // A negative lead would push the net past the expiry it guards,
+        // so it is treated as none.
+        assert_eq!(renewal_due(stale, Some(not_after), -DAY), not_after);
+        assert_eq!(RENEWAL_LEAD_SECS, 7 * DAY);
+    }
+
+    #[test]
+    fn recording_an_issuance_sets_both_times_together() {
+        let mut acme = acme();
+        acme.issued(T0, Some(T0 + 45 * DAY));
+        assert_eq!(acme.issued_at, T0);
+        assert_eq!(acme.renew_after, T0 + 30 * DAY);
+    }
+
+    #[test]
+    fn a_manual_certificate_is_never_due() {
+        // Saying yes here would overwrite a file anago does not own.
+        let tls = Tls::manual("/etc/ssl/anago/fullchain.pem", "/etc/ssl/anago/privkey.pem");
+        assert_eq!(tls.renewal_due(RENEWAL_LEAD_SECS), None);
+        assert!(!tls.needs_renewal(i64::MAX, RENEWAL_LEAD_SECS));
+    }
+
+    #[test]
+    fn a_short_certificate_is_caught_by_the_net_not_the_plan() {
+        // Why the two are composed: a stored decision that predates a
+        // lifetime change must not outlive the certificate.
+        let not_after = T0 + 45 * DAY;
+        let mut tls = issued_tls(T0, Some(not_after));
+        if let TlsSource::Acme(acme) = &mut tls.source {
+            acme.renew_after = T0 + 60 * DAY; // computed for 90 days
+        }
+        assert_eq!(
+            tls.renewal_due(RENEWAL_LEAD_SECS),
+            Some(not_after - RENEWAL_LEAD_SECS)
+        );
+        assert!(tls.needs_renewal(not_after - RENEWAL_LEAD_SECS, RENEWAL_LEAD_SECS));
+        assert!(!tls.needs_renewal(not_after - RENEWAL_LEAD_SECS - 1, RENEWAL_LEAD_SECS));
+    }
+
+    #[test]
+    fn a_hand_edited_date_is_honoured() {
+        // §9.1 makes this a value a person may pull forward; the only
+        // thing that overrides them is the expiry safety net.
+        let mut tls = issued().tls;
+        tls.not_after = Some(T0 + 90 * DAY);
+        if let TlsSource::Acme(acme) = &mut tls.source {
+            acme.renew_after = T0;
+        }
+        assert_eq!(tls.renewal_due(RENEWAL_LEAD_SECS), Some(T0));
+        assert!(tls.needs_renewal(T0, RENEWAL_LEAD_SECS));
     }
 
     // --------------------------------------------------- cloudflare

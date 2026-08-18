@@ -30,7 +30,7 @@ M0의 수동 경로는 **그대로 남긴다** — `--tls-cert/--tls-key`로 기
 ## B. anago-core — 상태·판정 (순수 std, 외부 크레이트 금지)
 
 - [x] `state.rs`: TLS 출처 모델 추가 — 수동 인증서 경로와 ACME 발급물을 구분해 담는 타입 + JSON 직렬화/역직렬화 + A단계에서 정한 `version` 규칙(구버전 파일 처리 포함) + 라운드트립·거부 케이스 유닛 테스트
-- [ ] `state.rs`: ACME/DNS 상태 필드 추가(계정 키 경로, 발급 방식, 인증서 만료 epoch, Cloudflare zone id/record id 캐시) + 갱신 판정 순수 함수 `needs_renewal(expires_at, now, lead_secs)` + 경계값 유닛 테스트
+- [x] `state.rs`: ACME/DNS 상태 필드 추가(계정 키 경로, 발급 방식, 인증서 만료 epoch, Cloudflare zone id/record id 캐시) + 갱신 판정 순수 함수 `needs_renewal(expires_at, now, lead_secs)` + 경계값 유닛 테스트
 - [ ] `acme.rs`(core): ACME의 순수한 부분만 — HTTP-01 챌린지 경로(`/.well-known/acme-challenge/<token>`)와 응답 본문 조립, DNS-01 TXT 레코드 이름(`_acme-challenge.<domain>`) 조립, 토큰 형식 검증 + 유닛 테스트. 서명·키·해싱·네트워크는 바이너리 몫임을 주석으로 못박는다
 - [ ] `dns.rs`(core): Cloudflare A 레코드 upsert **판정** 순수 함수 — 기존 레코드 목록과 원하는 IP를 받아 `생성 / 수정 / 변경 없음 / 거부(프록시 켜짐·다른 타입 충돌)` 중 하나를 내는 결정 함수 + 유닛 테스트
 - [ ] `sync.rs`(core): 동기화 판정 순수 함수 — 저장된 기기 설정과 서버가 준 피어 목록·서버 정보를 비교해 `변경 없음 / wg 설정 재작성 / 이 기기가 제거됨` 중 하나를 내는 결정 함수 + 유닛 테스트(피어 추가만 된 경우가 "변경 없음"임을 고정)
