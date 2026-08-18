@@ -11,8 +11,9 @@
 //! owns the alphabet, the shape, normalization, and validation —
 //! nothing here needs entropy, so all of it is pure and unit-tested.
 //!
-//! Whether a code is still *live* — unexpired, unused — is a separate
-//! question answered against the state file, not against the string.
+//! Liveness — unexpired, unused — is a separate question from shape,
+//! and answered by [`status`] from the numbers the state file keeps
+//! (§9.1), never by looking at the string.
 
 use std::fmt;
 
@@ -125,6 +126,123 @@ impl fmt::Display for CodeError {
 }
 
 impl std::error::Error for CodeError {}
+
+// ------------------------------------------------------------ lifetime
+
+/// How long a fresh code lives by default: 15 minutes (§7). A code is
+/// the right to register, so it dies young.
+pub const DEFAULT_TTL_SECS: i64 = 15 * 60;
+
+/// Where a code stands right now. Shape is not in question here — a
+/// spent code is still a well-formed string.
+///
+/// The server collapses every non-`Usable` answer into one
+/// `invalid_code` on the wire (see `proto::ErrorCode`): telling an
+/// unauthenticated caller *which* way a code failed only helps them
+/// probe. The distinction is for the server's own log and for
+/// `anago code`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeStatus {
+    /// Issued, unspent, not yet expired.
+    Usable,
+    /// Already redeemed — permanently, by the time in `used_at`.
+    Used,
+    /// Past its expiry.
+    Expired,
+}
+
+impl CodeStatus {
+    pub fn is_usable(self) -> bool {
+        self == CodeStatus::Usable
+    }
+}
+
+impl fmt::Display for CodeStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CodeStatus::Usable => f.write_str("usable"),
+            CodeStatus::Used => f.write_str("already used"),
+            CodeStatus::Expired => f.write_str("expired"),
+        }
+    }
+}
+
+/// Expiry instant for a code issued at `issued_at` with `ttl_secs`,
+/// both Unix epoch seconds (§9.1).
+///
+/// Saturating: a TTL large enough to overflow parks the code at
+/// `i64::MAX` rather than wrapping into the past, which would expire it
+/// instantly.
+pub fn expires_at(issued_at: i64, ttl_secs: i64) -> i64 {
+    issued_at.saturating_add(ttl_secs)
+}
+
+/// Judges a code from what the state file stores about it: its expiry,
+/// and when it was redeemed if it was.
+///
+/// - `Used` wins over `Expired`. A redeemed code is spent forever, and
+///   saying "expired" would suggest a fresher one of the same string
+///   might work.
+/// - Expiry is exclusive: usable while `now < expires_at`, gone at
+///   exactly `expires_at`. A zero or negative TTL therefore means the
+///   code is born expired instead of living one extra second.
+/// - `now` before the issue time (a clock stepping backwards on the
+///   server) leaves the code usable. Skew is not the joining device's
+///   fault, and the expiry still bounds it.
+pub fn status(expires_at: i64, used_at: Option<i64>, now: i64) -> CodeStatus {
+    if used_at.is_some() {
+        return CodeStatus::Used;
+    }
+    if now >= expires_at {
+        return CodeStatus::Expired;
+    }
+    CodeStatus::Usable
+}
+
+/// [`status`] for callers holding an issue time and a TTL rather than
+/// an expiry — `anago code` deciding what to print, say. The state file
+/// stores `expires_at`, so the server itself uses [`status`].
+pub fn status_from_issue(
+    issued_at: i64,
+    ttl_secs: i64,
+    used_at: Option<i64>,
+    now: i64,
+) -> CodeStatus {
+    status(expires_at(issued_at, ttl_secs), used_at, now)
+}
+
+/// One entry of the state file's `codes[]` (§9.1).
+///
+/// Expired and spent entries are kept rather than deleted — the audit
+/// trail of who registered when is worth more than the bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssuedCode {
+    pub code: JoinCode,
+    pub issued_at: i64,
+    pub expires_at: i64,
+    /// `None` until redeemed; the redemption time afterwards.
+    pub used_at: Option<i64>,
+}
+
+impl IssuedCode {
+    /// A code issued now, living for `ttl_secs`.
+    pub fn issue(code: JoinCode, issued_at: i64, ttl_secs: i64) -> IssuedCode {
+        IssuedCode {
+            code,
+            issued_at,
+            expires_at: expires_at(issued_at, ttl_secs),
+            used_at: None,
+        }
+    }
+
+    pub fn status(&self, now: i64) -> CodeStatus {
+        status(self.expires_at, self.used_at, now)
+    }
+
+    pub fn is_usable(&self, now: i64) -> bool {
+        self.status(now).is_usable()
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -254,5 +372,126 @@ mod tests {
             assert!(code.as_str().starts_with(c), "{c} lost in {code}");
             assert_eq!(JoinCode::parse(code.as_str()).unwrap(), code);
         }
+    }
+
+    // ------------------------------------------------------ lifetime
+
+    const ISSUED: i64 = 1_755_500_000;
+
+    fn code() -> JoinCode {
+        JoinCode::parse("7QX4-M2KD").unwrap()
+    }
+
+    #[test]
+    fn default_ttl_is_fifteen_minutes() {
+        assert_eq!(DEFAULT_TTL_SECS, 900);
+        assert_eq!(expires_at(ISSUED, DEFAULT_TTL_SECS), ISSUED + 900);
+    }
+
+    #[test]
+    fn expiry_is_exclusive_at_the_boundary() {
+        let end = expires_at(ISSUED, DEFAULT_TTL_SECS);
+        assert_eq!(status(end, None, ISSUED), CodeStatus::Usable);
+        assert_eq!(status(end, None, end - 1), CodeStatus::Usable);
+        // The last usable instant is end - 1; end itself is too late.
+        assert_eq!(status(end, None, end), CodeStatus::Expired);
+        assert_eq!(status(end, None, end + 1), CodeStatus::Expired);
+    }
+
+    #[test]
+    fn a_used_code_stays_used_whenever_it_is_asked() {
+        let end = expires_at(ISSUED, DEFAULT_TTL_SECS);
+        let used = Some(ISSUED + 10);
+        // Used beats Expired in both directions of the boundary: a
+        // spent code never becomes usable again.
+        assert_eq!(status(end, used, ISSUED + 11), CodeStatus::Used);
+        assert_eq!(status(end, used, end - 1), CodeStatus::Used);
+        assert_eq!(status(end, used, end), CodeStatus::Used);
+        assert_eq!(status(end, used, end + 100_000), CodeStatus::Used);
+        // Even a used_at of 0 counts as used — presence, not truthiness.
+        assert_eq!(status(end, Some(0), ISSUED), CodeStatus::Used);
+    }
+
+    #[test]
+    fn a_zero_or_negative_ttl_is_born_expired() {
+        assert_eq!(
+            status_from_issue(ISSUED, 0, None, ISSUED),
+            CodeStatus::Expired
+        );
+        assert_eq!(
+            status_from_issue(ISSUED, -1, None, ISSUED),
+            CodeStatus::Expired
+        );
+        assert_eq!(
+            status_from_issue(ISSUED, -900, None, ISSUED),
+            CodeStatus::Expired
+        );
+        // One second of life is one second of life.
+        assert_eq!(
+            status_from_issue(ISSUED, 1, None, ISSUED),
+            CodeStatus::Usable
+        );
+        assert_eq!(
+            status_from_issue(ISSUED, 1, None, ISSUED + 1),
+            CodeStatus::Expired
+        );
+    }
+
+    #[test]
+    fn a_backwards_clock_does_not_reject_the_device() {
+        // Server clock stepped back after issuing: skew is not the
+        // joining device's fault, and expiry still bounds the code.
+        assert_eq!(
+            status_from_issue(ISSUED, DEFAULT_TTL_SECS, None, ISSUED - 3600),
+            CodeStatus::Usable
+        );
+        assert_eq!(
+            status_from_issue(ISSUED, DEFAULT_TTL_SECS, None, 0),
+            CodeStatus::Usable
+        );
+        assert_eq!(
+            status_from_issue(ISSUED, DEFAULT_TTL_SECS, None, i64::MIN),
+            CodeStatus::Usable
+        );
+    }
+
+    #[test]
+    fn a_huge_ttl_saturates_instead_of_wrapping_into_the_past() {
+        assert_eq!(expires_at(ISSUED, i64::MAX), i64::MAX);
+        assert_eq!(expires_at(i64::MAX, 1), i64::MAX);
+        assert_eq!(expires_at(i64::MIN, -1), i64::MIN);
+        // Wrapping would have expired it instantly.
+        assert_eq!(
+            status_from_issue(ISSUED, i64::MAX, None, ISSUED),
+            CodeStatus::Usable
+        );
+        // i64::MAX is still not usable *at* i64::MAX, by the exclusive rule.
+        assert_eq!(status(i64::MAX, None, i64::MAX), CodeStatus::Expired);
+    }
+
+    #[test]
+    fn issued_codes_answer_for_themselves() {
+        let mut issued = IssuedCode::issue(code(), ISSUED, DEFAULT_TTL_SECS);
+        assert_eq!(issued.expires_at, ISSUED + DEFAULT_TTL_SECS);
+        assert_eq!(issued.used_at, None);
+        assert!(issued.is_usable(ISSUED + 899));
+        assert!(!issued.is_usable(ISSUED + 900));
+        assert_eq!(issued.status(ISSUED + 900), CodeStatus::Expired);
+
+        issued.used_at = Some(ISSUED + 5);
+        assert_eq!(issued.status(ISSUED + 6), CodeStatus::Used);
+        assert!(!issued.is_usable(ISSUED + 6));
+        // The code string is untouched by any of this.
+        assert_eq!(issued.code.as_str(), "7QX4-M2KD");
+    }
+
+    #[test]
+    fn status_reads_as_a_sentence() {
+        assert_eq!(CodeStatus::Usable.to_string(), "usable");
+        assert_eq!(CodeStatus::Used.to_string(), "already used");
+        assert_eq!(CodeStatus::Expired.to_string(), "expired");
+        assert!(CodeStatus::Usable.is_usable());
+        assert!(!CodeStatus::Used.is_usable());
+        assert!(!CodeStatus::Expired.is_usable());
     }
 }
