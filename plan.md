@@ -53,7 +53,7 @@
 
 ## E. 클라이언트 — join / ls / rm
 
-- [ ] HTTPS 클라이언트 최소 구현(rustls 기반 요청/응답, JSON 본문, 타임아웃, 에러 메시지) — 요청 조립부 순수 함수 테스트
+- [x] HTTPS 클라이언트 최소 구현(rustls 기반 요청/응답, JSON 본문, 타임아웃, 에러 메시지) — 요청 조립부 순수 함수 테스트
 - [ ] `anago join <domain> <code> [--name]`: 로컬 키쌍 생성(개인키 로컬 0600) → join 호출 → 응답 저장(`~/.config/anago/`: 도메인·토큰·할당 IP)
 - [ ] `anago join` 후속: 클라 wg 설정 파일 작성 + `wg-quick up` 위임 + 서버 .1 ping으로 연결 확인, 실패 시 진단 안내
 - [ ] `anago ls`: 로컬 토큰으로 `/api/v1/peers` 호출 → 코어 렌더러로 출력. 서버에서 실행 시 상태 파일 직접 읽는 경로도 지원

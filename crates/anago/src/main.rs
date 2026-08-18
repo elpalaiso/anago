@@ -12,6 +12,8 @@
 mod api;
 mod args;
 mod cli;
+#[allow(dead_code)]
+mod client;
 mod code;
 mod init;
 // Path rules and file handling are complete and unit-tested; the
