@@ -35,6 +35,15 @@ sha2 = "0.10"
 # for one we do not.
 serde_json = "1"
 
+# ACME (DESIGN.md §10.2). `default-features = false` is a requirement,
+# not a preference: the defaults select aws-lc-rs, which would put a
+# second crypto backend and a C toolchain requirement under a binary
+# that pins ring above. `rcgen` makes the certificate key and CSR;
+# `hyper-rustls` is the library's own HTTP stack (hyper is already here
+# for the server). `x509-parser` and `time` stay off — they are the ARI
+# path, and it is not taken in M1.
+instant-acme = { version = "0.8", default-features = false, features = ["ring", "rcgen", "hyper-rustls"] }
+
 [dev-dependencies]
 # Drives the router in tests without binding a port.
 tower = { version = "0.5", default-features = false, features = ["util"] }

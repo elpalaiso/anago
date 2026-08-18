@@ -1378,7 +1378,14 @@ instant-acme = { version = "0.8", default-features = false,
     CA(Let's Encrypt)만 상대하므로 §11의 origin-cert 단서와 무관하고,
     **어느 쪽도 검증을 끄지 않는다**.
 - **켜지 않는 것: `x509-parser`·`time`.** 둘은 ARI(RFC 9773)의 갱신
-  창을 읽기 위한 것이고, 그 대가로 ASN.1 파서 계열이 십수 개 따라온다.
+  창을 읽기 위한 것이고, 그 대가로 ASN.1 파서 계열(`x509-parser`,
+  `asn1-rs`, `der-parser`, `nom` …)이 따라온다. 이것들은 잠금 파일에는
+  이름이 남지만(옵션 의존성이라 해석 그래프에 기록된다) **빌드 트리에는
+  들어오지 않는다** — `cargo tree`로 확인했다.
+  - 정정: **`time` 크레이트 자체는 feature와 무관하게 들어온다.**
+    `rcgen`이 인증서 유효기간을 다루느라 무조건 의존하기 때문이다
+    (`time`·`time-core`·`deranged`·`num-conv`·`powerfmt`). feature를
+    끄는 것으로 막히는 것은 위 ASN.1 파서 계열이지 `time`이 아니다.
   M1의 갱신 시점은 ARI 없이 정한다 — 그 규칙(무엇을 상태에 적고 언제
   갱신하는가)은 §9.1에서 확정한다. 인증서의 `notAfter`는 상태에 적지만
   (§9.1의 `tls.not_after`) 그것 때문에 이 feature를 켜지는 않는다:
@@ -1469,15 +1476,39 @@ QR에서 인코더를 코어에 두지 않기로 한 것과 어긋나 보이지�
 것뿐이다(진짜 판정은 ACME 서버가 내린다). §4 원칙 1이 위임하라고 한
 "어려운 문제"는 이쪽이 아니다.
 
-#### 새로 들어오는 전이 의존성
+#### 실제로 들어온 전이 의존성 (측정치)
 
-위 셋을 더하면 잠금 파일에 **약 20개**가 추가된다(instant-acme,
-`rcgen`, `hyper-rustls`, `rustls-platform-verifier`, `serde_json`,
-`thiserror`, `base64`, `pem` 등). **그중 C 툴체인을 새로 요구하는 것은
-하나도 없다** — aws-lc-rs를 끈 이유가 이것이다. 빌드 스크립트가 있는
-것은 셋뿐이고(`serde_json`·`thiserror`·`zmij`) 전부 rustc 버전을 묻는
-순수 러스트 프로브다. 이 성질은 M4의 "어느 VPS에서나 `cargo build`"를
+`instant-acme`를 넣은 뒤 빌드 트리는 **93 → 111개**로 늘었다. 새로 들어온
+18개는 다음과 같다:
+
+```
+async-trait base64 deranged hyper-rustls instant-acme num-conv pem
+powerfmt rcgen rustls-platform-verifier serde_derive thiserror
+thiserror-impl time time-core try-lock want yasna
+```
+
+**C 툴체인을 새로 요구하는 것은 하나도 없다** — aws-lc-rs를 끈 이유가
+이것이다(`cargo tree -i aws-lc-rs` → 없음). 새 크레이트 중 빌드 스크립트가
+있는 것은 `thiserror` 하나뿐이고 rustc 버전을 묻는 순수 러스트 프로브다.
+`ring`이 `cc`를 빌드 의존성으로 갖지만 그건 M0의 rustls가 이미 데려온
+것이라 변화가 아니다. 이 성질은 M4의 "어느 VPS에서나 `cargo build`"를
 지키는 조건이므로, 앞으로 의존성을 더할 때마다 같은 확인을 한다.
+
+**anago-core의 의존성은 0개 그대로다**(§4 원칙 4).
+
+#### 암호 백엔드는 feature가 정한다 — 명시적 설치가 아니라
+
+anago의 rustls 호출은 전부 프로바이더를 **명시적으로** 넘긴다
+(`builder_with_provider`). 그런데 instant-acme의 기본 HTTP 클라이언트는
+rustls의 **암묵적** 기본값을 쓴다. rustls는 그 기본값을 크레이트
+feature에서 정하는데, 프로바이더가 정확히 하나 컴파일돼 있으면 그것을
+설치하고 **둘이거나 없으면 패닉**한다. anago에 컴파일돼 있는 것은
+`ring` 하나뿐이라 그 경로가 안전하다 — 즉 이 안전은 코드가 아니라
+**feature 설정이 지키고 있다.** 그래서 `tests/acme_deps.rs`가 그것을
+고정한다: ACME 클라이언트를 만든 뒤 설치된 프로바이더의 암호 스위트가
+ring의 것과 정확히 같은지 본다. feature 하나가 조용히 aws-lc-rs(그리고
+C 툴체인 요구)를 ACME 클라이언트 밑에 밀어 넣는 것이 이 테스트가 막는
+실패다.
 
 
 ## 11. 마일스톤
