@@ -23,7 +23,7 @@ M0의 수동 경로는 **그대로 남긴다** — `--tls-cert/--tls-key`로 기
 - [x] DESIGN.md §10 갱신: M1 의존성 확정 — ACME 라이브러리(instant-acme 등) 채택안, 그것이 끌고 오는 serde/HTTP 스택을 §10.1의 "제3자 JSON은 바이너리 몫" 예외로 명시, QR 인코딩 방식(크레이트 vs 자체), 전부 바이너리 크레이트 한정이며 anago-core는 순수 std 유지임을 문장으로 못박는다
 - [x] DESIGN.md §9.1 갱신: M1 상태 파일 스키마 — TLS 출처(수동 경로 vs ACME 발급물), ACME 계정·인증서 경로, 발급 방식(`http-01`|`dns-01`), 인증서 만료 epoch, Cloudflare zone/record id 캐시 필드를 추가하고 `version` 처리(2로 올릴지, M0 파일을 어떻게 읽을지)를 확정
 - [x] DESIGN.md §8 갱신: M1 CLI 표면 확정 — `server init`의 `--cf-token`/`--acme-email`/`--acme-staging`과 `--tls-cert/--tls-key` 생략 규칙(둘 다 없으면 ACME), `anago sync`의 플래그(`--install-timer`/`--uninstall-timer` 등), `anago join --export qr|conf`의 인자·출력 규약, 이미 선 허브의 인증서 재발급 표면(`server renew` 도입 여부)
-- [ ] DESIGN.md §6.3 갱신: `sync`가 M1에서 실제로 하는 일 확정 — 허브-스포크라 클라 `AllowedIPs`가 안 변하는데 무엇을 갱신하는가(서버 공개키·엔드포인트 변경 반영, 제거된 기기의 401 감지·안내, 허브의 `last_seen` 갱신), 타이머 기본 주기, 네트워크 실패 시 조용히 끝내는 규약
+- [x] DESIGN.md §6.3 갱신: `sync`가 M1에서 실제로 하는 일 확정 — 허브-스포크라 클라 `AllowedIPs`가 안 변하는데 무엇을 갱신하는가(서버 공개키·엔드포인트 변경 반영, 제거된 기기의 401 감지·안내, 허브의 `last_seen` 갱신), 타이머 기본 주기, 네트워크 실패 시 조용히 끝내는 규약
 - [ ] DESIGN.md §7 갱신: `--export`로 만든 폰 프로필의 보안 모델 — 개인키가 폰이 아니라 이 기기에서 생성돼 화면/파일로 나가는 §6.2 원칙의 단서, QR의 터미널 스크롤백 노출, conf 파일 0600·사용 후 삭제 안내를 명시
 - [ ] DESIGN.md §11/§13 갱신: M1 검증 조건(폰이 공식 wg 앱으로 합류)과 새 리스크 — HTTP-01의 :80 개방 요구, DNS-01이 그것을 없애는 대신 토큰 권한을 요구하는 트레이드오프, Let's Encrypt 레이트 리밋(staging 권장), Cloudflare 프록시 off 강제, 맥 launchd 권한 차이
 
