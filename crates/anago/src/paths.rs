@@ -66,6 +66,14 @@ impl ServerPaths {
     }
 }
 
+/// The device file's name inside the config directory. A bare name,
+/// because the work on it is done relative to a directory descriptor
+/// rather than by path (see `fsutil::DirHandle`).
+pub const DEVICE_FILE: &str = "device.json";
+
+/// The join lock's name inside the config directory.
+pub const JOIN_LOCK: &str = "join.lock";
+
 /// Paths under a device's config directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientPaths {
@@ -85,14 +93,14 @@ impl ClientPaths {
     /// 0600 (§9). The wg private key is not in here; it lives in the wg
     /// config and nowhere else.
     pub fn device_file(&self) -> PathBuf {
-        self.dir.join("device.json")
+        self.dir.join(DEVICE_FILE)
     }
 
     /// Serializes `anago join` against itself. Two joins on one device
     /// would race over the same two files — and the loser's cleanup
     /// would delete the winner's config.
     pub fn join_lock(&self) -> PathBuf {
-        self.dir.join("join.lock")
+        self.dir.join(JOIN_LOCK)
     }
 }
 
@@ -130,11 +138,119 @@ pub fn client_config_dir(
     }
 }
 
+/// Whoever typed `sudo anago join`.
+///
+/// `join` needs root to write `/etc/wireguard`, but the device file it
+/// writes belongs to the person, not to root. Without this, `sudo`
+/// would put `device.json` in `/root/.config/anago` — where the same
+/// person's later `anago ls` cannot find it — or leave it in their own
+/// home owned by root, which they cannot read either.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvokingUser {
+    pub uid: u32,
+    pub gid: u32,
+    /// The invoking user's home, from the password database.
+    pub home: Option<PathBuf>,
+}
+
+/// Reads `SUDO_UID`/`SUDO_GID`, which sudo sets and nothing else does.
+///
+/// Values that are not numbers, or a uid of 0, mean there is nobody to
+/// hand anything back to.
+pub fn invoking_user(
+    sudo_uid: Option<&str>,
+    sudo_gid: Option<&str>,
+    home: Option<PathBuf>,
+) -> Option<InvokingUser> {
+    let uid: u32 = sudo_uid?.parse().ok()?;
+    if uid == 0 {
+        return None;
+    }
+    let gid: u32 = sudo_gid.and_then(|gid| gid.parse().ok()).unwrap_or(uid);
+    Some(InvokingUser { uid, gid, home })
+}
+
+/// [`invoking_user`] against this process's environment.
+pub fn invoking_user_from_env() -> Option<InvokingUser> {
+    let uid = env::var("SUDO_UID").ok();
+    let gid = env::var("SUDO_GID").ok();
+    let user = invoking_user(uid.as_deref(), gid.as_deref(), None)?;
+    Some(InvokingUser {
+        home: home_of(user.uid),
+        ..user
+    })
+}
+
+/// A uid's home directory, from the password database.
+///
+/// `SUDO_USER`'s home is the right base even when `HOME` says `/root`,
+/// and `getpwuid_r` is the only way to ask.
+fn home_of(uid: u32) -> Option<PathBuf> {
+    use std::ffi::CStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut passwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buffer = vec![0i8; 4096];
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: `passwd` and `buffer` outlive the call, the buffer length
+    // is its real length, and `result` is checked before `passwd` is
+    // read.
+    let code = unsafe {
+        libc::getpwuid_r(
+            uid,
+            &mut passwd,
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if code != 0 || result.is_null() || passwd.pw_dir.is_null() {
+        return None;
+    }
+    // SAFETY: `pw_dir` points into `buffer`, which is still alive.
+    let dir = unsafe { CStr::from_ptr(passwd.pw_dir) };
+    let path = PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes()));
+    path.is_absolute().then_some(path)
+}
+
+/// Resolves the config directory the same way whether or not the
+/// command was run through sudo.
+///
+/// `XDG_CONFIG_HOME` still wins when it is visible, so a person who
+/// moved their config directory and runs `sudo -E anago join` gets the
+/// same path their later `anago ls` will use. When sudo has stripped it
+/// — the default — the invoking user's home from the password database
+/// is the closest thing to the truth, and it matches what `anago ls`
+/// resolves for somebody who has not moved anything.
+///
+/// Root's own `HOME` is never used while an invoking user is known:
+/// `/root/.config/anago` is a place the person could not read anyway.
+pub fn client_config_dir_for(
+    xdg_config_home: Option<&str>,
+    home: Option<&str>,
+    invoking: Option<&InvokingUser>,
+) -> Result<ClientPaths, PathError> {
+    if let Some(xdg) = xdg_config_home {
+        let xdg = Path::new(xdg);
+        if xdg.is_absolute() {
+            return Ok(ClientPaths::new(xdg.join("anago")));
+        }
+    }
+    if let Some(sudo_home) = invoking.and_then(|user| user.home.as_deref()) {
+        return Ok(ClientPaths::new(sudo_home.join(".config").join("anago")));
+    }
+    client_config_dir(None, home)
+}
+
 /// The one place that reads the environment.
 pub fn client_config_dir_from_env() -> Result<ClientPaths, PathError> {
     let xdg = env::var("XDG_CONFIG_HOME").ok();
     let home = env::var("HOME").ok();
-    client_config_dir(xdg.as_deref(), home.as_deref())
+    client_config_dir_for(
+        xdg.as_deref(),
+        home.as_deref(),
+        invoking_user_from_env().as_ref(),
+    )
 }
 
 /// Why a path could not be resolved.
@@ -255,6 +371,55 @@ mod tests {
             paths.device_file(),
             Path::new("/home/jo/.config/anago/device.json")
         );
+    }
+
+    #[test]
+    fn sudo_and_plain_runs_land_in_the_same_directory() {
+        // The device file is written by `sudo anago join` and read by a
+        // plain `anago ls`: the two have to agree, or the token is
+        // saved somewhere the next command will not look.
+        let sudo = InvokingUser {
+            uid: 501,
+            gid: 20,
+            home: Some(PathBuf::from("/home/jo")),
+        };
+
+        // Default sudo, which strips XDG: root's HOME is ignored in
+        // favour of the invoking user's home — the same place a plain
+        // run with HOME=/home/jo resolves.
+        let under_sudo = client_config_dir_for(None, Some("/root"), Some(&sudo)).unwrap();
+        let plain = client_config_dir_for(None, Some("/home/jo"), None).unwrap();
+        assert_eq!(under_sudo.dir(), plain.dir());
+        assert_eq!(under_sudo.dir(), Path::new("/home/jo/.config/anago"));
+
+        // `sudo -E` keeps XDG_CONFIG_HOME, and a person who moved it
+        // gets the same answer both ways.
+        let under_sudo =
+            client_config_dir_for(Some("/home/jo/cfg"), Some("/root"), Some(&sudo)).unwrap();
+        let plain = client_config_dir_for(Some("/home/jo/cfg"), Some("/home/jo"), None).unwrap();
+        assert_eq!(under_sudo.dir(), plain.dir());
+        assert_eq!(under_sudo.dir(), Path::new("/home/jo/cfg/anago"));
+    }
+
+    #[test]
+    fn sudo_variables_are_read_strictly() {
+        assert_eq!(
+            invoking_user(Some("501"), Some("20"), None),
+            Some(InvokingUser {
+                uid: 501,
+                gid: 20,
+                home: None
+            })
+        );
+        // A missing gid falls back to the uid's own group.
+        assert_eq!(
+            invoking_user(Some("501"), None, None).map(|user| user.gid),
+            Some(501)
+        );
+        // root running as root is nobody to hand files back to.
+        assert_eq!(invoking_user(Some("0"), Some("0"), None), None);
+        assert_eq!(invoking_user(None, Some("20"), None), None);
+        assert_eq!(invoking_user(Some("nope"), None, None), None);
     }
 
     #[test]

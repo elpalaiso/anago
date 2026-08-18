@@ -24,7 +24,7 @@ use anago_core::wgconf::{self, ClientProfile};
 use crate::client::{self, Method, Request};
 use crate::diagnostics::Target;
 use crate::fsutil;
-use crate::paths::ClientPaths;
+use crate::paths::{ClientPaths, InvokingUser};
 use crate::wg::{self, WgError};
 
 /// Schema version of `device.json`.
@@ -304,6 +304,7 @@ pub fn run(
     api_port: u16,
     client_paths: &ClientPaths,
     wg_config_path: &Path,
+    invoking: Option<&InvokingUser>,
 ) -> Result<Joined, JoinError> {
     // Everything that can refuse happens before the code is spent: a
     // join that fails after registering leaves the person holding a
@@ -316,17 +317,12 @@ pub fn run(
             .and_then(name_from_hostname)
             .ok_or(JoinError::NoName)?,
     };
-    fsutil::ensure_private_dir(client_paths.dir()).map_err(|e| JoinError::Save {
-        what: "the config directory",
-        target: Target::user_directory(client_paths.dir()),
-        kind: e.kind(),
-        source: e.to_string(),
-    })?;
+    let client_dir = prepare_client_dir(client_paths, invoking)?;
     // Declared before the reservation so it outlives it: the claim is
     // released while this is still held, and only a lock holder ever
     // reclaims a leftover marker.
-    let _lock = acquire_join_lock(client_paths)?;
-    check_not_joined(client_paths, wg_config_path)?;
+    let _lock = acquire_join_lock(&client_dir, invoking)?;
+    check_not_joined(&client_dir, client_paths, wg_config_path)?;
     if let Some(parent) = wg_config_path.parent() {
         fsutil::ensure_private_dir(parent).map_err(|e| JoinError::Save {
             what: "the WireGuard directory",
@@ -341,10 +337,8 @@ pub fn run(
     // races surface here, while the code is still unspent; the writes
     // afterwards go into files this process already owns. The
     // reservation deletes itself unless the join finishes.
-    let mut reservation = Reservation::claim(&Targets {
-        wg_config: wg_config_path.to_path_buf(),
-        device_file: client_paths.device_file(),
-    })?;
+    let owner = invoking.map(|user| (user.uid, user.gid));
+    let mut reservation = Reservation::claim(&client_dir, client_paths, wg_config_path, owner)?;
 
     let (private_key, public_key) = wg::generate_keypair().map_err(JoinError::Wg)?;
     let body = request_body(code, &name, &public_key);
@@ -367,20 +361,27 @@ pub fn run(
     // failure below is a failure *after* that, so they all leave
     // through the same door — one that tries to undo the registration
     // and, failing that, says what to do by hand.
-    match finish(
-        &response.body,
-        domain,
-        api_port,
-        private_key,
+    let destination = Destination {
+        client_dir: &client_dir,
         client_paths,
-        wg_config_path,
-    ) {
+        wg_config: wg_config_path,
+        owner,
+    };
+    match finish(&response.body, domain, api_port, private_key, &destination) {
         Ok(config) => {
             reservation.commit();
             Ok(Joined { config })
         }
         Err(e) => Err(post_registration(&response.body, domain, api_port, &e)),
     }
+}
+
+/// Where a finished join writes, and on whose behalf.
+struct Destination<'a> {
+    client_dir: &'a fsutil::DirHandle,
+    client_paths: &'a ClientPaths,
+    wg_config: &'a Path,
+    owner: Owner,
 }
 
 /// Everything between a 2xx and a usable device: decode, validate,
@@ -390,8 +391,7 @@ fn finish(
     domain: &str,
     api_port: u16,
     private_key: PrivateKey,
-    client_paths: &ClientPaths,
-    wg_config_path: &Path,
+    to: &Destination,
 ) -> Result<DeviceConfig, JoinError> {
     let value = json::parse(body).map_err(|e| JoinError::BadResponse(e.to_string()))?;
     let answer =
@@ -403,7 +403,7 @@ fn finish(
     config.validate()?;
     let profile = config.profile(private_key)?;
 
-    publish(&config, &profile, client_paths, wg_config_path)?;
+    publish(&config, &profile, to)?;
     Ok(config)
 }
 
@@ -494,29 +494,56 @@ pub fn is_stale_claim(contents: &str) -> bool {
     contents == CLAIM_MARKER
 }
 
-/// Files claimed for this attempt, removed if it does not finish.
+/// Files claimed for this attempt, released if it does not finish.
 ///
 /// Claiming up front turns "the disk is full after the code was spent"
 /// into "the disk is full before anything happened", which is a retry
 /// rather than a dead end.
+///
+/// The wg config is claimed by path — `/etc/wireguard` is root's
+/// already. The device file is claimed through the directory
+/// descriptor, so nothing about it can be redirected by renaming a
+/// directory the person owns.
 #[derive(Debug)]
-struct Reservation {
-    paths: Vec<std::path::PathBuf>,
+struct Reservation<'a> {
+    wg_config: &'a Path,
+    client_dir: &'a fsutil::DirHandle,
+    device_file: String,
+    /// Whether this attempt actually took the device file. A claim that
+    /// failed because somebody else holds that name must not have its
+    /// cleanup delete their file.
+    device_claimed: bool,
     committed: bool,
 }
 
-impl Reservation {
-    fn claim(targets: &Targets) -> Result<Reservation, JoinError> {
+/// Who a newly created client-side file should belong to.
+type Owner = Option<(u32, u32)>;
+
+impl<'a> Reservation<'a> {
+    fn claim(
+        client_dir: &'a fsutil::DirHandle,
+        client_paths: &ClientPaths,
+        wg_config: &'a Path,
+        owner: Owner,
+    ) -> Result<Reservation<'a>, JoinError> {
+        claim_system(wg_config)?;
         let mut reservation = Reservation {
-            paths: Vec::new(),
+            wg_config,
+            client_dir,
+            device_file: crate::paths::DEVICE_FILE.to_string(),
+            device_claimed: false,
             committed: false,
         };
-        for path in [&targets.wg_config, &targets.device_file] {
-            claim_one(path, targets)?;
-            // Pushed after the claim, so a failure only cleans up what
-            // this call actually took.
-            reservation.paths.push(path.clone());
-        }
+        // Claimed after the wg config, so a failure here releases that
+        // one on the way out — and only that one.
+        claim_user(
+            client_dir,
+            &reservation.device_file,
+            client_paths,
+            wg_config,
+            owner,
+        )?;
+        reservation.device_claimed = true;
         Ok(reservation)
     }
 
@@ -525,75 +552,83 @@ impl Reservation {
     }
 }
 
-/// The two files a join needs, together — every message about one of
-/// them has to be able to name the other.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Targets {
-    pub wg_config: std::path::PathBuf,
-    pub device_file: std::path::PathBuf,
-}
-
-impl Targets {
-    /// How to describe a write to one of these paths, ownership
-    /// included — the wg config is the system's, the device file is
-    /// the person's.
-    fn describe(&self, path: &Path) -> Target {
-        if path == self.wg_config {
-            Target::system_file(path)
-        } else {
-            Target::user_file(path)
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
         }
-    }
-
-    /// The error for a path that is already taken.
-    fn taken(&self, path: &Path) -> JoinError {
-        if path == self.wg_config {
-            JoinError::ConfigExists(path.display().to_string())
-        } else {
-            JoinError::AlreadyJoined {
-                device_file: self.device_file.display().to_string(),
-                wg_config: self.wg_config.display().to_string(),
-            }
+        let _ = std::fs::remove_file(self.wg_config);
+        if self.device_claimed {
+            let _ = self.client_dir.remove(&self.device_file);
         }
     }
 }
 
-/// Takes one path: creates it, or takes over a claim an earlier run
-/// left behind when it was killed.
-fn claim_one(path: &Path, targets: &Targets) -> Result<(), JoinError> {
+/// Claims a path in a system directory, or takes over a marker an
+/// earlier run left behind when it was killed.
+fn claim_system(path: &Path) -> Result<(), JoinError> {
     match fsutil::create_new_private(path, CLAIM_MARKER) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             let existing = std::fs::read_to_string(path).unwrap_or_default();
             if is_stale_claim(&existing) {
-                // Ours to reuse: an unfinished join owns nothing.
                 fsutil::write_private(path, CLAIM_MARKER).map_err(|e| JoinError::Save {
                     what: "a config file",
-                    target: targets.describe(path),
+                    target: Target::system_file(path),
                     kind: e.kind(),
                     source: e.to_string(),
                 })
             } else {
-                Err(targets.taken(path))
+                Err(JoinError::ConfigExists(path.display().to_string()))
             }
         }
         Err(e) => Err(JoinError::Save {
             what: "a config file",
-            target: targets.describe(path),
+            target: Target::system_file(path),
             kind: e.kind(),
             source: e.to_string(),
         }),
     }
 }
 
-impl Drop for Reservation {
-    fn drop(&mut self) {
-        if self.committed {
-            return;
+/// The same, for the device file, through the directory descriptor.
+fn claim_user(
+    dir: &fsutil::DirHandle,
+    name: &str,
+    client_paths: &ClientPaths,
+    wg_config: &Path,
+    owner: Owner,
+) -> Result<(), JoinError> {
+    // Both paths, because the recovery this error prints names both —
+    // an empty one would tell somebody to run `wg-quick down ` with
+    // nothing after it.
+    let taken = || JoinError::AlreadyJoined {
+        device_file: client_paths.device_file().display().to_string(),
+        wg_config: wg_config.display().to_string(),
+    };
+    match dir.create_new_private(name, CLAIM_MARKER, owner) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing = dir.read_to_string(name).unwrap_or_default();
+            if is_stale_claim(&existing) {
+                // Ours to reuse: an unfinished join owns nothing.
+                dir.write_private(name, CLAIM_MARKER, owner)
+                    .map_err(|e| JoinError::Save {
+                        what: "a config file",
+                        target: Target::user_file(client_paths.device_file()),
+                        kind: e.kind(),
+                        source: e.to_string(),
+                    })
+            } else {
+                Err(taken())
+            }
         }
-        for path in &self.paths {
-            let _ = std::fs::remove_file(path);
-        }
+        Err(e) => Err(JoinError::Save {
+            what: "a config file",
+            target: Target::user_file(client_paths.device_file()),
+            kind: e.kind(),
+            source: e.to_string(),
+        }),
     }
 }
 
@@ -637,14 +672,74 @@ fn undo_registration(
 /// freshly written config on the way out.
 ///
 /// Not a wait: a second join on one device is a mistake, not a queue.
-pub fn acquire_join_lock(client_paths: &ClientPaths) -> Result<fsutil::FileLock, JoinError> {
-    let path = client_paths.join_lock();
-    match fsutil::FileLock::try_acquire(&path) {
+pub fn acquire_join_lock(
+    client_dir: &fsutil::DirHandle,
+    invoking: Option<&InvokingUser>,
+) -> Result<fsutil::FileLock, JoinError> {
+    let owner = invoking.map(|user| (user.uid, user.gid));
+    match client_dir.try_lock(crate::paths::JOIN_LOCK, owner) {
         Ok(Some(lock)) => Ok(lock),
         Ok(None) => Err(JoinError::AlreadyRunning),
         Err(e) => Err(JoinError::Save {
             what: "the join lock",
-            target: Target::user_file(client_paths.join_lock()),
+            target: Target::user_file(client_dir.path().join(crate::paths::JOIN_LOCK)),
+            kind: e.kind(),
+            source: e.to_string(),
+        }),
+    }
+}
+
+/// Opens the client config directory, checking it belongs to the person
+/// who ran the command.
+///
+/// Under sudo the directory must already exist and already be theirs.
+/// anago will not create it: doing so as root means `mkdir -p` over a
+/// path they control, which is a way to have root apply an owner or a
+/// mode to whatever a symlink points at — and it leaves a root-owned
+/// `~/.config` behind for every other program to trip over.
+///
+/// The handle that comes back is what every later step uses, so the
+/// check and the work are about the same directory even if the name is
+/// moved in between.
+fn prepare_client_dir(
+    client_paths: &ClientPaths,
+    invoking: Option<&InvokingUser>,
+) -> Result<fsutil::DirHandle, JoinError> {
+    let dir = client_paths.dir();
+    let Some(user) = invoking else {
+        fsutil::ensure_private_dir(dir).map_err(|e| JoinError::Save {
+            what: "the config directory",
+            target: Target::user_directory(dir),
+            kind: e.kind(),
+            source: e.to_string(),
+        })?;
+        return fsutil::DirHandle::open(dir).map_err(|e| JoinError::Save {
+            what: "the config directory",
+            target: Target::user_directory(dir),
+            kind: e.kind(),
+            source: e.to_string(),
+        });
+    };
+
+    match fsutil::DirHandle::open_owned(dir, user.uid) {
+        Ok(handle) => Ok(handle),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(JoinError::NoConfigDir(dir.display().to_string()))
+        }
+        // Not theirs, not a directory, or a symlink we refuse to follow
+        // — all "sort this out yourself" rather than something anago
+        // should fix as root.
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotADirectory
+            ) || e.raw_os_error() == Some(libc::ELOOP) =>
+        {
+            Err(JoinError::UnsafeConfigDir(dir.display().to_string()))
+        }
+        Err(e) => Err(JoinError::Save {
+            what: "the config directory",
+            target: Target::user_directory(dir),
             kind: e.kind(),
             source: e.to_string(),
         }),
@@ -657,11 +752,12 @@ pub fn acquire_join_lock(client_paths: &ClientPaths) -> Result<fsutil::FileLock,
 /// hub still lists the old peer — the device would look registered from
 /// both sides and work from neither.
 pub fn check_not_joined(
+    client_dir: &fsutil::DirHandle,
     client_paths: &ClientPaths,
     wg_config_path: &Path,
 ) -> Result<(), JoinError> {
     let device_file = client_paths.device_file();
-    if occupied(&device_file) {
+    if occupied_at(client_dir, crate::paths::DEVICE_FILE) {
         return Err(JoinError::AlreadyJoined {
             device_file: device_file.display().to_string(),
             wg_config: wg_config_path.display().to_string(),
@@ -673,6 +769,17 @@ pub fn check_not_joined(
         ));
     }
     Ok(())
+}
+
+/// [`occupied`] for a file inside the client directory, asked through
+/// the descriptor rather than by path.
+fn occupied_at(dir: &fsutil::DirHandle, name: &str) -> bool {
+    match dir.read_to_string(name) {
+        Ok(contents) => !is_stale_claim(&contents),
+        // Present but unreadable — a directory, a symlink we refuse to
+        // follow — is somebody's, not ours.
+        Err(_) => dir.exists(name).unwrap_or(false),
+    }
 }
 
 /// Whether a path holds something worth protecting — a leftover claim
@@ -696,24 +803,29 @@ fn occupied(path: &Path) -> bool {
 fn publish(
     config: &DeviceConfig,
     profile: &ClientProfile,
-    client_paths: &ClientPaths,
-    wg_config_path: &Path,
+    to: &Destination,
 ) -> Result<(), JoinError> {
-    fsutil::write_private(wg_config_path, &wgconf::client_config(profile)).map_err(|e| {
+    fsutil::write_private(to.wg_config, &wgconf::client_config(profile)).map_err(|e| {
         JoinError::Save {
             what: "the WireGuard config",
-            target: Target::system_file(wg_config_path),
+            target: Target::system_file(to.wg_config),
             kind: e.kind(),
             source: e.to_string(),
         }
     })?;
 
-    let device_file = client_paths.device_file();
-    if let Err(e) = fsutil::write_private(&device_file, &config.to_json_string()) {
-        let _ = std::fs::remove_file(wg_config_path);
+    // Through the directory descriptor, and owned as it lands: this
+    // write replaces the claim by rename, and a root-owned 0600
+    // replacement is one the person cannot read with `anago ls`.
+    if let Err(e) = to.client_dir.write_private(
+        crate::paths::DEVICE_FILE,
+        &config.to_json_string(),
+        to.owner,
+    ) {
+        let _ = std::fs::remove_file(to.wg_config);
         return Err(JoinError::Save {
             what: "the device file",
-            target: Target::user_file(device_file.clone()),
+            target: Target::user_file(to.client_paths.device_file()),
             kind: e.kind(),
             source: e.to_string(),
         });
@@ -745,6 +857,11 @@ pub enum JoinError {
     },
     /// Another `anago join` is working on this device right now.
     AlreadyRunning,
+    /// Under sudo, and the config directory is not there yet.
+    NoConfigDir(String),
+    /// Under sudo, and the config directory is not a plain directory
+    /// belonging to the person who ran the command.
+    UnsafeConfigDir(String),
     /// A WireGuard config with anago's name is already there.
     ConfigExists(String),
     /// A file could not be written. Carries the `ErrorKind` so the
@@ -782,6 +899,17 @@ impl fmt::Display for JoinError {
             JoinError::BadResponse(detail) => {
                 write!(f, "the hub's answer made no sense: {detail}")
             }
+            JoinError::NoConfigDir(path) => write!(
+                f,
+                "{path} does not exist — anago will not create it as root. \
+                 Make it as yourself first: `mkdir -p {path}`"
+            ),
+            JoinError::UnsafeConfigDir(path) => write!(
+                f,
+                "{path} is not a directory you own — anago will not write into it as root. \
+                 Check it with `ls -ld {path}`; a symlink or a root-owned directory there \
+                 has to be sorted out first"
+            ),
             JoinError::AlreadyRunning => write!(
                 f,
                 "another `anago join` is already running on this device — \
@@ -1047,11 +1175,9 @@ mod tests {
     }
 
     impl TempDirs {
-        fn targets(&self) -> Targets {
-            Targets {
-                wg_config: self.wg_config.clone(),
-                device_file: self.client.device_file(),
-            }
+        /// A handle on the client directory, as `run` would hold.
+        fn dir(&self) -> fsutil::DirHandle {
+            fsutil::DirHandle::open(self.client.dir()).expect("the temp config directory")
         }
     }
 
@@ -1068,22 +1194,103 @@ mod tests {
     }
 
     #[test]
+    fn root_will_not_make_or_take_a_directory_in_somebody_s_home() {
+        let dirs = TempDirs::new();
+        let me = unsafe { libc::getuid() };
+        let user = InvokingUser {
+            uid: me,
+            gid: unsafe { libc::getgid() },
+            home: None,
+        };
+
+        // The directory exists and is mine: fine.
+        assert!(prepare_client_dir(&dirs.client, Some(&user)).is_ok());
+
+        // Missing: anago says to make it rather than making it as root.
+        let missing = ClientPaths::new(dirs.root.join("not-there"));
+        let e = prepare_client_dir(&missing, Some(&user)).unwrap_err();
+        assert!(matches!(e, JoinError::NoConfigDir(_)), "{e:?}");
+        assert!(e.to_string().contains("mkdir -p"), "{e}");
+        assert!(!missing.dir().exists(), "nothing was created");
+
+        // Somebody else's directory is not ours to write into.
+        let other = InvokingUser {
+            uid: me + 1,
+            gid: user.gid,
+            home: None,
+        };
+        assert!(matches!(
+            prepare_client_dir(&dirs.client, Some(&other)),
+            Err(JoinError::UnsafeConfigDir(_))
+        ));
+
+        // Without sudo, the directory is the person's own to create.
+        let mine = ClientPaths::new(dirs.root.join("plain"));
+        assert!(prepare_client_dir(&mine, None).is_ok());
+        assert!(mine.dir().is_dir());
+    }
+
+    #[test]
+    fn moving_the_directory_after_the_check_cannot_redirect_the_write() {
+        // The race this design exists for: the person renames
+        // `~/.config/anago` between the check and the write, leaving a
+        // symlink to somewhere root should never touch. The handle is
+        // bound to the inode that was checked, so the write follows the
+        // old directory, not the new name.
+        let dirs = TempDirs::new();
+        let handle = fsutil::DirHandle::open(dirs.client.dir()).unwrap();
+
+        let decoy = dirs.root.join("decoy");
+        std::fs::create_dir_all(&decoy).unwrap();
+        std::fs::rename(dirs.client.dir(), dirs.root.join("moved")).unwrap();
+        std::os::unix::fs::symlink(&decoy, dirs.client.dir()).unwrap();
+
+        handle
+            .write_private(crate::paths::DEVICE_FILE, "{}", None)
+            .expect("the held directory is still writable");
+
+        // It landed in the directory that was checked, not the one the
+        // name now points at.
+        assert!(dirs
+            .root
+            .join("moved")
+            .join(crate::paths::DEVICE_FILE)
+            .exists());
+        assert!(!decoy.join(crate::paths::DEVICE_FILE).exists());
+    }
+
+    #[test]
+    fn a_symlinked_config_directory_is_refused_outright() {
+        let dirs = TempDirs::new();
+        let elsewhere = ClientPaths::new(dirs.root.join("linked"));
+        std::os::unix::fs::symlink(dirs.client.dir(), elsewhere.dir()).unwrap();
+
+        let user = InvokingUser {
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+            home: None,
+        };
+        let e = prepare_client_dir(&elsewhere, Some(&user)).unwrap_err();
+        assert!(matches!(e, JoinError::UnsafeConfigDir(_)), "{e:?}");
+    }
+
+    #[test]
     fn a_device_that_already_joined_is_not_quietly_re_joined() {
         // Rejoining would replace the token and the key while the hub
         // still lists the old peer — registered on both sides, working
         // on neither.
         let dirs = TempDirs::new();
-        assert!(check_not_joined(&dirs.client, &dirs.wg_config).is_ok());
+        assert!(check_not_joined(&dirs.dir(), &dirs.client, &dirs.wg_config).is_ok());
 
         std::fs::write(dirs.client.device_file(), "{}").unwrap();
-        let e = check_not_joined(&dirs.client, &dirs.wg_config).unwrap_err();
+        let e = check_not_joined(&dirs.dir(), &dirs.client, &dirs.wg_config).unwrap_err();
         assert!(matches!(e, JoinError::AlreadyJoined { .. }), "{e:?}");
         assert!(e.to_string().contains("anago rm"), "{e}");
 
         // And a wg config anago did not write is not ours to replace.
         std::fs::remove_file(dirs.client.device_file()).unwrap();
         std::fs::write(&dirs.wg_config, "[Interface]\n").unwrap();
-        let e = check_not_joined(&dirs.client, &dirs.wg_config).unwrap_err();
+        let e = check_not_joined(&dirs.dir(), &dirs.client, &dirs.wg_config).unwrap_err();
         assert!(matches!(e, JoinError::ConfigExists(_)), "{e:?}");
     }
 
@@ -1091,7 +1298,17 @@ mod tests {
     fn publishing_writes_both_files_or_neither() {
         let dirs = TempDirs::new();
         let config = config();
-        publish(&config, &profile_of(&config), &dirs.client, &dirs.wg_config).unwrap();
+        publish(
+            &config,
+            &profile_of(&config),
+            &Destination {
+                client_dir: &dirs.dir(),
+                client_paths: &dirs.client,
+                wg_config: &dirs.wg_config,
+                owner: None,
+            },
+        )
+        .unwrap();
 
         assert_eq!(
             DeviceConfig::parse(&std::fs::read_to_string(dirs.client.device_file()).unwrap())
@@ -1113,7 +1330,17 @@ mod tests {
         std::fs::create_dir_all(dirs.client.device_file()).unwrap();
 
         let config = config();
-        let e = publish(&config, &profile_of(&config), &dirs.client, &dirs.wg_config).unwrap_err();
+        let e = publish(
+            &config,
+            &profile_of(&config),
+            &Destination {
+                client_dir: &dirs.dir(),
+                client_paths: &dirs.client,
+                wg_config: &dirs.wg_config,
+                owner: None,
+            },
+        )
+        .unwrap_err();
         assert!(
             matches!(e, JoinError::Save { .. } | JoinError::AlreadyJoined { .. }),
             "{e:?}"
@@ -1150,7 +1377,7 @@ mod tests {
     fn the_device_file_being_taken_names_both_paths() {
         let dirs = TempDirs::new();
         std::fs::write(dirs.client.device_file(), "{}").unwrap();
-        let e = check_not_joined(&dirs.client, &dirs.wg_config).unwrap_err();
+        let e = check_not_joined(&dirs.dir(), &dirs.client, &dirs.wg_config).unwrap_err();
         match e {
             JoinError::AlreadyJoined {
                 device_file,
@@ -1169,8 +1396,9 @@ mod tests {
         // after the code was spent" into a plain retry.
         let dirs = TempDirs::new();
         let device_file = dirs.client.device_file();
+        let handle = dirs.dir();
         {
-            let _claim = Reservation::claim(&dirs.targets()).unwrap();
+            let _claim = Reservation::claim(&handle, &dirs.client, &dirs.wg_config, None).unwrap();
             assert!(dirs.wg_config.exists() && device_file.exists());
         }
         // Dropped without commit: nothing left behind, so the next
@@ -1181,11 +1409,7 @@ mod tests {
         );
         assert!(!device_file.exists());
 
-        let mut claim = Reservation::claim(&Targets {
-            wg_config: dirs.wg_config.clone(),
-            device_file: dirs.root.join("unused-device.json"),
-        })
-        .unwrap();
+        let mut claim = Reservation::claim(&handle, &dirs.client, &dirs.wg_config, None).unwrap();
         claim.commit();
         drop(claim);
         assert!(dirs.wg_config.exists(), "a committed claim stays");
@@ -1197,7 +1421,7 @@ mod tests {
         std::fs::write(&dirs.wg_config, "someone else's interface\n").unwrap();
 
         let device_file = dirs.client.device_file();
-        let e = Reservation::claim(&dirs.targets()).unwrap_err();
+        let e = Reservation::claim(&dirs.dir(), &dirs.client, &dirs.wg_config, None).unwrap_err();
         // The wg config is the one that was taken, and the error says
         // so rather than blaming the device file.
         assert!(matches!(e, JoinError::ConfigExists(_)), "{e:?}");
@@ -1275,6 +1499,41 @@ mod tests {
     }
 
     #[test]
+    fn a_device_file_that_appears_during_the_claim_still_names_both_files() {
+        // The race the reservation exists for: `device.json` shows up
+        // between the preflight and the claim. The refusal has to carry
+        // the same recovery as any other "already joined" — with both
+        // paths, not an empty one.
+        let dirs = TempDirs::new();
+        let handle = dirs.dir();
+        std::fs::write(dirs.client.device_file(), "{}").unwrap();
+
+        let e = Reservation::claim(&handle, &dirs.client, &dirs.wg_config, None).unwrap_err();
+        match &e {
+            JoinError::AlreadyJoined {
+                device_file,
+                wg_config,
+            } => {
+                assert_eq!(
+                    device_file,
+                    &dirs.client.device_file().display().to_string()
+                );
+                assert_eq!(wg_config, &dirs.wg_config.display().to_string());
+            }
+            other => panic!("{other:?}"),
+        }
+        let message = e.to_string();
+        assert!(
+            message.contains(&format!("wg-quick down {}", dirs.wg_config.display())),
+            "{message}"
+        );
+        assert!(!message.contains("wg-quick down \n"), "{message}");
+
+        // The wg config claimed a moment earlier was released again.
+        assert!(!dirs.wg_config.exists(), "the claim it did take is gone");
+    }
+
+    #[test]
     fn a_claim_left_by_a_killed_run_does_not_block_the_next_one() {
         // Drop never runs on SIGKILL, so the marker is what tells the
         // next attempt that these files belong to nobody.
@@ -1284,10 +1543,11 @@ mod tests {
         std::fs::write(&device_file, CLAIM_MARKER).unwrap();
 
         assert!(
-            check_not_joined(&dirs.client, &dirs.wg_config).is_ok(),
+            check_not_joined(&dirs.dir(), &dirs.client, &dirs.wg_config).is_ok(),
             "an unfinished join owns nothing"
         );
-        let mut claim = Reservation::claim(&dirs.targets()).unwrap();
+        let handle = dirs.dir();
+        let mut claim = Reservation::claim(&handle, &dirs.client, &dirs.wg_config, None).unwrap();
         claim.commit();
         assert!(dirs.wg_config.exists() && device_file.exists());
 
@@ -1297,13 +1557,9 @@ mod tests {
         assert!(!is_stale_claim("   \n"));
         assert!(is_stale_claim(CLAIM_MARKER));
         std::fs::write(&dirs.wg_config, "").unwrap();
-        let e = check_not_joined(&dirs.client, &dirs.wg_config).unwrap_err();
+        let e = check_not_joined(&dirs.dir(), &dirs.client, &dirs.wg_config).unwrap_err();
         assert!(matches!(e, JoinError::ConfigExists(_)), "{e:?}");
-        assert!(Reservation::claim(&Targets {
-            wg_config: dirs.wg_config.clone(),
-            device_file: dirs.root.join("unused-device.json"),
-        })
-        .is_err());
+        assert!(Reservation::claim(&dirs.dir(), &dirs.client, &dirs.wg_config, None).is_err());
         assert_eq!(
             std::fs::read_to_string(&dirs.wg_config).unwrap(),
             "",
@@ -1318,12 +1574,14 @@ mod tests {
         std::fs::write(dirs.client.device_file(), config.to_json_string()).unwrap();
         assert!(!is_stale_claim(&config.to_json_string()));
 
-        let e = check_not_joined(&dirs.client, &dirs.wg_config).unwrap_err();
+        let e = check_not_joined(&dirs.dir(), &dirs.client, &dirs.wg_config).unwrap_err();
         assert!(matches!(e, JoinError::AlreadyJoined { .. }), "{e:?}");
-        let e = Reservation::claim(&Targets {
-            wg_config: dirs.root.join("unused.conf"),
-            device_file: dirs.client.device_file(),
-        })
+        let e = Reservation::claim(
+            &dirs.dir(),
+            &dirs.client,
+            &dirs.root.join("unused.conf"),
+            None,
+        )
         .unwrap_err();
         assert!(matches!(e, JoinError::AlreadyJoined { .. }), "{e:?}");
         // And the real file is still there.
@@ -1339,9 +1597,9 @@ mod tests {
         // Two joins would each pass the preflight, both POST, and the
         // loser's cleanup would delete the winner's config.
         let dirs = TempDirs::new();
-        let held = acquire_join_lock(&dirs.client).unwrap();
+        let held = acquire_join_lock(&dirs.dir(), None).unwrap();
         assert!(matches!(
-            acquire_join_lock(&dirs.client),
+            acquire_join_lock(&dirs.dir(), None),
             Err(JoinError::AlreadyRunning)
         ));
         assert!(JoinError::AlreadyRunning
@@ -1350,7 +1608,7 @@ mod tests {
 
         drop(held);
         assert!(
-            acquire_join_lock(&dirs.client).is_ok(),
+            acquire_join_lock(&dirs.dir(), None).is_ok(),
             "the lock is released"
         );
     }
@@ -1363,15 +1621,27 @@ mod tests {
         let config = config();
         let device_file = dirs.client.device_file();
 
-        let lock = acquire_join_lock(&dirs.client).expect("first in");
-        check_not_joined(&dirs.client, &dirs.wg_config).expect("nothing there yet");
-        let mut claim = Reservation::claim(&dirs.targets()).expect("claimed");
-        publish(&config, &profile_of(&config), &dirs.client, &dirs.wg_config).expect("published");
+        let lock = acquire_join_lock(&dirs.dir(), None).expect("first in");
+        check_not_joined(&dirs.dir(), &dirs.client, &dirs.wg_config).expect("nothing there yet");
+        let handle = dirs.dir();
+        let mut claim =
+            Reservation::claim(&handle, &dirs.client, &dirs.wg_config, None).expect("claimed");
+        publish(
+            &config,
+            &profile_of(&config),
+            &Destination {
+                client_dir: &dirs.dir(),
+                client_paths: &dirs.client,
+                wg_config: &dirs.wg_config,
+                owner: None,
+            },
+        )
+        .expect("published");
         claim.commit();
 
         // A second join while the first still holds the lock.
         assert!(matches!(
-            acquire_join_lock(&dirs.client),
+            acquire_join_lock(&dirs.dir(), None),
             Err(JoinError::AlreadyRunning)
         ));
         drop(lock);
@@ -1379,7 +1649,7 @@ mod tests {
         // And once the lock is free, the finished files still stop it —
         // the claim it fails to make must not take them down with it.
         assert!(matches!(
-            Reservation::claim(&dirs.targets()),
+            Reservation::claim(&dirs.dir(), &dirs.client, &dirs.wg_config, None),
             Err(JoinError::ConfigExists(_))
         ));
         assert_eq!(

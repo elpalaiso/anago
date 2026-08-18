@@ -142,6 +142,7 @@ fn join_device(args: &cli::Join) -> ! {
         args.api_port,
         &client_paths,
         &wg_config,
+        paths::invoking_user_from_env().as_ref(),
     ) {
         Ok(joined) => {
             println!(
