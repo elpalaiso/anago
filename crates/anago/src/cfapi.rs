@@ -25,9 +25,12 @@
 //! look at (§10.2).
 
 use std::fmt;
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
-use crate::client::{self, ClientError, HeaderValue, Method, Request};
+use anago_core::dns::{self, Record, Refusal, Upsert};
+
+use crate::client::{self, Body, ClientError, HeaderValue, Method, Request};
 
 /// Cloudflare's API host.
 pub const API_HOST: &str = "api.cloudflare.com";
@@ -377,9 +380,9 @@ pub struct Zone {
 /// long name is a handful of extra requests on a path that was going to
 /// fail anyway, and DNS caps a name at 127 labels regardless.
 pub fn zone_candidates(domain: &str) -> Result<Vec<String>, CfError> {
-    let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    let domain = dns_name(domain)?;
     let labels: Vec<&str> = domain.split('.').collect();
-    if domain.is_empty() || labels.len() < 2 || labels.iter().any(|label| label.is_empty()) {
+    if labels.len() < 2 || labels.iter().any(|label| label.is_empty()) {
         return Err(CfError::NotADomain(domain));
     }
 
@@ -409,9 +412,9 @@ pub fn parse_zones(status: u16, body: &str) -> Result<Vec<Zone>, CfError> {
         .iter()
         .map(|zone| {
             Ok(Zone {
-                id: string_at(zone, "id", status)?,
-                name: string_at(zone, "name", status)?,
-                status: string_at(zone, "status", status)?,
+                id: string_at(zone, "id", "zone", status)?,
+                name: string_at(zone, "name", "zone", status)?,
+                status: string_at(zone, "status", "zone", status)?,
             })
         })
         .collect()
@@ -425,16 +428,21 @@ pub fn parse_zones(status: u16, body: &str) -> Result<Vec<Zone>, CfError> {
 /// A response that does not have what it is documented to have is a
 /// malformed response, and saying so puts the run on the manual
 /// fallback path where it belongs.
-fn string_at(value: &serde_json::Value, key: &str, status: u16) -> Result<String, CfError> {
+fn string_at(
+    value: &serde_json::Value,
+    key: &str,
+    what: &str,
+    status: u16,
+) -> Result<String, CfError> {
     match value.get(key).and_then(serde_json::Value::as_str) {
         Some(text) if !text.is_empty() => Ok(text.to_string()),
         Some(_) => Err(CfError::ApiFailure {
             status,
-            message: format!("a zone in the answer has an empty {key}"),
+            message: format!("a {what} in the answer has an empty {key}"),
         }),
         None => Err(CfError::ApiFailure {
             status,
-            message: format!("a zone in the answer has no usable {key}"),
+            message: format!("a {what} in the answer has no usable {key}"),
         }),
     }
 }
@@ -500,6 +508,410 @@ pub fn find_zone(token: &Token, domain: &str) -> Result<Zone, CfError> {
     })
 }
 
+// ------------------------------------------------------- A record
+
+/// Cloudflare's automatic TTL. `1` is how the API spells "let
+/// Cloudflare decide", which for a DNS-only record is five minutes —
+/// short enough to repoint a hub that moved, and not a number anago has
+/// any business pinning on someone else's zone.
+pub const TTL_AUTOMATIC: i64 = 1;
+
+/// How many records one listing page holds.
+pub const PER_PAGE: usize = 100;
+
+/// A zone's records.
+pub fn records_path(zone_id: &str) -> String {
+    format!(
+        "{ZONES_PATH}/{}/dns_records",
+        client::encode_segment(zone_id)
+    )
+}
+
+/// One record within a zone.
+pub fn record_path(zone_id: &str, record_id: &str) -> String {
+    format!(
+        "{}/{}",
+        records_path(zone_id),
+        client::encode_segment(record_id)
+    )
+}
+
+/// Every record at one name.
+///
+/// The list is asked for **by name and not by type**: a CNAME in the
+/// way and a cached id that changed type are both things the judgement
+/// reports rather than trips over (`anago_core::dns::decide`), and
+/// filtering to `type=A` at the API would hide exactly those.
+///
+/// The filter is spelled `name.exact`, which is how the current List
+/// DNS Records API models it — `name` is an object there, with
+/// `exact`, `contains`, `startswith`, and `endswith` under it. A bare
+/// `name=` is the older spelling, and an unrecognised filter that gets
+/// *ignored* rather than refused is the bad case: the answer becomes
+/// the zone's whole first page, which in a zone of any size is a full
+/// page, and [`parse_records`] refuses to judge from that. A name with
+/// one record would take the manual path for no reason.
+pub fn records_query(zone_id: &str, name: &str) -> String {
+    format!(
+        "{}?name.exact={}&per_page={PER_PAGE}",
+        records_path(zone_id),
+        client::encode_segment(name)
+    )
+}
+
+/// Reads a record listing into the shape the judgement takes.
+///
+/// `name` is filtered on again here, locally. Cloudflare's `name=`
+/// filter is an exact match, but the difference between an exact filter
+/// and a prefix or substring one is the difference between "the record
+/// for this hub" and "every record whose name contains it", and the
+/// second would let `old.net.example.com` be counted as a second A
+/// record at `net.example.com` — ambiguity where there is none. Which
+/// records are ours is not a thing to take on trust from a query
+/// parameter.
+///
+/// A full page is refused rather than judged: the page after it could
+/// hold the second A record that makes this name ambiguous (§9.1), and
+/// deciding from a truncated list is how a round-robin survives a run
+/// that reported success.
+pub fn parse_records(status: u16, body: &str, name: &str) -> Result<Vec<Record>, CfError> {
+    let result = parse_result(status, body)?;
+    let items = result.as_array().ok_or_else(|| CfError::ApiFailure {
+        status,
+        message: "the record list is not a list".to_string(),
+    })?;
+    if items.len() >= PER_PAGE {
+        return Err(CfError::ApiFailure {
+            status,
+            message: format!(
+                "{name} has at least {PER_PAGE} records, more than one page — \
+                 anago will not judge what to do here from a partial list"
+            ),
+        });
+    }
+
+    let wanted = fold_name(name);
+    let mut records = Vec::new();
+    for item in items {
+        if fold_name(&string_at(item, "name", "record", status)?) != wanted {
+            continue;
+        }
+        let kind = string_at(item, "type", "record", status)?;
+        records.push(Record {
+            id: string_at(item, "id", "record", status)?,
+            content: string_at(item, "content", "record", status)?,
+            proxied: proxied_at(item, &kind, status)?,
+            kind,
+        });
+    }
+    Ok(records)
+}
+
+/// Reads the single record a create or an update answers with.
+pub fn parse_record(status: u16, body: &str) -> Result<Record, CfError> {
+    let result = parse_result(status, body)?;
+    let kind = string_at(&result, "type", "record", status)?;
+    Ok(Record {
+        id: string_at(&result, "id", "record", status)?,
+        content: string_at(&result, "content", "record", status)?,
+        proxied: proxied_at(&result, &kind, status)?,
+        kind,
+    })
+}
+
+/// The one spelling of a DNS name anago sends and compares.
+///
+/// Case and a trailing root dot are noise — `NET.Example.com.` and
+/// `net.example.com` are one name — so both are folded away.
+///
+/// **A non-ASCII name is refused, not converted.** Cloudflare takes and
+/// returns complete record names in Punycode, so an internationalized
+/// name sent as UTF-8 goes wrong twice: the write can be rejected, and
+/// a record that already exists comes back as `xn--…`, fails the local
+/// name match, and is judged absent — a create beside a record that was
+/// already there, which is the round-robin §9.1 refuses.
+///
+/// Converting it here is not the fix. IDNA is mapping, normalization,
+/// and bidi rules, not just Punycode, and anago hand-rolling a subtly
+/// wrong version of it would point the hub's record at a name nobody
+/// types. The `xn--` form is exact, it is what Cloudflare's dashboard
+/// shows beside the name, and it is what TLS and the `Host` header want
+/// as well — so anago asks for it and uses it everywhere unchanged.
+fn dns_name(name: &str) -> Result<String, CfError> {
+    let name = name.trim().trim_end_matches('.');
+    if name.is_empty() {
+        return Err(CfError::NotADomain(name.to_string()));
+    }
+    if !name.is_ascii() {
+        return Err(CfError::NotAscii(name.to_string()));
+    }
+    Ok(name.to_ascii_lowercase())
+}
+
+/// The same folding for a name Cloudflare handed back, where there is
+/// nothing to refuse — a name in the answer is already Punycode, and a
+/// name anago cannot fold is simply not the one it asked about.
+fn fold_name(name: &str) -> String {
+    name.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Whether the orange cloud can be on for this type at all.
+fn proxiable(kind: &str) -> bool {
+    ["A", "AAAA", "CNAME"]
+        .iter()
+        .any(|proxiable| kind.eq_ignore_ascii_case(proxiable))
+}
+
+/// Reads `proxied`, and **will not default it to `false`**.
+///
+/// `false` is exactly the answer that lets a run carry on, so inventing
+/// it on a record anago could not read properly is how §13's silent
+/// failure happens: the certificate issues, the output is green, and
+/// the tunnel is dead behind the proxy. A record that should carry the
+/// flag and does not is a malformed answer, and saying so sends the run
+/// to the manual path with the reason attached.
+///
+/// Types that cannot be proxied — TXT, MX — legitimately come back
+/// without the field, and the judgement never looks at their flag.
+fn proxied_at(record: &serde_json::Value, kind: &str, status: u16) -> Result<bool, CfError> {
+    match record.get("proxied") {
+        Some(serde_json::Value::Bool(on)) => Ok(*on),
+        Some(_) => Err(CfError::ApiFailure {
+            status,
+            message: format!("a {kind} record in the answer has a proxied flag that is not true or false"),
+        }),
+        None if proxiable(kind) => Err(CfError::ApiFailure {
+            status,
+            message: format!("a {kind} record in the answer has no proxied flag, so anago cannot tell whether it is behind the proxy"),
+        }),
+        None => Ok(false),
+    }
+}
+
+/// The body that creates the hub's A record.
+///
+/// `name` is the folded, ASCII form — see [`dns_name`]. Cloudflare
+/// stores what it is given, so a name spelled differently here from the
+/// one the listing was matched against would create a second record
+/// rather than the one that was missing.
+///
+/// `proxied: false` is stated rather than left out: a zone can be set
+/// to proxy new records by default, and inheriting that would be §13's
+/// trap arriving through the automation that was meant to avoid it.
+pub fn create_body(name: &str, desired: Ipv4Addr) -> String {
+    serde_json::json!({
+        "type": "A",
+        "name": name,
+        "content": desired.to_string(),
+        "ttl": TTL_AUTOMATIC,
+        "proxied": false,
+    })
+    .to_string()
+}
+
+/// The body that points an existing record at the hub.
+///
+/// **Only `content`.** The record may be one a person made by hand and
+/// anago is adopting, carrying their TTL and comment; sending a whole
+/// record would reset those to anago's defaults on the way past. This
+/// goes out as `PATCH` for the same reason (see [`Method::Patch`]).
+///
+/// Note what is *not* here: `proxied`. Turning the proxy off is not
+/// anago's call either — a proxied record is refused before this point,
+/// never quietly un-proxied (§13).
+pub fn update_body(desired: Ipv4Addr) -> String {
+    serde_json::json!({ "content": desired.to_string() }).to_string()
+}
+
+/// What happened to the hub's A record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Applied {
+    Created {
+        record_id: String,
+    },
+    Updated {
+        record_id: String,
+        /// The record was already there and anago did not make it —
+        /// somebody followed M0's manual instructions. Said out loud
+        /// because anago has just edited something it did not write.
+        adopted: bool,
+    },
+    Unchanged {
+        record_id: String,
+    },
+}
+
+impl Applied {
+    /// The id to cache (§9.1).
+    pub fn record_id(&self) -> &str {
+        match self {
+            Applied::Created { record_id }
+            | Applied::Updated { record_id, .. }
+            | Applied::Unchanged { record_id } => record_id,
+        }
+    }
+}
+
+impl fmt::Display for Applied {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Applied::Created { record_id } => write!(
+                f,
+                "created the A record, DNS only — no orange cloud ({record_id})"
+            ),
+            Applied::Updated {
+                record_id,
+                adopted: false,
+            } => write!(f, "pointed the A record at this server ({record_id})"),
+            Applied::Updated {
+                record_id,
+                adopted: true,
+            } => write!(
+                f,
+                "took over the A record that was already at this name and pointed it \
+                 at this server ({record_id}) — anago did not create that record"
+            ),
+            Applied::Unchanged { record_id } => write!(
+                f,
+                "the A record already points at this server; left alone ({record_id})"
+            ),
+        }
+    }
+}
+
+/// A record that was written, and anything worth saying about it.
+pub struct Written {
+    pub applied: Applied,
+    /// Printed beside the success line, not instead of it: the record
+    /// is written, and something about it still needs a person.
+    pub warning: Option<String>,
+}
+
+/// Whether a record Cloudflare just handed back needs saying something
+/// about.
+///
+/// Both checks are for the same failure: anago asked for one thing, the
+/// answer says another, and every later step still succeeds. A proxied
+/// record still passes HTTP-01 and still gets a certificate — only the
+/// tunnel is dead (§13) — so the one moment this is catchable is here,
+/// while the answer is in hand.
+pub fn record_warning(record: &Record, desired: Ipv4Addr) -> Option<String> {
+    if record.proxied {
+        return Some(format!(
+            "warning: Cloudflare says that record is proxied (orange cloud) although \
+             anago asked for DNS only. WireGuard's UDP port is not forwarded through \
+             the proxy, so HTTPS will work and the tunnel will not. Set the record to \
+             DNS only in the dashboard ({}).",
+            record.id
+        ));
+    }
+    if record.content.trim().parse::<Ipv4Addr>() != Ok(desired) {
+        return Some(format!(
+            "warning: the record now reads {:?}, not {desired}. Check it in the \
+             dashboard before relying on the name ({}).",
+            record.content, record.id
+        ));
+    }
+    None
+}
+
+/// Lists the name, decides, and does it (§9.1).
+///
+/// The listing happens **every time, cache or no cache**: the cached id
+/// says which record is ours, not that the record is still unproxied or
+/// still correct. Skipping the read to save a round trip is how a
+/// proxied record gets reported as fine.
+///
+/// A refusal is an error rather than a warning because the states it
+/// covers — proxied, a CNAME in the way, several A records — are all
+/// ones where carrying on would report success over a network that does
+/// not work.
+///
+/// **Human verification needed**: these calls need a real Cloudflare
+/// account and a real zone.
+pub fn apply_record(
+    token: &Token,
+    zone_id: &str,
+    name: &str,
+    desired: Ipv4Addr,
+    cached_id: Option<&str>,
+) -> Result<Written, CfError> {
+    // Folded once, then used for the query, the local match, and the
+    // record anago creates — one spelling, so "not found" cannot mean
+    // "spelled differently".
+    let name = dns_name(name)?;
+    let authorization = token.header().map_err(CfError::Client)?;
+    let listed = client::send(&Request {
+        method: Method::Get,
+        host: API_HOST,
+        port: 443,
+        path: &records_query(zone_id, &name),
+        body: None,
+        authorization: Some(&authorization),
+    })
+    .map_err(CfError::Client)?;
+    let records = parse_records(listed.status, &listed.body, &name)?;
+
+    match dns::decide(&records, desired, cached_id) {
+        Upsert::Refuse(refusal) => Err(CfError::RecordRefused(refusal)),
+        Upsert::Unchanged { record_id } => Ok(Written {
+            applied: Applied::Unchanged { record_id },
+            warning: None,
+        }),
+        Upsert::Create => {
+            let written = write_record(
+                &authorization,
+                Method::Post,
+                &records_path(zone_id),
+                &create_body(&name, desired),
+            )?;
+            Ok(Written {
+                warning: record_warning(&written, desired),
+                applied: Applied::Created {
+                    record_id: written.id,
+                },
+            })
+        }
+        Upsert::Update { record_id, adopted } => {
+            let written = write_record(
+                &authorization,
+                Method::Patch,
+                &record_path(zone_id, &record_id),
+                &update_body(desired),
+            )?;
+            Ok(Written {
+                warning: record_warning(&written, desired),
+                applied: Applied::Updated {
+                    record_id: written.id,
+                    adopted,
+                },
+            })
+        }
+    }
+}
+
+/// One write, whichever way round it is.
+///
+/// This is where a read-only token finally fails, as a 403 — verify
+/// says `active` and nothing about permissions (§7).
+fn write_record(
+    authorization: &HeaderValue,
+    method: Method,
+    path: &str,
+    body: &str,
+) -> Result<Record, CfError> {
+    let response = client::send(&Request {
+        method,
+        host: API_HOST,
+        port: 443,
+        path,
+        body: Some(Body::json(body)),
+        authorization: Some(authorization),
+    })
+    .map_err(CfError::Client)?;
+    parse_record(response.status, &response.body)
+}
+
 /// The line that explains why the manual DNS step is still there (§6.1).
 ///
 /// Failing to reach Cloudflare is **not** a reason to stop setting up a
@@ -543,6 +955,9 @@ pub enum CfError {
     },
     /// Not a name a zone could be found for.
     NotADomain(String),
+    /// An internationalized name that has not been written in its
+    /// `xn--` form. Refused rather than converted — see [`dns_name`].
+    NotAscii(String),
     /// No zone at any of the names walked.
     ZoneNotFound {
         domain: String,
@@ -558,6 +973,9 @@ pub enum CfError {
         name: String,
         status: String,
     },
+    /// The name is in a state anago will not edit its way out of —
+    /// proxied, a CNAME in the way, several A records (§9.1, §13).
+    RecordRefused(Refusal),
     Undecodable(String),
     Client(ClientError),
 }
@@ -627,6 +1045,14 @@ impl fmt::Display for CfError {
                 "{domain:?} is not a domain a zone can be found for — it needs at least \
                  a name and a suffix, like example.com"
             ),
+            CfError::NotAscii(name) => write!(
+                f,
+                "{name:?} is an internationalized name, and Cloudflare, TLS, and DNS all \
+                 want its Punycode spelling (xn--...). anago will not convert it for you: \
+                 doing that correctly is more than Punycode, and getting it subtly wrong \
+                 would point this record at a name nobody types. Cloudflare's dashboard \
+                 shows the xn-- form beside the name — use that spelling"
+            ),
             CfError::ZoneNotFound { domain, tried } => write!(
                 f,
                 "no Cloudflare zone holds {domain} (tried {}). Either the domain is not \
@@ -643,6 +1069,10 @@ impl fmt::Display for CfError {
                 "the zone {name} is {status:?}, not active — Cloudflare holds its records \
                  but is not answering for the name, so a record added here would change \
                  nothing. Point the domain's nameservers at Cloudflare first"
+            ),
+            CfError::RecordRefused(refusal) => write!(
+                f,
+                "anago did not change the DNS record for this name: {refusal}"
             ),
             CfError::Undecodable(detail) => {
                 write!(f, "Cloudflare's answer could not be read: {detail}")
@@ -1183,10 +1613,41 @@ mod tests {
             zones_query("example.com"),
             "/client/v4/zones?name=example.com"
         );
-        // A name is percent-encoded on the way into the query.
+        // An internationalized zone is asked about in its Punycode
+        // spelling, which needs no escaping — and is the only spelling
+        // that gets this far (see the IDN test below).
         assert_eq!(
-            zones_query("맥북.example.com"),
-            "/client/v4/zones?name=%EB%A7%A5%EB%B6%81.example.com"
+            zone_candidates("XN--HU5B.example.com.").unwrap()[0],
+            "xn--hu5b.example.com"
+        );
+        assert_eq!(
+            zones_query("xn--hu5b.example.com"),
+            "/client/v4/zones?name=xn--hu5b.example.com"
+        );
+    }
+
+    #[test]
+    fn an_internationalized_name_is_refused_rather_than_converted() {
+        // Cloudflare takes and returns record names in Punycode. Sent
+        // as UTF-8, a name goes wrong twice: the write can be rejected,
+        // and a record that already exists comes back as `xn--…`, fails
+        // the local match, and is judged absent — a create beside a
+        // record that was already there (§9.1).
+        //
+        // Converting it here would be IDNA, not Punycode: mapping,
+        // normalization, bidi. A subtly wrong version of that points
+        // the hub's record at a name nobody types.
+        let error = zone_candidates("맥북.example.com").unwrap_err();
+        assert_eq!(error, CfError::NotAscii("맥북.example.com".to_string()));
+        let message = error.to_string();
+        assert!(message.contains("xn--"), "{message}");
+        assert!(message.contains("dashboard"), "{message}");
+        assert!(dns_name("맥북.example.com").is_err());
+        // The Punycode spelling of the same name is ordinary ASCII and
+        // goes through untouched.
+        assert_eq!(
+            dns_name("XN--HU5B.example.com."),
+            Ok("xn--hu5b.example.com".to_string())
         );
     }
 
@@ -1354,6 +1815,415 @@ mod tests {
     fn the_fallback_notice_never_carries_the_token() {
         let notice = fallback_notice(&CfError::Rejected("Invalid API Token".to_string()));
         assert!(!notice.contains("cf-api-token"), "{notice}");
+    }
+
+    // ----------------------------------------------------- records
+
+    const HUB_IP: &str = "203.0.113.10";
+    const NAME: &str = "net.example.com";
+    const ZONE: &str = "023e105f4ecef8ad9ca31a8372d0c353";
+
+    fn hub_ip() -> Ipv4Addr {
+        HUB_IP.parse().unwrap()
+    }
+
+    /// One record the way Cloudflare lists it, fields anago ignores
+    /// included — `zone_name`, `locked`, `meta` are not its business.
+    fn record_json(id: &str, kind: &str, name: &str, content: &str, proxied: &str) -> String {
+        format!(
+            r#"{{"id":"{id}","zone_id":"{ZONE}","zone_name":"example.com",
+                "name":"{name}","type":"{kind}","content":"{content}",
+                "ttl":1,"locked":false,{proxied}
+                "meta":{{"auto_added":false}},
+                "created_on":"2026-08-19T00:00:00.000000Z"}}"#
+        )
+    }
+
+    fn a_record(id: &str, content: &str, proxied: bool) -> String {
+        record_json(id, "A", NAME, content, &format!(r#""proxied":{proxied},"#))
+    }
+
+    fn listing(records: &[String]) -> String {
+        format!(
+            r#"{{"success":true,"errors":[],"messages":[],
+                "result":[{}],
+                "result_info":{{"page":1,"per_page":100,"count":{},"total_count":{}}}}}"#,
+            records.join(","),
+            records.len(),
+            records.len()
+        )
+    }
+
+    fn single(record: String) -> String {
+        format!(r#"{{"success":true,"errors":[],"messages":[],"result":{record}}}"#)
+    }
+
+    #[test]
+    fn the_record_query_asks_for_one_name_and_one_page() {
+        // `name.exact` is how the current List DNS Records API spells
+        // the filter. A bare `name=` that gets ignored rather than
+        // refused would answer with the zone's whole first page, and a
+        // full page is refused below — a name with one record would
+        // take the manual path for nothing.
+        assert_eq!(
+            records_query(ZONE, NAME),
+            format!("/client/v4/zones/{ZONE}/dns_records?name.exact=net.example.com&per_page=100")
+        );
+        assert_eq!(
+            record_path(ZONE, "372e6795"),
+            format!("/client/v4/zones/{ZONE}/dns_records/372e6795")
+        );
+    }
+
+    #[test]
+    fn the_listing_is_read_into_the_judgement() {
+        // Everything at the name, not only the A records: the CNAME and
+        // the cached id that changed type are cases `dns::decide`
+        // reports rather than trips over, and `type=A` would hide them.
+        let body = listing(&[
+            a_record("r1", HUB_IP, false),
+            record_json("r2", "TXT", NAME, "v=spf1 -all", ""),
+        ]);
+        let records = parse_records(200, &body, NAME).unwrap();
+        assert_eq!(
+            records,
+            [
+                Record::a("r1", HUB_IP),
+                Record {
+                    id: "r2".to_string(),
+                    kind: "TXT".to_string(),
+                    content: "v=spf1 -all".to_string(),
+                    proxied: false,
+                },
+            ]
+        );
+        assert_eq!(
+            dns::decide(&records, hub_ip(), Some("r1")),
+            Upsert::Unchanged {
+                record_id: "r1".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn a_record_at_another_name_is_not_counted_as_ours() {
+        // Cloudflare's `name=` is an exact filter, but the difference
+        // between exact and "contains" is the difference between one A
+        // record and an ambiguous name — not a thing to take on trust
+        // from a query parameter.
+        let body = listing(&[
+            a_record("r1", HUB_IP, false),
+            record_json(
+                "r2",
+                "A",
+                "old.net.example.com",
+                "198.51.100.7",
+                r#""proxied":false,"#,
+            ),
+        ]);
+        let records = parse_records(200, &body, NAME).unwrap();
+        assert_eq!(records, [Record::a("r1", HUB_IP)]);
+        // The trailing root dot and case are the same name.
+        assert_eq!(
+            parse_records(200, &body, "NET.Example.com.").unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_punycode_name_in_the_answer_is_the_name_we_asked_about() {
+        // Cloudflare returns complete record names in Punycode. Since
+        // that is also the only spelling anago sends, the two match and
+        // the existing record is found — rather than being read as a
+        // different name and a second record created beside it.
+        let puny = "xn--hu5b.example.com";
+        let body = listing(&[record_json(
+            "r1",
+            "A",
+            "XN--HU5B.example.com",
+            HUB_IP,
+            r#""proxied":false,"#,
+        )]);
+        let records = parse_records(200, &body, puny).unwrap();
+        assert_eq!(records, [Record::a("r1", HUB_IP)]);
+        assert_eq!(
+            dns::decide(&records, hub_ip(), Some("r1")),
+            Upsert::Unchanged {
+                record_id: "r1".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn a_full_page_is_refused_rather_than_judged_from() {
+        // The page after this one could hold the second A record that
+        // makes the name ambiguous (§9.1). Judging from a partial list
+        // is how a round-robin survives a run that reported success.
+        let records: Vec<String> = (0..PER_PAGE)
+            .map(|n| record_json(&format!("r{n}"), "TXT", NAME, "filler", ""))
+            .collect();
+        let error = parse_records(200, &listing(&records), NAME).unwrap_err();
+        assert!(error.to_string().contains("more than one page"), "{error}");
+    }
+
+    #[test]
+    fn an_a_record_without_a_proxied_flag_is_malformed_not_unproxied() {
+        // `false` is exactly the answer that lets the run carry on, so
+        // inventing it is how §13's silent failure happens: certificate
+        // issued, output green, tunnel dead behind the proxy.
+        let body = listing(&[record_json("r1", "A", NAME, HUB_IP, "")]);
+        let error = parse_records(200, &body, NAME).unwrap_err();
+        assert!(error.to_string().contains("no proxied flag"), "{error}");
+        assert!(
+            error.to_string().contains("behind the proxy"),
+            "the reason travels with it: {error}"
+        );
+
+        let not_a_bool = listing(&[record_json("r1", "A", NAME, HUB_IP, r#""proxied":"yes","#)]);
+        assert!(parse_records(200, &not_a_bool, NAME)
+            .unwrap_err()
+            .to_string()
+            .contains("not true or false"));
+    }
+
+    #[test]
+    fn a_type_that_cannot_be_proxied_may_leave_the_flag_out() {
+        // TXT and MX come back without it, and the judgement never
+        // looks at their flag.
+        for kind in ["TXT", "MX"] {
+            let body = listing(&[record_json("r1", kind, NAME, "whatever", "")]);
+            assert!(!parse_records(200, &body, NAME).unwrap()[0].proxied);
+        }
+    }
+
+    #[test]
+    fn a_record_missing_a_field_anago_reads_is_malformed() {
+        let no_content = r#"{"success":true,"errors":[],"result":[
+          {"id":"r1","name":"net.example.com","type":"A","proxied":false}
+        ]}"#;
+        assert_eq!(
+            parse_records(200, no_content, NAME).unwrap_err(),
+            CfError::ApiFailure {
+                status: 200,
+                message: "a record in the answer has no usable content".to_string()
+            }
+        );
+
+        // No id means nothing to update or cache later.
+        let no_id = r#"{"success":true,"errors":[],"result":[
+          {"name":"net.example.com","type":"A","content":"203.0.113.10","proxied":false}
+        ]}"#;
+        assert!(parse_records(200, no_id, NAME)
+            .unwrap_err()
+            .to_string()
+            .contains("no usable id"));
+
+        let not_a_list = r#"{"success":true,"errors":[],"result":{"id":"r1"}}"#;
+        assert!(matches!(
+            parse_records(200, not_a_list, NAME),
+            Err(CfError::ApiFailure { .. })
+        ));
+    }
+
+    #[test]
+    fn the_create_body_says_dns_only_out_loud() {
+        // A zone can be set to proxy new records by default; inheriting
+        // that would be §13's trap arriving through the automation
+        // meant to avoid it.
+        let body: serde_json::Value = serde_json::from_str(&create_body(NAME, hub_ip())).unwrap();
+        assert_eq!(body["type"], "A");
+        assert_eq!(body["name"], NAME);
+        assert_eq!(body["content"], HUB_IP);
+        assert_eq!(body["proxied"], false);
+        assert_eq!(body["ttl"], TTL_AUTOMATIC);
+    }
+
+    #[test]
+    fn the_update_body_touches_only_the_address() {
+        // The record may be one a person made by hand, carrying their
+        // TTL and comment. Sending a whole record would reset those on
+        // the way past — and `proxied` is absent on purpose too, since
+        // turning the proxy off is not anago's call either (§13).
+        let body: serde_json::Value = serde_json::from_str(&update_body(hub_ip())).unwrap();
+        assert_eq!(body["content"], HUB_IP);
+        assert_eq!(
+            body.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["content"]
+        );
+    }
+
+    #[test]
+    fn the_answer_to_a_write_is_read_back() {
+        let record = parse_record(200, &single(a_record("r9", HUB_IP, false))).unwrap();
+        assert_eq!(record, Record::a("r9", HUB_IP));
+        assert_eq!(record_warning(&record, hub_ip()), None);
+    }
+
+    #[test]
+    fn a_record_that_comes_back_proxied_is_warned_about() {
+        // The write succeeded, HTTP-01 will pass, the certificate will
+        // issue — and the tunnel is dead. This answer is the one moment
+        // that is catchable (§13).
+        let record = parse_record(200, &single(a_record("r9", HUB_IP, true))).unwrap();
+        let warning = record_warning(&record, hub_ip()).unwrap();
+        assert!(warning.contains("orange cloud"), "{warning}");
+        assert!(warning.contains("UDP"), "{warning}");
+        assert!(warning.contains("r9"), "{warning}");
+    }
+
+    #[test]
+    fn an_address_that_is_not_the_one_asked_for_is_warned_about() {
+        let record = parse_record(200, &single(a_record("r9", "198.51.100.7", false))).unwrap();
+        let warning = record_warning(&record, hub_ip()).unwrap();
+        assert!(warning.contains("198.51.100.7"), "{warning}");
+        assert!(warning.contains(HUB_IP), "{warning}");
+    }
+
+    #[test]
+    fn a_hand_made_record_is_adopted_and_said_so() {
+        // M0's manual instructions are still there, so meeting a record
+        // anago did not create is the ordinary case, not an anomaly.
+        let body = listing(&[a_record("r1", "198.51.100.7", false)]);
+        let records = parse_records(200, &body, NAME).unwrap();
+        assert_eq!(
+            dns::decide(&records, hub_ip(), None),
+            Upsert::Update {
+                record_id: "r1".to_string(),
+                adopted: true
+            }
+        );
+        let line = Applied::Updated {
+            record_id: "r1".to_string(),
+            adopted: true,
+        }
+        .to_string();
+        assert!(line.contains("did not create"), "{line}");
+    }
+
+    #[test]
+    fn a_proxied_record_stops_the_run_instead_of_being_un_proxied() {
+        // Somebody may be serving that domain through the proxy on
+        // purpose; rerouting their traffic is not anago's business.
+        let body = listing(&[a_record("r1", HUB_IP, true)]);
+        let records = parse_records(200, &body, NAME).unwrap();
+        let Upsert::Refuse(refusal) = dns::decide(&records, hub_ip(), Some("r1")) else {
+            panic!("a proxied record must be refused");
+        };
+        assert!(matches!(refusal, Refusal::Proxied { .. }));
+
+        let error = CfError::RecordRefused(refusal);
+        let message = error.to_string();
+        assert!(message.contains("did not change"), "{message}");
+        assert!(message.contains("grey cloud"), "{message}");
+        // And the fallback line carries the same reason, since the hub
+        // is still worth setting up (§6.1).
+        assert!(fallback_notice(&error).contains("grey cloud"));
+    }
+
+    #[test]
+    fn several_a_records_are_reported_rather_than_half_fixed() {
+        let body = listing(&[
+            a_record("r1", HUB_IP, false),
+            a_record("r2", "198.51.100.7", false),
+        ]);
+        let records = parse_records(200, &body, NAME).unwrap();
+        let error = CfError::RecordRefused(match dns::decide(&records, hub_ip(), Some("r1")) {
+            Upsert::Refuse(refusal) => refusal,
+            other => panic!("{other:?}"),
+        });
+        let message = error.to_string();
+        assert!(message.contains("2 A records"), "{message}");
+        // The cache earns its keep here: it names which one is ours.
+        assert!(message.contains("anago created r1"), "{message}");
+    }
+
+    #[test]
+    fn a_403_on_a_write_names_the_permission_that_is_missing() {
+        // A read-only token gets through `verify` and through the zone
+        // walk, and fails here — the first time anago writes anything.
+        let body = r#"{"success":false,"errors":[{"code":9109,"message":"Unauthorized"}]}"#;
+        let error = parse_record(403, body).unwrap_err();
+        assert!(matches!(error, CfError::Forbidden(_)));
+        assert!(error.to_string().contains("Zone → DNS → Edit"), "{error}");
+    }
+
+    #[test]
+    fn what_happened_reads_as_a_sentence_and_carries_the_id() {
+        for applied in [
+            Applied::Created {
+                record_id: "r1".to_string(),
+            },
+            Applied::Updated {
+                record_id: "r1".to_string(),
+                adopted: false,
+            },
+            Applied::Unchanged {
+                record_id: "r1".to_string(),
+            },
+        ] {
+            assert_eq!(applied.record_id(), "r1");
+            assert!(applied.to_string().contains("r1"), "{applied}");
+        }
+        assert!(Applied::Created {
+            record_id: "r1".to_string()
+        }
+        .to_string()
+        .contains("DNS only"));
+    }
+
+    #[test]
+    fn no_message_carries_a_collapsed_line_continuation() {
+        // A `\` continuation that lost its leading-whitespace strip
+        // leaves a run of spaces mid-sentence. Cheap to catch, and
+        // invisible in a diff.
+        let refusal = Refusal::Proxied {
+            record_id: "r1".to_string(),
+        };
+        let mut messages = vec![
+            CfError::RecordRefused(refusal.clone()).to_string(),
+            fallback_notice(&CfError::RecordRefused(refusal)),
+            record_warning(&Record::a("r1", "198.51.100.7"), hub_ip()).unwrap(),
+            record_warning(
+                &Record {
+                    proxied: true,
+                    ..Record::a("r1", HUB_IP)
+                },
+                hub_ip(),
+            )
+            .unwrap(),
+            CfError::NotAscii("맥북.example.com".to_string()).to_string(),
+            parse_records(
+                200,
+                &listing(&[record_json("r1", "A", NAME, HUB_IP, "")]),
+                NAME,
+            )
+            .unwrap_err()
+            .to_string(),
+        ];
+        messages.extend(
+            [
+                Applied::Created {
+                    record_id: "r1".to_string(),
+                },
+                Applied::Updated {
+                    record_id: "r1".to_string(),
+                    adopted: true,
+                },
+                Applied::Unchanged {
+                    record_id: "r1".to_string(),
+                },
+            ]
+            .iter()
+            .map(ToString::to_string),
+        );
+        for message in messages {
+            for line in message.lines() {
+                assert!(
+                    !line.trim_start().contains("  "),
+                    "collapsed continuation in {line:?}"
+                );
+            }
+        }
     }
 
     #[test]

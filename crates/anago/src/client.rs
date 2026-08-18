@@ -42,9 +42,9 @@ pub const MAX_RESPONSE: usize = 1 << 20;
 pub const JSON: &str = "application/json";
 
 /// An HTTP method, spelled the way the request line needs it.
-// The Cloudflare surface (`Put`, [`HeaderValue::bearer`], [`Body::new`],
-// [`Response::header`], [`ClientError::BadHeaderValue`]) is exercised by
-// tests here and called for real by `cfapi` in the next slice. Kept
+// The rest of the Cloudflare surface ([`HeaderValue::bearer`],
+// [`Body::new`], [`Response::header`], [`ClientError::BadHeaderValue`])
+// is exercised by tests here and called for real by `cfapi`. Kept
 // together so this module is reviewed as one wire format rather than
 // grown a field at a time.
 #[allow(dead_code)]
@@ -52,8 +52,12 @@ pub const JSON: &str = "application/json";
 pub enum Method {
     Get,
     Post,
-    /// Cloudflare's full-record update.
-    Put,
+    /// Cloudflare's record update. `PATCH`, not `PUT`, on purpose:
+    /// `PUT` replaces a whole record, so pointing an **adopted** record
+    /// at the hub would also reset the TTL, comment, and tags its owner
+    /// set. `PATCH` sends only the field anago is changing.
+    Patch,
+    /// Removing a DNS-01 challenge record once it has been checked.
     Delete,
 }
 
@@ -62,7 +66,7 @@ impl Method {
         match self {
             Method::Get => "GET",
             Method::Post => "POST",
-            Method::Put => "PUT",
+            Method::Patch => "PATCH",
             Method::Delete => "DELETE",
         }
     }
@@ -757,7 +761,7 @@ mod tests {
         for (method, spelled) in [
             (Method::Get, "GET"),
             (Method::Post, "POST"),
-            (Method::Put, "PUT"),
+            (Method::Patch, "PATCH"),
             (Method::Delete, "DELETE"),
         ] {
             let request = Request {

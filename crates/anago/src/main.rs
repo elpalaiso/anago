@@ -10,9 +10,9 @@
 mod activate;
 mod api;
 mod args;
-// The Cloudflare front door: where the token comes from and whether it
-// still works. `server init` wires it in with the record calls in the
-// next slice, so the whole module is briefly ahead of its caller.
+// Cloudflare: where the token comes from, which zone the domain lives
+// in, and the hub's A record. `server init` wires all of it in a later
+// slice, so the module is briefly ahead of its caller.
 #[allow(dead_code)]
 mod cfapi;
 mod cli;
