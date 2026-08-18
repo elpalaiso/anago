@@ -803,7 +803,7 @@ fn publish(
     profile: &ClientProfile,
     to: &Destination,
 ) -> Result<(), JoinError> {
-    fsutil::write_private(to.wg_config, &wgconf::client_config(profile)).map_err(|e| {
+    fsutil::write_private(to.wg_config, wgconf::client_config(profile).expose()).map_err(|e| {
         JoinError::Save {
             what: "the WireGuard config",
             target: Target::system_file(to.wg_config),
@@ -1126,7 +1126,8 @@ mod tests {
         assert_eq!(profile.subnet.to_string(), "10.100.0.0/24");
         assert_eq!(profile.server_endpoint, "net.example.com:51820");
 
-        let text = wgconf::client_config(&profile);
+        let rendered = wgconf::client_config(&profile);
+        let text = rendered.expose();
         assert!(text.contains("PrivateKey = ZGV2aWNlIHByaXZhdGU="), "{text}");
         assert!(text.contains("AllowedIPs = 10.100.0.0/24"), "{text}");
     }
@@ -1682,7 +1683,8 @@ mod tests {
 
         // Nothing that survives validation can carry a second line.
         let good = super::tests::config();
-        let text = wgconf::client_config(&profile_of(&good));
+        let rendered = wgconf::client_config(&profile_of(&good));
+        let text = rendered.expose();
         assert!(!text.contains("PostUp"), "{text}");
     }
 

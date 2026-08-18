@@ -309,17 +309,19 @@ pub fn publish(state: &ServerState, root: &Path, wg_dir: &Path) -> Result<(), In
         source: e.to_string(),
     })?;
     let config_path = paths::wg_config(wg_dir);
-    fsutil::create_new_private(&config_path, &wgconf::server_config(state)).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::AlreadyExists {
-            InitError::ConfigExists(config_path.display().to_string())
-        } else {
-            InitError::Io {
-                what: "write the WireGuard config",
-                kind: e.kind(),
-                source: e.to_string(),
+    fsutil::create_new_private(&config_path, wgconf::server_config(state).expose()).map_err(
+        |e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                InitError::ConfigExists(config_path.display().to_string())
+            } else {
+                InitError::Io {
+                    what: "write the WireGuard config",
+                    kind: e.kind(),
+                    source: e.to_string(),
+                }
             }
-        }
-    })?;
+        },
+    )?;
 
     let published = fsutil::ensure_private_dir(root)
         .map_err(|e| InitError::Io {
@@ -628,7 +630,7 @@ mod tests {
         publish_once(&state, &root, &wg_dir).unwrap();
         assert_eq!(
             std::fs::read_to_string(paths::wg_config(&wg_dir)).unwrap(),
-            wgconf::server_config(&state)
+            wgconf::server_config(&state).expose()
         );
         assert_eq!(
             Store::new(&root).read().unwrap(),
@@ -761,7 +763,7 @@ mod tests {
         // The two files describe the same hub — the winner's.
         let stored = Store::new(&root).read().unwrap();
         let config = std::fs::read_to_string(paths::wg_config(&wg_dir)).unwrap();
-        assert_eq!(config, wgconf::server_config(&stored));
+        assert_eq!(config, wgconf::server_config(&stored).expose());
         assert!(
             ["first.example.com", "second.example.com"].contains(&stored.domain.as_str()),
             "{}",

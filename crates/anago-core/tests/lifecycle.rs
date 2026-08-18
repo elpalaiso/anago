@@ -210,6 +210,7 @@ fn the_whole_m0_lifecycle_runs_on_pure_functions() {
 
     // --- the configs both sides run -------------------------------
     let server_config = wgconf::server_config(&hub);
+    let server_config = server_config.expose();
     assert!(
         server_config.contains("Address = 10.100.0.1/24"),
         "{server_config}"
@@ -227,13 +228,15 @@ fn the_whole_m0_lifecycle_runs_on_pure_functions() {
         "the hub does not keepalive"
     );
 
-    let macbook_config = wgconf::client_config(&ClientProfile {
+    let macbook_profile = ClientProfile {
         address: ip(&macbook.address),
         subnet: Subnet::parse(&macbook.subnet).expect("the subnet the hub sent"),
         private_key: PrivateKey::new(MACBOOK_PRIVATE),
         server_public_key: macbook.server_public_key.clone(),
         server_endpoint: macbook.server_endpoint.clone(),
-    });
+    };
+    let rendered = wgconf::client_config(&macbook_profile);
+    let macbook_config = rendered.expose();
     // The asymmetry that makes hub-and-spoke work: the device routes
     // the whole subnet through the hub and knows nothing of the other
     // device.
@@ -270,6 +273,7 @@ fn the_whole_m0_lifecycle_runs_on_pure_functions() {
     assert_eq!(hub.peers.len(), 1);
 
     let after_removal = wgconf::server_config(&hub);
+    let after_removal = after_removal.expose();
     assert!(!after_removal.contains("10.100.0.2/32"), "{after_removal}");
     assert!(after_removal.contains("10.100.0.3/32"), "{after_removal}");
 
