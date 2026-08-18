@@ -8,6 +8,8 @@
 //! behind them yet — the server, join, and state-file slices land
 //! next. They exit non-zero rather than pretending to have worked.
 
+#[allow(dead_code)]
+mod api;
 mod args;
 mod cli;
 // Path rules and file handling are complete and unit-tested; the
@@ -17,6 +19,10 @@ mod cli;
 mod fsutil;
 #[allow(dead_code)]
 mod paths;
+#[allow(dead_code)]
+mod secret;
+#[allow(dead_code)]
+mod store;
 #[allow(dead_code)]
 mod tls;
 #[allow(dead_code)]

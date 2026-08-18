@@ -24,4 +24,6 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pemfile = "2"
+# SHA-256 for device-token hashes (DESIGN.md §7.1).
+sha2 = "0.10"
 # tokio/axum/rustls/serde는 M0 서버 구현이 요구할 때 추가한다 (원칙 4).
