@@ -8,6 +8,7 @@
 //! behind them yet — the server, join, and state-file slices land
 //! next. They exit non-zero rather than pretending to have worked.
 
+mod activate;
 #[allow(dead_code)]
 mod api;
 mod args;
@@ -152,7 +153,31 @@ fn join_device(args: &cli::Join) -> ! {
                 client_paths.device_file().display(),
                 wg_config.display()
             );
-            std::process::exit(0);
+
+            // Bring the tunnel up and see whether it carries traffic.
+            // The registration stands either way, so a failure here is
+            // a diagnosis rather than a rollback.
+            let Some(server_address) = joined.config.server_ip() else {
+                // validate() accepted it, so this is a file edited by
+                // hand between then and now.
+                eprintln!("anago: the saved hub address is unreadable — bring the tunnel up with");
+                eprintln!("       sudo wg-quick up {}", wg_config.display());
+                std::process::exit(EXIT_FAILED);
+            };
+            let path_var = std::env::var("PATH").unwrap_or_default();
+            let outcome = activate::run(&wg_config, server_address, &path_var);
+            let report = activate::report(
+                &outcome,
+                server_address,
+                &joined.config.server_endpoint,
+                &wg_config,
+            );
+            if outcome.is_working() {
+                print!("{report}");
+                std::process::exit(0);
+            }
+            eprint!("{report}");
+            std::process::exit(EXIT_FAILED);
         }
         Err(e) => {
             eprintln!("anago: {e}");

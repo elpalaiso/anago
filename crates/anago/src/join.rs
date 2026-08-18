@@ -129,6 +129,12 @@ impl DeviceConfig {
         })
     }
 
+    /// The hub's private address, parsed. `None` only for a file that
+    /// was hand-edited after [`DeviceConfig::validate`] accepted it.
+    pub fn server_ip(&self) -> Option<std::net::Ipv4Addr> {
+        self.server_address.parse().ok()
+    }
+
     /// Checks the fields that never reach the wg config but do reach
     /// later commands.
     pub fn validate(&self) -> Result<(), JoinError> {
@@ -736,6 +742,14 @@ mod tests {
             text.contains("\"server_endpoint\": \"net.example.com:51820\""),
             "{text}"
         );
+    }
+
+    #[test]
+    fn the_hubs_address_comes_back_typed() {
+        assert_eq!(config().server_ip().unwrap().to_string(), "10.100.0.1");
+        let mut broken = config();
+        broken.server_address = "10.100.0.999".to_string();
+        assert_eq!(broken.server_ip(), None);
     }
 
     #[test]
