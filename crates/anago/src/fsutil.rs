@@ -74,6 +74,54 @@ fn create_private_new(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
+/// Publishes a *new* file, 0600, refusing to replace an existing one.
+///
+/// [`write_private`] replaces whatever is there, which is right for a
+/// state file anago owns. This is for the other case — creating
+/// something that must not exist yet — where losing a race has to be an
+/// error rather than a silent overwrite.
+///
+/// The content is written to a private temp file first and then linked
+/// into place: `link(2)` fails if the name is taken, so the publish is
+/// both complete and no-clobber. A `rename` would have clobbered.
+pub fn create_new_private(path: &Path, contents: &str) -> io::Result<()> {
+    // The temp name carries this process's id, so two racing writers
+    // never share scratch space.
+    let tmp = unique_temp_sibling(path)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(PRIVATE_FILE_MODE)
+        .open(&tmp)?;
+    let written = file
+        .write_all(contents.as_bytes())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(e) = written {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    let linked = fs::hard_link(&tmp, path);
+    let _ = fs::remove_file(&tmp);
+    linked?;
+    sync_parent(path);
+    Ok(())
+}
+
+/// `path` with this process's id and `.tmp` appended.
+fn unique_temp_sibling(path: &Path) -> io::Result<PathBuf> {
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{path:?} has no file name"),
+        )
+    })?;
+    let mut tmp = name.to_os_string();
+    tmp.push(format!(".{}.tmp", std::process::id()));
+    Ok(path.with_file_name(tmp))
+}
+
 /// Creates a directory and everything above it, then makes the leaf
 /// 0700. Existing directories are left alone apart from that mode.
 pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
@@ -313,6 +361,41 @@ mod tests {
         let path = dir.join("nope").join("state.json");
         let e = write_private(&path, "x").unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn a_new_file_is_published_privately() {
+        let dir = TempDir::new();
+        let path = dir.join("anago.conf");
+        create_new_private(&path, "[Interface]\n").unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "[Interface]\n");
+        assert_eq!(mode_of(&path), PRIVATE_FILE_MODE);
+        // Nothing left over.
+        let entries: Vec<String> = fs::read_dir(&dir.path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries, ["anago.conf"]);
+    }
+
+    #[test]
+    fn publishing_over_an_existing_file_is_refused_not_silent() {
+        // The difference from write_private: losing this race must be
+        // an error, and the file that was there must survive intact.
+        let dir = TempDir::new();
+        let path = dir.join("anago.conf");
+        fs::write(&path, "someone else's interface").unwrap();
+
+        let e = create_new_private(&path, "ours").unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "someone else's interface"
+        );
+        assert!(!dir
+            .join(&format!("anago.conf.{}.tmp", std::process::id()))
+            .exists());
     }
 
     #[test]

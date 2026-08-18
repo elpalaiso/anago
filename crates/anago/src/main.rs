@@ -12,11 +12,14 @@
 mod api;
 mod args;
 mod cli;
+mod init;
 // Path rules and file handling are complete and unit-tested; the
 // slices that read and write those files (server init, join) land next,
 // so both modules are briefly ahead of their callers.
 #[allow(dead_code)]
 mod fsutil;
+// Client-side path resolution and a few server paths are used by the
+// join and serving slices that land next.
 #[allow(dead_code)]
 mod paths;
 #[allow(dead_code)]
@@ -57,12 +60,49 @@ fn main() {
     match command {
         Command::Version => println!("anago {}", env!("CARGO_PKG_VERSION")),
         Command::Help(topic) => print!("{}", cli::help(topic.as_deref())),
-        Command::ServerInit(_) => not_yet_built("anago server init"),
+        Command::ServerInit(args) => server_init(&args),
         Command::Code => not_yet_built("anago code"),
         Command::Join(_) => not_yet_built("anago join"),
         Command::Ls => not_yet_built("anago ls"),
         Command::Rm(_) => not_yet_built("anago rm"),
     }
+}
+
+/// `anago server init` — the only M0 command wired up so far.
+fn server_init(args: &cli::ServerInit) -> ! {
+    match init::run(
+        args,
+        std::path::Path::new(paths::DEFAULT_SERVER_ROOT),
+        std::path::Path::new(paths::DEFAULT_WG_DIR),
+        now(),
+    ) {
+        Ok(done) => {
+            for warning in &done.warnings {
+                eprintln!("anago: warning: {warning}");
+            }
+            print!("{}", done.instructions);
+            // The interface itself comes up with the server process,
+            // which is the next slice; say so rather than let the
+            // operator assume the tunnel is live.
+            eprintln!(
+                "\nnote: the hub is configured but not running yet — \
+                 serving lands with the next M0 slice"
+            );
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("anago: {e}");
+            std::process::exit(EXIT_FAILED);
+        }
+    }
+}
+
+/// Unix epoch seconds.
+fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// An M0 command that routes and validates but has no implementation
