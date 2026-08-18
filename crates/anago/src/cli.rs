@@ -26,6 +26,9 @@ pub const DEFAULT_API_PORT: u16 = 443;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     ServerInit(ServerInit),
+    /// The resident process (§8). systemd runs this; a person only
+    /// types it after `server init --no-systemd`.
+    ServerRun,
     Code,
     Join(Join),
     Ls,
@@ -137,6 +140,7 @@ fn server(argv: &[String]) -> Result<Command, CliError> {
         None => Err(CliError::MissingSubcommand("server")),
         Some((head, rest)) => match head.as_str() {
             "init" => server_init(rest),
+            "run" => no_args("server run", rest).map(|_| Command::ServerRun),
             "status" => Err(CliError::NotYet {
                 what: "anago server status",
                 milestone: "M3",
@@ -252,6 +256,8 @@ fn no_args(name: &'static str, argv: &[String]) -> Result<Command, CliError> {
     Ok(match name {
         "code" => Command::Code,
         "ls" => Command::Ls,
+        // `server run` maps itself; this arm only reports the shape.
+        "server run" => Command::ServerRun,
         other => unreachable!("no_args called for {other}"),
     })
 }
@@ -434,6 +440,7 @@ anago {version} — self-hosted WireGuard private network
 
 usage:
   anago server init --domain <d> --tls-cert <path> --tls-key <path>
+  anago server run                  run the hub (systemd does this for you)
   anago code                        issue a join code (on the server)
   anago join <domain> <code>        register this device
   anago ls                          list devices
@@ -681,6 +688,20 @@ mod tests {
         ));
         // `--` keeps a device whose name starts with a dash reachable.
         assert!(parse_args(&["rm", "--", "x-1"]).is_ok());
+    }
+
+    #[test]
+    fn server_run_is_routed_for_systemd_and_for_no_systemd_users() {
+        assert_eq!(parse_args(&["server", "run"]), Ok(Command::ServerRun));
+        assert_eq!(
+            parse_args(&["server", "run", "now"]),
+            Err(CliError::TooManyArguments("server run"))
+        );
+        assert!(cli_help_mentions("anago server run"));
+    }
+
+    fn cli_help_mentions(text: &str) -> bool {
+        help(None).contains(text)
     }
 
     #[test]

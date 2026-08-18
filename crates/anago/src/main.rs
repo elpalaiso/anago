@@ -24,8 +24,11 @@ mod fsutil;
 mod paths;
 #[allow(dead_code)]
 mod secret;
+mod serve;
 #[allow(dead_code)]
 mod store;
+#[allow(dead_code)]
+mod systemd;
 #[allow(dead_code)]
 mod tls;
 #[allow(dead_code)]
@@ -61,6 +64,7 @@ fn main() {
         Command::Version => println!("anago {}", env!("CARGO_PKG_VERSION")),
         Command::Help(topic) => print!("{}", cli::help(topic.as_deref())),
         Command::ServerInit(args) => server_init(&args),
+        Command::ServerRun => server_run(),
         Command::Code => not_yet_built("anago code"),
         Command::Join(_) => not_yet_built("anago join"),
         Command::Ls => not_yet_built("anago ls"),
@@ -80,16 +84,26 @@ fn server_init(args: &cli::ServerInit) -> ! {
             for warning in &done.warnings {
                 eprintln!("anago: warning: {warning}");
             }
+            // `init::run` already ends with how this hub starts —
+            // under systemd, or by hand. Nothing to add here.
             print!("{}", done.instructions);
-            // The interface itself comes up with the server process,
-            // which is the next slice; say so rather than let the
-            // operator assume the tunnel is live.
-            eprintln!(
-                "\nnote: the hub is configured but not running yet — \
-                 serving lands with the next M0 slice"
-            );
             std::process::exit(0);
         }
+        Err(e) => {
+            eprintln!("anago: {e}");
+            std::process::exit(EXIT_FAILED);
+        }
+    }
+}
+
+/// `anago server run` — the process systemd starts.
+fn server_run() -> ! {
+    match serve::run(
+        std::path::Path::new(paths::DEFAULT_SERVER_ROOT),
+        std::path::Path::new(paths::DEFAULT_WG_DIR),
+    ) {
+        // `serve::run` only returns when the listener stops.
+        Ok(()) => std::process::exit(0),
         Err(e) => {
             eprintln!("anago: {e}");
             std::process::exit(EXIT_FAILED);

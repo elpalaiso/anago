@@ -100,8 +100,9 @@ anago server init --domain net.example.com
 3. ACME로 TLS 인증서 발급 — 기본 HTTP-01(:80 필요). Cloudflare 토큰이
    있으면 DNS-01도 가능(:80을 안 열어도 됨). 갱신은 서버 데몬이 내장
    처리(§10).
-4. systemd 유닛 설치·기동(`--no-systemd`로 포그라운드 실행도 가능 —
-   컨테이너/비-systemd 환경).
+4. systemd 유닛 설치·기동(`/etc/systemd/system/anago.service`, ExecStart는
+   `anago server run`). `--no-systemd`면 설치하지 않고 포그라운드로 실행할
+   명령을 안내한다 — 컨테이너/비-systemd 환경.
 5. 조인 코드 발급·출력: `anago join net.example.com 7QX4-M2KD`(형식은 §7.2).
 
 ### 6.2 기기 등록 (각 기기에서 1회)
@@ -230,6 +231,10 @@ anago server init --domain <d> --tls-cert <p> --tls-key <p>
                   [--api-port 443] [--no-systemd]
                                    # DNS는 수동 안내(A 레코드 출력), TLS는
                                    # 기존 인증서 경로 지정 (§11 M0)
+anago server run                   # 서버 상주 프로세스: 컨트롤 API + wg 인터페이스 유지
+                                   # systemd 유닛의 ExecStart. `server init`이
+                                   # 대신 설치·기동하므로 손으로 칠 일은
+                                   # `--no-systemd`로 포그라운드 실행할 때뿐이다
 anago code                         # 서버에서: 조인 코드 발급
 anago join <domain> <code> [--name 맥북]
 anago ls                           # 기기 목록 (기기에선 API, 서버에선 상태 파일)

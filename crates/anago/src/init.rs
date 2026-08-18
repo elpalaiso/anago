@@ -11,7 +11,7 @@
 
 use std::fmt;
 use std::net::{Ipv4Addr, UdpSocket};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anago_core::code::{IssuedCode, JoinCode, DEFAULT_TTL_SECS};
 use anago_core::state::{PrivateKey, ServerKeys, ServerState};
@@ -21,6 +21,7 @@ use crate::cli::ServerInit;
 use crate::fsutil;
 use crate::paths::{self, ServerPaths};
 use crate::secret;
+use crate::systemd;
 use crate::wg::{self, WgError};
 
 /// Builds the initial state. Pure — the keys, the clock, and the code
@@ -191,10 +192,59 @@ pub fn run(
 
     publish_once(&state, root, wg_dir)?;
 
+    let mut warnings = loaded.warnings;
+    // No systemd on this host means no unit to install, whatever the
+    // flag says — offering one would leave a file nothing reads.
+    let start = if args.systemd && systemd::is_available() {
+        match systemd::install(
+            &std::env::current_exe().unwrap_or_else(|_| PathBuf::from("anago")),
+            root,
+            wg_dir,
+            Path::new(&args.tls_cert),
+            Path::new(&args.tls_key),
+            Path::new(systemd::UNIT_DIR),
+        ) {
+            Ok(path) => systemd_note(&path),
+            Err(e) => {
+                // The hub is configured either way; only the babysitter
+                // is missing, and the operator can still run it by hand.
+                warnings.push(format!("could not install the systemd unit: {e}"));
+                foreground_hint()
+            }
+        }
+    } else {
+        foreground_hint()
+    };
+
     Ok(Initialized {
-        instructions: instructions(&state, detect_public_ip(), DEFAULT_TTL_SECS),
-        warnings: loaded.warnings,
+        instructions: assemble(
+            &instructions(&state, detect_public_ip(), DEFAULT_TTL_SECS),
+            &start,
+        ),
+        warnings,
     })
+}
+
+/// The finished output: what the operator must do, then how this hub
+/// starts. Exactly one start note, so nothing can contradict it.
+pub fn assemble(instructions: &str, start_note: &str) -> String {
+    format!("{instructions}\n{start_note}")
+}
+
+/// What `server init` says when systemd took over.
+pub fn systemd_note(unit_path: &Path) -> String {
+    format!(
+        "The hub is running under systemd ({}) and comes back on reboot.\n\
+         `systemctl status anago` shows it, `journalctl -u anago` its log.\n",
+        unit_path.display()
+    )
+}
+
+/// What to run when nothing will run it for you — `--no-systemd`, a
+/// container, or a failed unit install.
+pub fn foreground_hint() -> String {
+    "Start the hub with:\n\n     anago server run\n\n     It stays in the foreground; nothing keeps it alive across a reboot.\n"
+        .to_string()
 }
 
 /// Refuses when either output is already there.
@@ -453,6 +503,60 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("`anago code` issues another"), "{text}");
+    }
+
+    #[test]
+    fn without_systemd_the_operator_is_told_what_to_run() {
+        // `--no-systemd` is for containers and non-systemd hosts: the
+        // hub is configured, but nothing will start it.
+        let hint = foreground_hint();
+        assert!(hint.contains("anago server run"), "{hint}");
+        assert!(hint.contains("across a reboot"), "{hint}");
+    }
+
+    #[test]
+    fn the_output_says_exactly_one_thing_about_starting() {
+        // Regression: a fixed "not running yet" line used to follow the
+        // real answer, contradicting the systemd case and denying the
+        // command the foreground case had just recommended.
+        let state = state_from(&args());
+        let base = instructions(&state, None, DEFAULT_TTL_SECS);
+
+        let under_systemd = assemble(
+            &base,
+            &systemd_note(Path::new("/etc/systemd/system/anago.service")),
+        );
+        assert!(
+            under_systemd.contains("running under systemd"),
+            "{under_systemd}"
+        );
+        assert!(
+            under_systemd.contains("systemctl status anago"),
+            "{under_systemd}"
+        );
+        assert!(
+            !under_systemd.contains("not running yet"),
+            "{under_systemd}"
+        );
+        assert!(
+            !under_systemd.contains("Start the hub with"),
+            "one start note only: {under_systemd}"
+        );
+
+        let by_hand = assemble(&base, &foreground_hint());
+        assert!(by_hand.contains("anago server run"), "{by_hand}");
+        assert!(!by_hand.contains("running under systemd"), "{by_hand}");
+        assert!(!by_hand.contains("next M0 slice"), "{by_hand}");
+
+        // Both keep everything the operator still has to do.
+        for text in [&under_systemd, &by_hand] {
+            assert!(text.contains("A  <this server's public IP>"), "{text}");
+            assert!(text.contains("51820/udp"), "{text}");
+            assert!(
+                text.contains("anago join net.example.com 7QX4-M2KD"),
+                "{text}"
+            );
+        }
     }
 
     #[test]
