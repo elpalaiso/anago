@@ -46,7 +46,7 @@
 - [x] HTTPS 리스너: `--tls-cert/--tls-key` PEM 로드 → rustls 설정, 잘못된 경로·형식에 대한 명확한 에러 (경로 검증·에러 문구는 순수 함수 분리)
 - [x] `POST /api/v1/join` 핸들러: 코드 검증 → 이름/공개키 등록 → IP 할당 → 상태 저장(잠금) → JoinResponse (코어 순수 함수 호출부만 얇게)
 - [x] `GET /api/v1/peers` + `DELETE /api/v1/peers/{name}` 핸들러: 기기 토큰 bearer 인증 → 코어 상태 전이 호출
-- [ ] 서버 wg 인터페이스 반영: 상태 변경 시 서버 wg 설정 재생성 + `wg syncconf`(또는 wg-quick) 적용, `ip_forward` 확인/안내
+- [x] 서버 wg 인터페이스 반영: 상태 변경 시 서버 wg 설정 재생성 + `wg syncconf`(또는 wg-quick) 적용, `ip_forward` 확인/안내
 - [ ] `anago server init` 조립: 키쌍 생성 → 상태 파일 초기 생성 → DNS 수동 안내 출력(A 레코드 문구, 서버 공인 IP 조회는 실패해도 진행) → 방화벽 체크리스트(:443, :51820/udp) → 첫 조인 코드 출력
 - [ ] `--no-systemd` 포그라운드 실행 경로 + systemd 유닛 파일 생성/설치(유닛 텍스트 생성은 순수 함수 + 유닛 테스트)
 - [ ] `anago code`: 서버 로컬에서 상태 파일에 코드 발급·저장·출력(`anago join <domain> 7QX4-M2KD` 형태로 복붙 가능하게 — 형식은 DESIGN §7.2)

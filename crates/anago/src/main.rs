@@ -27,6 +27,8 @@ mod store;
 mod tls;
 #[allow(dead_code)]
 mod wg;
+#[allow(dead_code)]
+mod wgapply;
 
 use cli::Command;
 

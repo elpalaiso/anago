@@ -38,11 +38,16 @@ const UNAUTHORIZED: &str = "a valid device token is required";
 use crate::secret;
 use crate::store::Store;
 use crate::wg;
+use crate::wgapply::Applier;
 
-/// What the handlers need: the state file, and nothing else.
+/// What the handlers need: the state file, and a way to push changes
+/// into the wg interface.
 #[derive(Clone)]
 pub struct Api {
     pub store: Arc<Store>,
+    /// Applied after every committed change. Tests pass a no-op so
+    /// they never touch the kernel.
+    pub wg: Arc<dyn Applier>,
 }
 
 /// The M0 routes.
@@ -101,6 +106,7 @@ async fn join(State(api): State<Api>, body: Bytes) -> Response {
             "the server could not save the new device",
         ));
     }
+    apply_to_interface(&api, "join");
 
     json_response(StatusCode::OK, &json::to_string(&response.to_json()))
 }
@@ -169,7 +175,40 @@ fn with_caller(
             "the server could not save its state",
         ));
     }
+    apply_to_interface(api, "request");
     json_response(StatusCode::OK, &body)
+}
+
+/// Pushes the committed state into the wg interface.
+///
+/// Runs *after* the commit, and a failure does not fail the request.
+/// The state file is the source of truth: the device really is
+/// registered, its own config is correct, and the interface is
+/// regenerated from state on the next change or restart — whereas
+/// answering with an error would send the client back with a code it
+/// has already spent, which nothing can undo. So the operator gets a
+/// loud line and the caller gets the truth.
+fn apply_to_interface(api: &Api, what: &str) {
+    // Under the lock, and reading the state back from disk: two
+    // requests must not apply in the opposite order to the one they
+    // committed in. A slow apply that still held its own snapshot could
+    // otherwise rewind the kernel to a state the file no longer has.
+    // Taking the lock again also keeps concurrent applies off each
+    // other's scratch files.
+    let guard = match api.store.lock() {
+        Ok(guard) => guard,
+        Err(e) => {
+            eprintln!("anago: {what} saved, but the state could not be re-read: {e}");
+            // Applying a guess here would rewrite the interface from
+            // something we do not know to be current.
+            return;
+        }
+    };
+    if let Err(e) = api.wg.apply(guard.state()) {
+        eprintln!("anago: {what} saved, but the wg interface was not updated: {e}");
+        eprintln!("anago: devices become reachable once `anago server` applies the state again");
+    }
+    // Dropped without commit: applying changes nothing on disk.
 }
 
 /// Reads a bearer token out of an `Authorization` header.
@@ -806,10 +845,38 @@ mod tests {
 
     // ------------------------------------------------ through the router
 
+    use crate::wgapply::NoopApplier;
     use axum::http::Request;
     use std::fs;
     use std::sync::atomic::{AtomicU32, Ordering};
     use tower::ServiceExt;
+
+    /// An applier that records what it was handed, so a test can see
+    /// that a committed change reached the interface layer.
+    #[derive(Default)]
+    struct RecordingApplier {
+        seen: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+
+    impl RecordingApplier {
+        /// The peer names of each apply, in order.
+        fn calls(&self) -> Vec<Vec<String>> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl crate::wgapply::Applier for RecordingApplier {
+        fn apply(&self, state: &ServerState) -> Result<(), crate::wg::WgError> {
+            self.seen.lock().unwrap().push(
+                state
+                    .peers
+                    .iter()
+                    .map(|peer| peer.name.to_string())
+                    .collect(),
+            );
+            Ok(())
+        }
+    }
 
     /// A store on a temp directory, deleted when the test ends.
     struct TempServer {
@@ -819,6 +886,10 @@ mod tests {
 
     impl TempServer {
         fn new(state: &ServerState) -> TempServer {
+            TempServer::with_applier(state, Arc::new(NoopApplier))
+        }
+
+        fn with_applier(state: &ServerState, wg: Arc<dyn crate::wgapply::Applier>) -> TempServer {
             static COUNTER: AtomicU32 = AtomicU32::new(0);
             let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
             let root =
@@ -830,6 +901,7 @@ mod tests {
                 root,
                 api: Api {
                     store: Arc::new(store),
+                    wg,
                 },
             }
         }
@@ -971,5 +1043,74 @@ mod tests {
         let token = DeviceToken::parse(&response.token).unwrap();
         let (status, _, _) = server.send(get(PATH_PEERS, Some(&token))).await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_committed_change_reaches_the_interface() {
+        let (state, first, _) = network();
+        let recorder = Arc::new(RecordingApplier::default());
+        let server = TempServer::with_applier(&state, recorder.clone());
+
+        // A read-only-looking call still commits `last_seen`, so it
+        // applies too — harmless, because an unchanged config is a
+        // no-op at the wg layer.
+        server.send(get(PATH_PEERS, Some(&first))).await;
+        assert_eq!(recorder.calls().len(), 1);
+
+        let (status, _, _) = server
+            .send(build(
+                axum::http::Method::DELETE,
+                "/api/v1/peers/macbook",
+                Some(&first),
+            ))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // The applier saw the state *after* the removal, from disk.
+        let calls = recorder.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], ["macbook", "맥북"]);
+        assert_eq!(calls[1], ["맥북"], "the removed device must be gone");
+    }
+
+    #[tokio::test]
+    async fn the_interface_is_applied_from_disk_under_the_lock() {
+        // Regression: apply used to run after the lock was released
+        // with whatever snapshot the request held, so a slow apply
+        // could rewind the kernel past a newer commit. It now re-reads
+        // under the lock, so it can only ever apply the current state.
+        let (state, first, _) = network();
+        let recorder = Arc::new(RecordingApplier::default());
+        let server = TempServer::with_applier(&state, recorder.clone());
+
+        // Someone else changes the state between commit and apply.
+        {
+            let mut guard = server.api.store.lock().unwrap();
+            guard
+                .state_mut()
+                .peers
+                .retain(|peer| peer.name.as_str() != "맥북");
+            guard.commit().unwrap();
+        }
+
+        server.send(get(PATH_PEERS, Some(&first))).await;
+        assert_eq!(
+            recorder.calls(),
+            vec![vec!["macbook".to_string()]],
+            "the applier must see what is on disk, not an older snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_request_never_reaches_the_interface() {
+        let (state, _, _) = network();
+        let recorder = Arc::new(RecordingApplier::default());
+        let server = TempServer::with_applier(&state, recorder.clone());
+
+        // Unauthenticated, and authenticated-but-nonexistent.
+        server.send(get(PATH_PEERS, None)).await;
+        let stranger = DeviceToken::parse(&"99".repeat(32)).unwrap();
+        server.send(get(PATH_PEERS, Some(&stranger))).await;
+        assert!(recorder.calls().is_empty(), "nothing was committed");
     }
 }
