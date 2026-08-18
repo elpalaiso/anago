@@ -11,4 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 anago-core = { path = "../anago-core" }
+# flock(2) for serializing concurrent joins — std has no file lock
+# (DESIGN.md §10, §13).
+libc = "0.2"
 # tokio/axum/rustls/serde는 M0 서버 구현이 요구할 때 추가한다 (원칙 4).

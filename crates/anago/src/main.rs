@@ -10,9 +10,11 @@
 
 mod args;
 mod cli;
-// The path rules are complete and unit-tested; the slices that read and
-// write those files (server init, join) land next, so the module is
-// briefly ahead of its callers.
+// Path rules and file handling are complete and unit-tested; the
+// slices that read and write those files (server init, join) land next,
+// so both modules are briefly ahead of their callers.
+#[allow(dead_code)]
+mod fsutil;
 #[allow(dead_code)]
 mod paths;
 
