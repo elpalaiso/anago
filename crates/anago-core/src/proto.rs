@@ -196,21 +196,21 @@ pub enum DecodeErrorKind {
 }
 
 impl DecodeError {
-    fn missing(field: &str) -> DecodeError {
+    pub(crate) fn missing(field: &str) -> DecodeError {
         DecodeError {
             field: field.to_string(),
             kind: DecodeErrorKind::Missing,
         }
     }
 
-    fn wrong_type(field: &str) -> DecodeError {
+    pub(crate) fn wrong_type(field: &str) -> DecodeError {
         DecodeError {
             field: field.to_string(),
             kind: DecodeErrorKind::WrongType,
         }
     }
 
-    fn unknown_value(field: &str) -> DecodeError {
+    pub(crate) fn unknown_value(field: &str) -> DecodeError {
         DecodeError {
             field: field.to_string(),
             kind: DecodeErrorKind::UnknownValue,
@@ -222,7 +222,7 @@ impl DecodeError {
     /// names the element that actually failed. An error carrying no
     /// path — the element was not an object at all — becomes just
     /// `peers[1]`.
-    fn within(self, prefix: &str) -> DecodeError {
+    pub(crate) fn within(self, prefix: &str) -> DecodeError {
         let field = if self.field.is_empty() {
             // The element itself was wrong, not a field inside it —
             // no dangling "peers[1]." path.
@@ -254,11 +254,11 @@ impl fmt::Display for DecodeError {
 
 impl std::error::Error for DecodeError {}
 
-fn object(value: &Value) -> Result<&Object, DecodeError> {
+pub(crate) fn object(value: &Value) -> Result<&Object, DecodeError> {
     value.as_object().ok_or_else(|| DecodeError::wrong_type(""))
 }
 
-fn string_field(obj: &Object, name: &str) -> Result<String, DecodeError> {
+pub(crate) fn string_field(obj: &Object, name: &str) -> Result<String, DecodeError> {
     match obj.get(name) {
         None => Err(DecodeError::missing(name)),
         Some(found) => found

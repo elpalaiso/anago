@@ -7,6 +7,7 @@ pub mod code;
 pub mod json;
 pub mod name;
 pub mod proto;
+pub mod state;
 pub mod subnet;
 pub mod token;
 
