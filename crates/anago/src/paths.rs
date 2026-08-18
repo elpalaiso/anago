@@ -87,6 +87,13 @@ impl ClientPaths {
     pub fn device_file(&self) -> PathBuf {
         self.dir.join("device.json")
     }
+
+    /// Serializes `anago join` against itself. Two joins on one device
+    /// would race over the same two files — and the loser's cleanup
+    /// would delete the winner's config.
+    pub fn join_lock(&self) -> PathBuf {
+        self.dir.join("join.lock")
+    }
 }
 
 /// The wg-quick config for the anago interface, under `dir`.
@@ -227,6 +234,17 @@ mod tests {
         // Even when it points somewhere unrelated to HOME.
         let paths = client_config_dir(Some("/mnt/keys"), Some("/home/jo")).unwrap();
         assert_eq!(paths.dir(), Path::new("/mnt/keys/anago"));
+    }
+
+    #[test]
+    fn the_join_lock_sits_beside_the_device_file() {
+        let paths = ClientPaths::new("/home/jo/.config/anago");
+        assert_eq!(
+            paths.join_lock(),
+            Path::new("/home/jo/.config/anago/join.lock")
+        );
+        assert_eq!(paths.join_lock().parent(), paths.device_file().parent());
+        assert_ne!(paths.join_lock(), paths.device_file());
     }
 
     #[test]

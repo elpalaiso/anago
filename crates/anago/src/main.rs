@@ -16,6 +16,7 @@ mod cli;
 mod client;
 mod code;
 mod init;
+mod join;
 // Path rules and file handling are complete and unit-tested; the
 // slices that read and write those files (server init, join) land next,
 // so both modules are briefly ahead of their callers.
@@ -75,7 +76,7 @@ fn main() {
                 std::process::exit(EXIT_FAILED);
             }
         },
-        Command::Join(_) => not_yet_built("anago join"),
+        Command::Join(args) => join_device(&args),
         Command::Ls => not_yet_built("anago ls"),
         Command::Rm(_) => not_yet_built("anago rm"),
     }
@@ -113,6 +114,46 @@ fn server_run() -> ! {
     ) {
         // `serve::run` only returns when the listener stops.
         Ok(()) => std::process::exit(0),
+        Err(e) => {
+            eprintln!("anago: {e}");
+            std::process::exit(EXIT_FAILED);
+        }
+    }
+}
+
+/// `anago join <domain> <code>`.
+fn join_device(args: &cli::Join) -> ! {
+    let client_paths = match paths::client_config_dir_from_env() {
+        Ok(paths) => paths,
+        Err(e) => {
+            eprintln!("anago: {e}");
+            std::process::exit(EXIT_FAILED);
+        }
+    };
+    let wg_config = paths::wg_config(paths::DEFAULT_WG_DIR);
+
+    match join::run(
+        &args.domain,
+        &args.code,
+        args.name.clone(),
+        args.api_port,
+        &client_paths,
+        &wg_config,
+    ) {
+        Ok(joined) => {
+            println!(
+                "Registered as {name} — this device is {address} on {subnet}.",
+                name = joined.config.name,
+                address = joined.config.address,
+                subnet = joined.config.subnet
+            );
+            println!(
+                "  device file   {}\n  wg config     {}",
+                client_paths.device_file().display(),
+                wg_config.display()
+            );
+            std::process::exit(0);
+        }
         Err(e) => {
             eprintln!("anago: {e}");
             std::process::exit(EXIT_FAILED);

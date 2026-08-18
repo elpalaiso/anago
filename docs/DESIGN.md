@@ -236,7 +236,8 @@ anago server run                   # 서버 상주 프로세스: 컨트롤 API +
                                    # 대신 설치·기동하므로 손으로 칠 일은
                                    # `--no-systemd`로 포그라운드 실행할 때뿐이다
 anago code                         # 서버에서: 조인 코드 발급
-anago join <domain> <code> [--name 맥북]
+anago join <domain> <code> [--name 맥북] [--api-port 443]
+                                   # 서버가 --api-port로 초기화됐으면 같은 값을 준다
 anago ls                           # 기기 목록 (기기에선 API, 서버에선 상태 파일)
 anago rm <이름>                    # 기기 제거 (서버 반영)
 ```
@@ -320,7 +321,7 @@ M3에서는 호스트명이 된다. 그래서 규칙을 여기서 못박는다.
   - 서버 쪽 경로에는 이런 재정의가 없다. `/var/lib/anago/`는 systemd
     유닛이 가리키는 고정 위치이고 root 소유다.
 
-### 9.1 M0 상태 파일 스키마
+### 9.1 M0 상태 파일 스키마 (서버)
 
 `version`은 1로 고정한다. **읽을 때 `version`이 1이 아니면 에러로
 중단**(구버전 바이너리가 신버전 상태를 덮어쓰는 사고 방지), 모르는
@@ -384,6 +385,30 @@ M0에는 `endpoint`·`last_handshake` 필드가 **없다**. 허브-스포크에�
 `wg show`에서 읽는다), 기기 관측 엔드포인트 보고는 M2의
 `/api/v1/endpoint`가 생길 때 스키마와 함께 들어온다. 그때
 `version`을 올린다.
+
+### 9.2 기기 파일 스키마 (클라, M0)
+
+`~/.config/anago/device.json`(§9의 경로 규칙). 0600.
+
+```json
+{
+  "version": 1,
+  "domain": "net.example.com",
+  "name": "macbook",
+  "address": "10.100.0.2",
+  "subnet": "10.100.0.0/24",
+  "token": "<64 hex>",
+  "server_public_key": "<wg base64>",
+  "server_endpoint": "net.example.com:51820",
+  "server_address": "10.100.0.1"
+}
+```
+
+join 응답(§8)을 그대로 담는다 — 기기가 나중에 `ls`/`rm`을 하려면 토큰과
+도메인이, wg 설정을 다시 만들려면 나머지가 필요하기 때문이다. **wg
+개인키는 여기 없다**: `/etc/wireguard/anago.conf`에만 있고 서버로도
+가지 않는다(§6.2). `name`은 서버가 정규화해 돌려준 이름이라 `anago rm`
+이 그대로 쓸 수 있다.
 
 ## 10. 기술 스택
 

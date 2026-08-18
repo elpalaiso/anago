@@ -59,6 +59,9 @@ pub struct Join {
     pub code: JoinCode,
     /// `None` means the client fills in this machine's hostname.
     pub name: Option<DeviceName>,
+    /// Control-API port. Must match the hub's `--api-port`, which is
+    /// why it is a flag and not a guess.
+    pub api_port: u16,
 }
 
 /// `anago rm <name>`.
@@ -196,7 +199,11 @@ fn server_init(argv: &[String]) -> Result<Command, CliError> {
 }
 
 fn join(argv: &[String]) -> Result<Command, CliError> {
-    let spec = [Flag::value("name"), Flag::value("export")];
+    let spec = [
+        Flag::value("name"),
+        Flag::value("api-port"),
+        Flag::value("export"),
+    ];
     let parsed = ParsedArgs::parse(argv, &spec)?;
 
     if parsed.is_set("export") {
@@ -223,8 +230,10 @@ fn join(argv: &[String]) -> Result<Command, CliError> {
         None => None,
     };
 
+    let api_port = port(&parsed, "api-port", DEFAULT_API_PORT)?;
     Ok(Command::Join(Join {
         domain: domain(host)?,
+        api_port,
         code: JoinCode::parse(code).map_err(|e| CliError::BadArgument {
             what: "join code",
             message: e.to_string(),
@@ -402,11 +411,14 @@ M0 takes an existing certificate; ACME and Cloudflare DNS arrive in M1.
         ),
         Some("join") => format!(
             "\
-usage: anago join <domain> <code> [--name <name>]
+usage: anago join <domain> <code> [--name <name>] [--api-port <port>]
 
 Registers this device with the hub at <domain>. The wg keypair is made
 here and the private key never leaves — the server sees the public half
 only. Without --name the machine's hostname is used.
+
+--api-port has to match the hub's; pass it when the server was set up
+with a non-default one.
 
 Join codes are single use and expire; ask the server for another with
 `anago code`. Format: {code}
@@ -608,6 +620,7 @@ mod tests {
                 // Normalized on the way in, so the server sees one form.
                 code: JoinCode::parse("7QX4-M2KD").unwrap(),
                 name: None,
+                api_port: DEFAULT_API_PORT,
             })
         );
 
@@ -618,8 +631,26 @@ mod tests {
                 domain: "net.example.com".to_string(),
                 code: JoinCode::parse("7QX4-M2KD").unwrap(),
                 name: Some(DeviceName::parse("맥북").unwrap()),
+                api_port: DEFAULT_API_PORT,
             })
         );
+    }
+
+    #[test]
+    fn join_can_reach_a_hub_on_a_non_default_port() {
+        // `server init --api-port 8443` is a supported setup, so the
+        // device has to be able to say the same number.
+        match parse_args(&["join", "net.example.com", "7QX4-M2KD", "--api-port", "8443"]).unwrap() {
+            Command::Join(join) => assert_eq!(join.api_port, 8443),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            parse_args(&["join", "net.example.com", "7QX4-M2KD", "--api-port", "0"]),
+            Err(CliError::BadValue {
+                flag: "api-port",
+                ..
+            })
+        ));
     }
 
     #[test]

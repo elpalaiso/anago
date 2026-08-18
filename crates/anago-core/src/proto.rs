@@ -254,11 +254,14 @@ impl fmt::Display for DecodeError {
 
 impl std::error::Error for DecodeError {}
 
-pub(crate) fn object(value: &Value) -> Result<&Object, DecodeError> {
+/// Decode helpers shared by everything that reads anago's JSON — the
+/// state file, the device file, the API — so one vocabulary of errors
+/// covers all of them.
+pub fn object(value: &Value) -> Result<&Object, DecodeError> {
     value.as_object().ok_or_else(|| DecodeError::wrong_type(""))
 }
 
-pub(crate) fn string_field(obj: &Object, name: &str) -> Result<String, DecodeError> {
+pub fn string_field(obj: &Object, name: &str) -> Result<String, DecodeError> {
     match obj.get(name) {
         None => Err(DecodeError::missing(name)),
         Some(found) => found
