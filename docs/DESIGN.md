@@ -146,8 +146,9 @@ timer는 편의이지 정합성 요건이 아니다 — 이 성질 덕에 클라
   발급되는 기기 토큰(bearer)으로. 토큰은 기기 로컬 저장(0600), 서버에는
   해시만 — 상세는 §7.1.
 - **Cloudflare 토큰**: DNS 편집 권한만 가진 스코프 토큰을 요구하도록
-  문서화. 서버에 저장 시 0600, `server init` 완료 후엔 인증서 갱신
-  (DNS-01일 때)에만 사용.
+  문서화. `server init` 완료 후엔 인증서 갱신(DNS-01일 때)에만 쓰므로,
+  **그때만** 상태 파일이 아닌 별도 파일(0600)에 남긴다 — 저장 위치와
+  이유는 §9.1.
 
 ### 7.1 기기 토큰 — M0 확정: 해시 저장
 
@@ -305,9 +306,13 @@ M3에서는 호스트명이 된다. 그래서 규칙을 여기서 못박는다.
 
 - 상태: `/var/lib/anago/state.json` — 단일 파일, 원자적 쓰기
   (tmp+rename), 0600, 동시 쓰기는 flock으로 직렬화. DB 없음.
-- 인증서: M0는 `--tls-cert/--tls-key`로 받은 **기존 인증서 경로를
-  상태에 기록만** 한다(파일은 복사하지 않는다). M1의 ACME 발급물은
-  `/var/lib/anago/tls/`(계정·인증서·키).
+- 인증서: 상태는 **경로만 기록한다 — 사람이 준 인증서 파일을 복사하지
+  않는다.** M1의 ACME 발급물만 anago가 소유하며 `/var/lib/anago/tls/`
+  (`account.key`·`fullchain.pem`·`privkey.pem`, 디렉터리 0700, 파일
+  0600)에 둔다. 둘을 가르는 것은 `tls.source` 하나다 — §9.1.
+- Cloudflare 토큰: **상태 파일에 넣지 않는다.** DNS-01로 갱신해야 해서
+  나중에도 필요할 때만 `/var/lib/anago/cf-token`(0600)에 따로 두고,
+  상태에는 그 경로만 적는다 — §9.1.
 - 클라: `~/.config/anago/device.json`(도메인·기기 토큰·할당 IP·서버
   공개키), 0600. wg 개인키는 여기 두지 않는다 — wg 설정
   `/etc/wireguard/anago.conf`(wg-quick 규약 위임)에만 있고 기기를
@@ -335,22 +340,46 @@ M3에서는 호스트명이 된다. 그래서 규칙을 여기서 못박는다.
   - 서버 쪽 경로에는 이런 재정의가 없다. `/var/lib/anago/`는 systemd
     유닛이 가리키는 고정 위치이고 root 소유다.
 
-### 9.1 M0 상태 파일 스키마 (서버)
+### 9.1 서버 상태 파일 스키마
 
-`version`은 1로 고정한다. **읽을 때 `version`이 1이 아니면 에러로
-중단**(구버전 바이너리가 신버전 상태를 덮어쓰는 사고 방지), 모르는
-필드는 무시한다. 시각은 전부 **Unix epoch 초(정수)** — 미니 JSON에
-날짜 파싱을 들이지 않기 위해서다.
+`version`은 **M1에서 2로 올린다**(M0가 쓴 파일은 1). 읽을 때 규칙은
+셋이다:
+
+- `2`: 그대로 읽는다.
+- `1`: **인메모리로 승격해 읽는다** — 손실 없는 변환이다(아래 "v1 → v2").
+- 그 밖(0, 3 이상, 없음, 정수가 아님): **에러로 중단**한다. 구버전
+  바이너리가 신버전 상태를 덮어쓰는 사고를 막는 M0의 규칙 그대로다.
+
+모르는 필드는 무시한다. 시각은 전부 **Unix epoch 초(정수)** — 미니
+JSON에 날짜 파싱을 들이지 않기 위해서다.
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "domain": "net.example.com",
   "subnet": "10.100.0.0/24",
   "listen_port": 51820,
   "api_port": 443,
-  "tls_cert_path": "/etc/ssl/anago/fullchain.pem",
-  "tls_key_path": "/etc/ssl/anago/privkey.pem",
+  "tls": {
+    "source": "acme",
+    "cert_path": "/var/lib/anago/tls/fullchain.pem",
+    "key_path": "/var/lib/anago/tls/privkey.pem",
+    "not_after": 1763276000,
+    "acme": {
+      "directory": "https://acme-v02.api.letsencrypt.org/directory",
+      "contact": "jo@example.com",
+      "account_key_path": "/var/lib/anago/tls/account.key",
+      "account_url": "https://acme-v02.api.letsencrypt.org/acme/acct/1234",
+      "challenge": "http-01",
+      "issued_at": 1755500000,
+      "renew_after": 1760684000
+    }
+  },
+  "cloudflare": {
+    "zone_id": "023e105f4ecef8ad9ca31a8372d0c353",
+    "record_id": "372e67954025e0ba6aaa6d586b9e0b59",
+    "token_path": "/var/lib/anago/cf-token"
+  },
   "server": {
     "private_key": "<wg base64>",
     "public_key": "<wg base64>",
@@ -379,12 +408,26 @@ M3에서는 호스트명이 된다. 그래서 규칙을 여기서 못박는다.
 
 | 필드 | 타입 | 의미 |
 |---|---|---|
-| `version` | 정수 | 스키마 버전. M0 = 1. 불일치는 에러 |
+| `version` | 정수 | 스키마 버전. M0 = 1, M1 = 2. 1은 승격해 읽고, 그 밖은 에러 |
 | `domain` | 문자열 | `server init --domain` 값. 클라 엔드포인트 조립에 사용 |
-| `subnet` | 문자열 | CIDR. M0는 /24만 허용 |
+| `subnet` | 문자열 | CIDR. /24만 허용한다 |
 | `listen_port` | 정수 | wg UDP 포트(기본 51820) |
 | `api_port` | 정수 | 컨트롤 API TCP 포트(기본 443) |
-| `tls_cert_path` / `tls_key_path` | 문자열 | M0에서 지정받은 인증서·키 경로 |
+| `tls.source` | 문자열 | `"manual"`(사람이 준 인증서) 또는 `"acme"`(anago가 발급·갱신) |
+| `tls.cert_path` / `tls.key_path` | 문자열 | 인증서·키 경로. **`source`와 무관하게 항상 채워진다** |
+| `tls.not_after` | 정수 \| null | **인증서에 적힌 실제 만료 시각**(epoch 초). 읽지 못했으면 `null` — 아래 |
+| `tls.acme` | 객체 \| null | `source`가 `"acme"`일 때만. 아니면 `null` |
+| `tls.acme.directory` | 문자열 | ACME 디렉터리 URL. staging과 production을 가르는 것이 이 값이다 |
+| `tls.acme.contact` | 문자열 \| null | `--acme-email`. 계정을 다시 만들 때만 쓴다 |
+| `tls.acme.account_key_path` | 문자열 | ACME 계정 키 경로(0600). 갱신에 필요하다 |
+| `tls.acme.account_url` | 문자열 | 등록된 계정 URL. 있으면 재등록하지 않는다 |
+| `tls.acme.challenge` | 문자열 | `"http-01"` 또는 `"dns-01"`. 갱신도 같은 방식으로 한다 |
+| `tls.acme.issued_at` | 정수 | 인증서를 받은 시각 |
+| `tls.acme.renew_after` | 정수 | **이 시각이 지나면 갱신한다.** 만료(`tls.not_after`)가 아니라 정책이다 — 아래 |
+| `cloudflare` | 객체 \| null | Cloudflare 토큰으로 DNS를 만진 적이 있으면. 아니면 `null` |
+| `cloudflare.zone_id` | 문자열 | 도메인 → zone 조회 결과 캐시 |
+| `cloudflare.record_id` | 문자열 \| null | anago가 만든 A 레코드의 id 캐시. 아직 없거나 무효화됐으면 `null` — 아래 |
+| `cloudflare.token_path` | 문자열 \| null | DNS-01일 때만 토큰 파일 경로. 아니면 `null` |
 | `server.private_key` / `public_key` | 문자열 | 서버 wg 키쌍(`wg genkey`/`wg pubkey` 산출물, base64) |
 | `server.address` | 문자열 | 서버 사설 IP = 서브넷의 .1 |
 | `peers[]` | 배열 | 등록 기기. 이름은 유일(§8 `rm`의 키) |
@@ -394,11 +437,156 @@ M3에서는 호스트명이 된다. 그래서 규칙을 여기서 못박는다.
 | `codes[]` | 배열 | 발급된 조인 코드. 소진·만료된 항목도 감사 목적으로 남긴다 |
 | `codes[].used_at` | 정수 \| null | 소진 시각. null이면 미사용 |
 
-M0에는 `endpoint`·`last_handshake` 필드가 **없다**. 허브-스포크에서
+**없는 것은 키를 빼지 않고 `null`을 쓴다.** `tls.acme`도
+`cloudflare`도 마찬가지다. 출력이 결정적이어야 하고(§10.1), "없다"가
+"이 바이너리는 그 필드를 모른다"와 구별되는 편이 낫다.
+
+#### TLS 출처: `manual`과 `acme`
+
+M0의 평평한 `tls_cert_path`/`tls_key_path`를 `tls` 객체로 바꾼다.
+**`cert_path`와 `key_path`는 두 경우 모두 채워진다** — TLS를 로드하는
+코드는 `source`를 보지 않고, rustls에 먹일 파일 두 개를 그냥 읽는다.
+`source`가 가르는 것은 단 하나, **누가 그 파일을 갱신하는가**다.
+
+- `"manual"`: 사람이 `--tls-cert/--tls-key`로 준 경로. anago는 읽기만
+  하고 절대 쓰지 않는다. 갱신도 하지 않는다 — certbot이든 무엇이든
+  그 파일을 관리하는 쪽이 따로 있다는 뜻이다. M0의 경로가 그대로
+  살아 있는 자리이고, M1에서도 1급 시민이다(§11).
+- `"acme"`: anago가 발급했고 anago가 갱신한다. 경로는
+  `/var/lib/anago/tls/` 아래로 고정된다.
+
+M0가 쓰던 수동 경로는 이렇게 남는다 — 위 예시와 같은 파일의 다른 모습
+이다:
+
+```json
+  "tls": {
+    "source": "manual",
+    "cert_path": "/etc/ssl/anago/fullchain.pem",
+    "key_path": "/etc/ssl/anago/privkey.pem",
+    "not_after": 1763276000,
+    "acme": null
+  },
+```
+
+이 구분이 상태에 남아야 하는 이유는 갱신 루프 때문이다. 파일만 보면
+둘을 구별할 수 없고, 남의 인증서를 anago가 덮어쓰는 것은 되돌릴 수
+없는 사고다.
+
+#### v1 → v2 승격
+
+M0 파일에는 `tls_cert_path`/`tls_key_path`가 있고 ACME도 Cloudflare도
+없다. 그 상태의 v2 의미는 정확히 하나뿐이라 변환이 전면적이다:
+
+```
+tls_cert_path, tls_key_path
+  → tls = { source: "manual", cert_path, key_path,
+            not_after: null, acme: null }
+cloudflare = null
+```
+
+`not_after`가 `null`인 것은 승격이 **파일을 읽는 일만** 하기 때문이다 —
+인증서를 열어 만료를 뜯어보는 것은 승격의 일이 아니고, 다음에 TLS를
+로드할 때 채워진다. 그 밖에는 추측이 들어가는 자리가 없으므로 사람에게
+묻지 않고 조용히 승격한다.
+다만 **읽는 김에 파일을 고쳐 쓰지는 않는다** — `anago ls`가 상태
+파일을 건드리는 것은 놀라운 일이다. 상태를 바꾸는 명령(`code`, join,
+`rm`, 인증서 발급)이 저장할 때 자연히 v2로 기록된다.
+
+**다운그레이드는 막힌다.** v2 파일을 M0 바이너리가 열면 위 규칙대로
+에러로 멈춘다. 이건 부작용이 아니라 `version`을 둔 목적 그 자체다 —
+ACME 정보를 모르는 바이너리가 그 필드를 지운 채 덮어쓰는 것, 그게
+막으려던 사고다.
+
+#### 인증서 시각: `not_after`는 사실, `renew_after`는 정책
+
+**두 값을 따로 적는다.** 하나로 합치지 않는 이유는 정하는 주체가 다르기
+때문이다.
+
+- **`tls.not_after`** — 인증서에 적힌 실제 만료 시각. CA가 정하고
+  우리는 읽기만 한다. `"manual"` 인증서에도 채운다(anago가 갱신하지는
+  않지만 만료일은 보여 줄 수 있어야 한다).
+- **`tls.acme.renew_after`** — 이 시각이 지나면 갱신을 시도한다.
+  우리가 정하고, 사람이 파일을 열어 앞당길 수도 있다. 발급하는 순간
+  `issued_at + 60일`로 계산해 적는다.
+
+기본 갱신 판정은 `now >= renew_after` 한 줄이고, 코어의 순수 함수라
+경계값까지 테스트된다. **`not_after`는 그 판정의 안전망**이다: 가정한
+수명보다 짧은 인증서를 받아 `renew_after`가 `not_after`를 넘어서 있으면
+그 자체가 잘못된 상태이므로, 판정 함수는 `min(renew_after, not_after -
+여유)`로 시점을 앞당기고 그 사실을 로그와 `server status`(M3)가 말한다.
+이 안전망이 §10.2에서 x509 파서를 끄면서 남겨 둔 구멍 — "LE가 단기
+인증서로 바뀌면 60일 규칙이 늦는다" — 을 스키마 차원에서 막는다.
+
+**`not_after`는 어디서 오는가.** §10.2대로 `x509-parser`는 켜지 않는다
+(그건 ARI용이고 ASN.1 파서 계열을 십수 개 끌고 온다). 대신 **바이너리가
+이미 있는 `rustls-pemfile`로 PEM을 DER로 풀고, 코어의 순수 함수가 그
+DER에서 `notAfter` 한 필드만 읽는다.** 경로는 고정돼 있다:
+`Certificate` → `TBSCertificate` → `Validity` → 두 번째 `Time`.
+UTCTime과 GeneralizedTime 둘 다 받아 epoch 초로 바꾼다. 체인 파일이면
+첫 인증서(엔드 엔티티)를 본다.
+
+이것이 §10.2가 QR 인코더를 코어에서 거절한 것과 어긋나지 않는 이유는
+성격이 다르기 때문이다. QR 인코더는 리드-솔로몬·마스킹까지 갖춘 **범용
+라이브러리**를 코어에 들이는 일이고, 이쪽은 이미 손에 쥔 바이트에서
+**필드 하나를 꺼내는 읽기**다. 무엇보다 **신뢰 판정에 쓰이지 않는다** —
+인증서 검증은 rustls가 하고(§7), 이 값은 갱신 일정과 표시에만 쓴다.
+그래서 실패해도 안전하다: **읽지 못하면 `not_after`는 `null`이고**,
+갱신은 `renew_after`만으로 그대로 돈다. 파싱 버그가 낼 수 있는 최악은
+"만료일을 표시하지 못한다"이지 "붙지 못한다"가 아니다.
+
+`renew_after`를 굳이 따로 저장하는 이유도 같은 결이다. 규칙은 언젠가
+바뀐다 — LE가 단기 프로파일을 기본으로 돌리거나 ARI(RFC 9773)를 켜면,
+그때 바뀌는 것은 `renew_after`를 **계산하는 코드**뿐이고 스키마도 이미
+발급된 허브의 예정 시각도 흔들리지 않는다.
+
+#### Cloudflare 캐시: `zone_id`와 `record_id`
+
+`zone_id`(도메인이 사는 zone)와 `record_id`(anago가 만든 A 레코드)를
+캐시한다. 캐시는 조용히 낡을 수 있으므로 규칙을 못박는다.
+
+- **생성**: zone은 도메인에서 찾은 직후 `zone_id`에, A 레코드는 만들거나
+  고친 직후 응답이 준 id를 `record_id`에 적는다.
+- **조회**: 캐시가 있어도 **upsert 전 레코드 목록 조회를 건너뛰지
+  않는다.** 프록시(주황 구름)가 켜졌는지 봐야 하고(§13) 값이 이미
+  맞는지도 봐야 한다. 그러니까 `record_id`가 하는 일은 왕복을 줄이는 게
+  아니라 **어느 레코드가 우리 것인지 지목하는 것**이다 — 같은 이름에 A
+  레코드를 여럿 둘 수 있으므로(라운드로빈), 캐시가 없으면 우리가 만들지
+  않은 레코드를 골라 고칠 위험이 있다. 반면 `zone_id`는 진짜로 왕복을
+  줄인다: DNS-01 갱신은 TXT를 만들기만 하면 되고 zone 목록을 볼 이유가
+  없다.
+- **무효화**: 목록에 캐시된 `record_id`가 없으면(사람이 대시보드에서
+  지웠다) 캐시를 `null`로 만들고 새로 만든 뒤 새 id를 적는다.
+  `zone_id`가 바뀌면 — 도메인을 다른 zone으로 옮겼다 — `record_id`도
+  함께 무효화한다. 다른 zone의 레코드 id는 의미가 없다.
+- **거부는 무효화가 아니다**: 캐시가 가리키는 레코드가 프록시 켜짐이거나
+  A가 아니면 **멈추고 사람에게 알리되 캐시는 유지한다**(§13). 사람이
+  고쳐야 하는 상태이지 anago가 지우고 새로 만들 상태가 아니다.
+
+**DNS-01의 TXT 레코드 id는 캐시하지 않는다.** 챌린지마다 만들고 검증
+직후 지우는, 수명이 분 단위인 레코드다. 상태에 남기면 정리에 실패했을
+때 다음 실행이 지워야 할 유령을 물려받는다 — 이름
+(`_acme-challenge.<domain>`)으로 조회해 지우는 쪽이 언제나 옳다.
+
+#### Cloudflare 토큰은 상태 파일에 없다
+
+토큰은 **DNS-01로 갱신해야 할 때만** `/var/lib/anago/cf-token`(0600)에
+남기고, 상태에는 `cloudflare.token_path`만 적는다. A 레코드만 만들고
+HTTP-01로 발급했다면 토큰은 `server init`이 끝나는 순간 잊는다 —
+`token_path`는 `null`이 된다.
+
+§7.1의 논리를 그대로 적용한 것이다. 없앨 수 있는 비밀은 없앤다. 없앨
+수 없을 때도 **상태 파일과는 분리한다**: 상태 파일이 통째로 새는 경로
+(백업, 이슈에 붙인 덤프)가 서버 침해보다 흔하다는 것이 §7.1의 전제였고,
+그때 DNS 편집 권한을 가진 토큰이 같이 나가지 않는 편이 낫다. 분리하면
+토큰 회전도 상태 파일을 건드리지 않고 된다.
+
+#### 아직 없는 것
+
+`endpoint`·`last_handshake` 필드는 **M1에도 없다**. 허브-스포크에서
 기기 엔드포인트는 서버가 wg 커널에서 관측하는 값이고(`anago ls`는
 `wg show`에서 읽는다), 기기 관측 엔드포인트 보고는 M2의
 `/api/v1/endpoint`가 생길 때 스키마와 함께 들어온다. 그때
-`version`을 올린다.
+`version`을 3으로 올린다.
 
 ### 9.2 기기 파일 스키마 (클라, M0)
 
@@ -526,7 +714,10 @@ instant-acme = { version = "0.8", default-features = false,
 - **켜지 않는 것: `x509-parser`·`time`.** 둘은 ARI(RFC 9773)의 갱신
   창을 읽기 위한 것이고, 그 대가로 ASN.1 파서 계열이 십수 개 따라온다.
   M1의 갱신 시점은 ARI 없이 정한다 — 그 규칙(무엇을 상태에 적고 언제
-  갱신하는가)은 §9.1에서 확정한다.
+  갱신하는가)은 §9.1에서 확정한다. 인증서의 `notAfter`는 상태에 적지만
+  (§9.1의 `tls.not_after`) 그것 때문에 이 feature를 켜지는 않는다:
+  PEM→DER은 이미 있는 `rustls-pemfile`이 하고, DER에서 그 필드 하나를
+  읽는 것은 코어의 순수 함수다.
 - **비동기 경계**: instant-acme은 async다. ACME 작업은 언제나 tokio
   런타임 안에서 돈다 — `server run`은 이미 런타임이 있고, `server init`
   은 발급 구간에만 런타임을 잠깐 띄운다. HTTP-01 챌린지에 답할 :80
