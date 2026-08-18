@@ -1,0 +1,20 @@
+# Every push/PR: build + full test suite (unit + real-git integration).
+# The tests need git but no tmux server (tmux paths degrade gracefully).
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace
+      - run: cargo test --workspace

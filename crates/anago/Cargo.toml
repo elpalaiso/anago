@@ -1,0 +1,14 @@
+[package]
+name = "anago"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "anago"
+path = "src/main.rs"
+
+[dependencies]
+anago-core = { path = "../anago-core" }
+# tokio/axum/rustls/serde는 M0 서버 구현이 요구할 때 추가한다 (원칙 4).

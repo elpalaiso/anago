@@ -1,0 +1,9 @@
+# 순수 std 라이브러리 — 외부 크레이트 추가 금지 (DESIGN.md §4 원칙 4).
+[package]
+name = "anago-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
