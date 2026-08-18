@@ -35,6 +35,9 @@ pub const API_HOST: &str = "api.cloudflare.com";
 /// The endpoint that answers "is this token any good?".
 pub const VERIFY_PATH: &str = "/client/v4/user/tokens/verify";
 
+/// Where zones are listed.
+pub const ZONES_PATH: &str = "/client/v4/zones";
+
 /// The environment variable, spelled the way Cloudflare's own tools
 /// spell it — people already have it exported.
 pub const TOKEN_ENV: &str = "CLOUDFLARE_API_TOKEN";
@@ -344,6 +347,177 @@ pub fn verify(token: &Token) -> Result<Verified, CfError> {
     parse_verify(response.status, &response.body)
 }
 
+/// A Cloudflare zone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Zone {
+    pub id: String,
+    pub name: String,
+    /// `active` when Cloudflare is actually serving this zone's DNS.
+    pub status: String,
+}
+
+/// The names to ask about, most specific first (§6.1).
+///
+/// The hub's name is usually a subdomain — `net.example.com` — while
+/// the zone is `example.com`, so anago walks up one label at a time and
+/// stops at the first zone that exists. Going most-specific-first is
+/// what makes a delegated subzone win over its parent: if someone runs
+/// `net.example.com` as its own zone, that is the one their records
+/// belong in.
+///
+/// The walk stops at two labels. It does not know where the public
+/// suffix is — `example.co.uk` and `example.com` look alike from here —
+/// but it does not need to: a match happens before the walk reaches a
+/// suffix nobody can own.
+///
+/// **Every suffix is walked; the list is not truncated.** Cutting it
+/// short would cut the *general* end, and the registrable name at that
+/// end is the candidate most likely to be the answer — a bound meant as
+/// insurance would drop the zone it was insuring. The cost of walking a
+/// long name is a handful of extra requests on a path that was going to
+/// fail anyway, and DNS caps a name at 127 labels regardless.
+pub fn zone_candidates(domain: &str) -> Result<Vec<String>, CfError> {
+    let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    let labels: Vec<&str> = domain.split('.').collect();
+    if domain.is_empty() || labels.len() < 2 || labels.iter().any(|label| label.is_empty()) {
+        return Err(CfError::NotADomain(domain));
+    }
+
+    Ok((0..=labels.len() - 2)
+        .map(|start| labels[start..].join("."))
+        .collect())
+}
+
+/// The path for one candidate: an exact-name query.
+///
+/// Exact rather than listing every zone and matching locally, because
+/// a listing is paginated and a person with a page and a half of zones
+/// would silently get the wrong answer. Two round trips for the usual
+/// hub name is a fair price for not having that bug.
+pub fn zones_query(candidate: &str) -> String {
+    format!("{ZONES_PATH}?name={}", client::encode_segment(candidate))
+}
+
+/// Reads one `GET /zones?name=...` answer.
+pub fn parse_zones(status: u16, body: &str) -> Result<Vec<Zone>, CfError> {
+    let result = parse_result(status, body)?;
+    let items = result.as_array().ok_or_else(|| CfError::ApiFailure {
+        status,
+        message: "the zone list is not a list".to_string(),
+    })?;
+    items
+        .iter()
+        .map(|zone| {
+            Ok(Zone {
+                id: string_at(zone, "id", status)?,
+                name: string_at(zone, "name", status)?,
+                status: string_at(zone, "status", status)?,
+            })
+        })
+        .collect()
+}
+
+/// A field anago actually reads, and therefore one it will not invent.
+///
+/// Defaulting a missing `id` to an empty string would hand the next
+/// call a zone id of `""`; the failure would arrive later, somewhere
+/// else, wearing a reason that has nothing to do with the real problem.
+/// A response that does not have what it is documented to have is a
+/// malformed response, and saying so puts the run on the manual
+/// fallback path where it belongs.
+fn string_at(value: &serde_json::Value, key: &str, status: u16) -> Result<String, CfError> {
+    match value.get(key).and_then(serde_json::Value::as_str) {
+        Some(text) if !text.is_empty() => Ok(text.to_string()),
+        Some(_) => Err(CfError::ApiFailure {
+            status,
+            message: format!("a zone in the answer has an empty {key}"),
+        }),
+        None => Err(CfError::ApiFailure {
+            status,
+            message: format!("a zone in the answer has no usable {key}"),
+        }),
+    }
+}
+
+/// Turns one candidate's answer into a decision.
+///
+/// `Ok(None)` means "not this one, keep walking". The two refusals are
+/// states a person has to resolve:
+///
+/// - **more than one zone with the same name** — anago will not guess
+///   which account's zone was meant;
+/// - **a zone that is not active** — Cloudflare holds the records but
+///   is not answering for the name, so anago would write a record that
+///   changes nothing while reporting success. That is §13's worst shape
+///   of failure, and it belongs to the person who has to repoint the
+///   nameservers.
+pub fn pick(zones: Vec<Zone>, candidate: &str) -> Result<Option<Zone>, CfError> {
+    let mut matching: Vec<Zone> = zones
+        .into_iter()
+        .filter(|zone| zone.name.eq_ignore_ascii_case(candidate))
+        .collect();
+    if matching.len() > 1 {
+        return Err(CfError::ZoneAmbiguous {
+            name: candidate.to_string(),
+            count: matching.len(),
+        });
+    }
+    let Some(zone) = matching.pop() else {
+        return Ok(None);
+    };
+    if zone.status != "active" {
+        return Err(CfError::ZoneNotActive {
+            name: zone.name,
+            status: zone.status,
+        });
+    }
+    Ok(Some(zone))
+}
+
+/// Finds the zone a domain lives in.
+///
+/// **Human verification needed**: this call needs a real account.
+pub fn find_zone(token: &Token, domain: &str) -> Result<Zone, CfError> {
+    let candidates = zone_candidates(domain)?;
+    let authorization = token.header().map_err(CfError::Client)?;
+    for candidate in &candidates {
+        let response = client::send(&Request {
+            method: Method::Get,
+            host: API_HOST,
+            port: 443,
+            path: &zones_query(candidate),
+            body: None,
+            authorization: Some(&authorization),
+        })
+        .map_err(CfError::Client)?;
+        if let Some(zone) = pick(parse_zones(response.status, &response.body)?, candidate)? {
+            return Ok(zone);
+        }
+    }
+    Err(CfError::ZoneNotFound {
+        domain: domain.to_string(),
+        tried: candidates,
+    })
+}
+
+/// The line that explains why the manual DNS step is still there (§6.1).
+///
+/// Failing to reach Cloudflare is **not** a reason to stop setting up a
+/// hub: everything else — the certificate over HTTP-01, wg, the unit —
+/// works without it, and the record is a thing a person can add in a
+/// browser in ten seconds. So the automation steps aside and says why,
+/// and M0's instructions carry on underneath.
+///
+/// A DNS-01 challenge is the one place this does not apply: there, the
+/// token is not a convenience but the whole mechanism, and its caller
+/// treats the same error as fatal.
+pub fn fallback_notice(error: &CfError) -> String {
+    format!(
+        "Cloudflare could not set the DNS record: {error}\n\
+         Nothing else is affected — add the record below by hand and carry on.\n"
+    )
+}
+
 /// What can go wrong before anago has a usable token.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CfError {
@@ -366,6 +540,23 @@ pub enum CfError {
     ApiFailure {
         status: u16,
         message: String,
+    },
+    /// Not a name a zone could be found for.
+    NotADomain(String),
+    /// No zone at any of the names walked.
+    ZoneNotFound {
+        domain: String,
+        tried: Vec<String>,
+    },
+    /// The same zone name in more than one account the token can see.
+    ZoneAmbiguous {
+        name: String,
+        count: usize,
+    },
+    /// Cloudflare holds the zone but is not answering for it.
+    ZoneNotActive {
+        name: String,
+        status: String,
     },
     Undecodable(String),
     Client(ClientError),
@@ -431,6 +622,28 @@ impl fmt::Display for CfError {
             CfError::ApiFailure { status, message } => {
                 write!(f, "Cloudflare answered {status}: {message}")
             }
+            CfError::NotADomain(domain) => write!(
+                f,
+                "{domain:?} is not a domain a zone can be found for — it needs at least \
+                 a name and a suffix, like example.com"
+            ),
+            CfError::ZoneNotFound { domain, tried } => write!(
+                f,
+                "no Cloudflare zone holds {domain} (tried {}). Either the domain is not \
+                 on this Cloudflare account, or the token is scoped to a different zone",
+                tried.join(", ")
+            ),
+            CfError::ZoneAmbiguous { name, count } => write!(
+                f,
+                "{count} zones are named {name} on the accounts this token can see; \
+                 anago will not guess which one you meant. Scope the token to one zone"
+            ),
+            CfError::ZoneNotActive { name, status } => write!(
+                f,
+                "the zone {name} is {status:?}, not active — Cloudflare holds its records \
+                 but is not answering for the name, so a record added here would change \
+                 nothing. Point the domain's nameservers at Cloudflare first"
+            ),
             CfError::Undecodable(detail) => {
                 write!(f, "Cloudflare's answer could not be read: {detail}")
             }
@@ -853,6 +1066,294 @@ mod tests {
         let error = parse_verify(200, "<html>nope</html>").unwrap_err();
         assert!(matches!(error, CfError::Undecodable(_)));
         assert!(error.to_string().contains("could not be read"));
+    }
+
+    // ------------------------------------------------ zone lookup
+
+    /// One zone as `GET /zones?name=` returns it, trimmed to the parts
+    /// anago reads plus a couple it does not.
+    fn zone_body(name: &str, status: &str) -> String {
+        format!(
+            r#"{{
+              "success": true,
+              "errors": [],
+              "messages": [],
+              "result_info": {{ "page": 1, "per_page": 20, "count": 1, "total_count": 1 }},
+              "result": [{{
+                "id": "023e105f4ecef8ad9ca31a8372d0c353",
+                "name": "{name}",
+                "status": "{status}",
+                "paused": false,
+                "development_mode": 7200,
+                "name_servers": ["tim.ns.cloudflare.com", "walt.ns.cloudflare.com"],
+                "meta": {{ "step": 4, "custom_certificate_quota": 0 }}
+              }}]
+            }}"#
+        )
+    }
+
+    const NO_ZONES: &str = r#"{
+      "success": true,
+      "errors": [],
+      "messages": [],
+      "result_info": { "page": 1, "per_page": 20, "count": 0, "total_count": 0 },
+      "result": []
+    }"#;
+
+    #[test]
+    fn a_subdomain_walks_up_to_its_zone() {
+        // The usual hub name: the zone is the registered domain and the
+        // hub is a label under it.
+        assert_eq!(
+            zone_candidates("net.example.com").unwrap(),
+            ["net.example.com", "example.com"]
+        );
+    }
+
+    #[test]
+    fn the_most_specific_name_is_tried_first() {
+        // Someone who runs `net.example.com` as a delegated zone of its
+        // own should get that zone, not its parent.
+        let candidates = zone_candidates("a.b.net.example.com").unwrap();
+        assert_eq!(candidates.first().unwrap(), "a.b.net.example.com");
+        assert_eq!(candidates.last().unwrap(), "example.com");
+    }
+
+    #[test]
+    fn the_walk_stops_before_a_suffix_nobody_owns() {
+        assert_eq!(zone_candidates("example.com").unwrap(), ["example.com"]);
+        // A multi-part suffix needs no special knowledge: the match
+        // happens at example.co.uk, before co.uk is ever reached.
+        assert_eq!(
+            zone_candidates("net.example.co.uk").unwrap(),
+            ["net.example.co.uk", "example.co.uk", "co.uk"]
+        );
+    }
+
+    #[test]
+    fn a_deep_name_still_reaches_its_registrable_zone() {
+        // The whole point of walking: the answer is almost always at
+        // the *general* end, so the list may not be cut short there.
+        let deep = "a.b.c.d.e.f.example.com";
+        let candidates = zone_candidates(deep).unwrap();
+        assert_eq!(candidates.first().unwrap(), deep);
+        assert_eq!(
+            candidates.last().unwrap(),
+            "example.com",
+            "truncating the walk would drop the zone it was meant to find"
+        );
+        assert_eq!(candidates.len(), 7);
+        // Every step is one label shorter than the last, in order.
+        for pair in candidates.windows(2) {
+            assert_eq!(
+                pair[1],
+                pair[0].split_once('.').unwrap().1,
+                "{candidates:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_that_cannot_hold_a_zone_is_refused() {
+        for bad in ["", "localhost", ".", "example.", ".com", "a..com", "   "] {
+            assert!(
+                matches!(zone_candidates(bad), Err(CfError::NotADomain(_))),
+                "{bad:?} should be refused"
+            );
+        }
+        assert!(CfError::NotADomain("localhost".to_string())
+            .to_string()
+            .contains("like example.com"));
+    }
+
+    #[test]
+    fn a_trailing_dot_and_upper_case_are_the_same_name() {
+        assert_eq!(
+            zone_candidates("NET.Example.COM.").unwrap(),
+            zone_candidates("net.example.com").unwrap()
+        );
+    }
+
+    #[test]
+    fn the_query_asks_for_one_exact_name() {
+        // Exact rather than listing every zone: a listing is paginated,
+        // and a person with more than a page of zones would silently
+        // get the wrong answer.
+        assert_eq!(
+            zones_query("example.com"),
+            "/client/v4/zones?name=example.com"
+        );
+        // A name is percent-encoded on the way into the query.
+        assert_eq!(
+            zones_query("맥북.example.com"),
+            "/client/v4/zones?name=%EB%A7%A5%EB%B6%81.example.com"
+        );
+    }
+
+    #[test]
+    fn a_zone_is_read_out_of_the_documented_shape() {
+        let zones = parse_zones(200, &zone_body("example.com", "active")).unwrap();
+        assert_eq!(
+            zones,
+            [Zone {
+                id: "023e105f4ecef8ad9ca31a8372d0c353".to_string(),
+                name: "example.com".to_string(),
+                status: "active".to_string(),
+            }]
+        );
+        // And the fields around it — nameservers, meta, result_info —
+        // are none of anago's business.
+        assert_eq!(pick(zones, "example.com").unwrap().unwrap().id.len(), 32);
+    }
+
+    #[test]
+    fn an_empty_answer_means_keep_walking() {
+        let zones = parse_zones(200, NO_ZONES).unwrap();
+        assert!(zones.is_empty());
+        assert_eq!(pick(zones, "net.example.com").unwrap(), None);
+    }
+
+    #[test]
+    fn a_zone_that_is_not_active_is_refused_rather_than_written_into() {
+        // §13's worst shape: Cloudflare holds the records, nothing is
+        // answering for the name, and the record we add changes nothing
+        // while the run reports success.
+        let zones = parse_zones(200, &zone_body("example.com", "pending")).unwrap();
+        let error = pick(zones, "example.com").unwrap_err();
+        assert_eq!(
+            error,
+            CfError::ZoneNotActive {
+                name: "example.com".to_string(),
+                status: "pending".to_string(),
+            }
+        );
+        let message = error.to_string();
+        assert!(message.contains("would change nothing"), "{message}");
+        assert!(message.contains("nameservers"), "{message}");
+    }
+
+    #[test]
+    fn two_zones_with_one_name_are_not_guessed_between() {
+        let zones = vec![
+            Zone {
+                id: "z1".to_string(),
+                name: "example.com".to_string(),
+                status: "active".to_string(),
+            },
+            Zone {
+                id: "z2".to_string(),
+                name: "example.com".to_string(),
+                status: "active".to_string(),
+            },
+        ];
+        let error = pick(zones, "example.com").unwrap_err();
+        assert_eq!(
+            error,
+            CfError::ZoneAmbiguous {
+                name: "example.com".to_string(),
+                count: 2
+            }
+        );
+        assert!(error.to_string().contains("Scope the token to one zone"));
+    }
+
+    #[test]
+    fn a_zone_with_a_different_name_is_not_this_candidate() {
+        // Cloudflare answers an exact-name query, but a filter that
+        // ever loosens must not quietly adopt a neighbour's zone.
+        let zones = parse_zones(200, &zone_body("other.com", "active")).unwrap();
+        assert_eq!(pick(zones, "example.com").unwrap(), None);
+    }
+
+    #[test]
+    fn a_403_during_the_zone_walk_names_the_missing_permission() {
+        // The read-only-token case surfaces here first, because the
+        // lookup happens before any record is written.
+        let body = r#"{"success":false,"errors":[{"code":9109,"message":"Unauthorized"}]}"#;
+        let error = parse_zones(403, body).unwrap_err();
+        assert!(matches!(error, CfError::Forbidden(_)));
+        assert!(error.to_string().contains("Zone → Zone → Read"), "{error}");
+    }
+
+    #[test]
+    fn a_zone_missing_a_field_anago_reads_is_malformed_not_blank() {
+        // An id of "" would be handed to the next call, and the failure
+        // would arrive later wearing a reason unrelated to the real
+        // problem. Saying so here puts the run on the manual fallback.
+        let no_id = r#"{"success":true,"errors":[],"result":[
+          {"name":"example.com","status":"active"}
+        ]}"#;
+        let error = parse_zones(200, no_id).unwrap_err();
+        assert_eq!(
+            error,
+            CfError::ApiFailure {
+                status: 200,
+                message: "a zone in the answer has no usable id".to_string()
+            }
+        );
+
+        let no_status = r#"{"success":true,"errors":[],"result":[
+          {"id":"z1","name":"example.com"}
+        ]}"#;
+        assert!(parse_zones(200, no_status)
+            .unwrap_err()
+            .to_string()
+            .contains("no usable status"));
+    }
+
+    #[test]
+    fn a_field_of_the_wrong_type_or_empty_is_refused_too() {
+        // A number where a string belongs, and an empty string, are the
+        // same problem as an absent field: nothing usable.
+        let numeric = r#"{"success":true,"errors":[],"result":[
+          {"id":42,"name":"example.com","status":"active"}
+        ]}"#;
+        assert!(parse_zones(200, numeric)
+            .unwrap_err()
+            .to_string()
+            .contains("no usable id"));
+
+        let blank = r#"{"success":true,"errors":[],"result":[
+          {"id":"z1","name":"","status":"active"}
+        ]}"#;
+        assert!(parse_zones(200, blank)
+            .unwrap_err()
+            .to_string()
+            .contains("empty name"));
+    }
+
+    #[test]
+    fn a_result_that_is_not_a_list_is_reported_not_ignored() {
+        let body = r#"{"success":true,"errors":[],"result":{"id":"z1"}}"#;
+        assert!(matches!(
+            parse_zones(200, body),
+            Err(CfError::ApiFailure { .. })
+        ));
+    }
+
+    // -------------------------------------------- manual fallback
+
+    #[test]
+    fn a_failed_lookup_says_what_to_do_by_hand() {
+        // Failing to reach Cloudflare is not a reason to stop setting
+        // up a hub: the record is ten seconds of browser work, and
+        // everything else is unaffected (§6.1).
+        let notice = fallback_notice(&CfError::ZoneNotFound {
+            domain: "net.example.com".to_string(),
+            tried: vec!["net.example.com".to_string(), "example.com".to_string()],
+        });
+        assert!(notice.contains("could not set the DNS record"), "{notice}");
+        assert!(notice.contains("Nothing else is affected"), "{notice}");
+        assert!(notice.contains("by hand"), "{notice}");
+        // The reason travels with it, so the person can fix the token
+        // rather than wonder why the automation went quiet.
+        assert!(notice.contains("scoped to a different zone"), "{notice}");
+    }
+
+    #[test]
+    fn the_fallback_notice_never_carries_the_token() {
+        let notice = fallback_notice(&CfError::Rejected("Invalid API Token".to_string()));
+        assert!(!notice.contains("cf-api-token"), "{notice}");
     }
 
     #[test]
