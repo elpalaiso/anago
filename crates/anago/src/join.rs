@@ -345,8 +345,8 @@ pub fn run(
         host: domain,
         port: api_port,
         path: PATH_JOIN,
-        body: Some(&body),
-        token: None,
+        body: Some(client::Body::json(&body)),
+        authorization: None,
     })
     .map_err(JoinError::Client)?;
 
@@ -652,7 +652,7 @@ fn undo_registration(
         port: api_port,
         path: &path,
         body: None,
-        token: Some(token),
+        authorization: Some(&client::HeaderValue::device_token(token)),
     })
     .map_err(JoinError::Client)?;
     if response.is_success() {

@@ -184,7 +184,7 @@ fn ask_hub(
         port: config.api_port(),
         path: PATH_PEERS,
         body: None,
-        token: Some(&token),
+        authorization: Some(&client::HeaderValue::device_token(&token)),
     })
     .map_err(LsError::Client)?;
 

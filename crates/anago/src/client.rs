@@ -1,9 +1,16 @@
-//! The device's HTTPS client (DESIGN.md §8).
+//! anago's HTTPS client (DESIGN.md §8, §10.2).
 //!
-//! Small on purpose: three requests, one connection each, no async.
-//! `join`, `ls`, and `rm` each make a single call and exit, so a
-//! blocking TLS stream over `std::net::TcpStream` is the whole
-//! requirement — and it keeps the client side free of a runtime.
+//! Small on purpose: one connection per call, no async. `join`, `ls`
+//! and `rm` each make a single call and exit, so a blocking TLS stream
+//! over `std::net::TcpStream` is the whole requirement — and it keeps
+//! the client side free of a runtime.
+//!
+//! M1 points the same client at Cloudflare rather than adding a second
+//! HTTP stack (§10.2). That is the reason for the general shape here:
+//! any method, any host, a settable `Authorization` and content type.
+//! What it buys is one set of timeouts, one trust store and one
+//! vocabulary of errors for everything anago sends outward — a second
+//! client would mean two of each, drifting.
 //!
 //! Building a request and reading a response are pure functions over
 //! bytes, so the wire format is unit-tested. [`send`] is the part that
@@ -22,19 +29,31 @@ use anago_core::token::DeviceToken;
 /// How long to wait for the TCP connection.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long to wait for the hub to answer.
+/// How long to wait for an answer.
 pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Largest response the client will hold. The peer list of a personal
-/// network is kilobytes; anything near this is a server that has lost
-/// its mind, and reading it into memory would not help.
+/// network is kilobytes, and a Cloudflare zone listing is not much
+/// more; anything near this is a server that has lost its mind, and
+/// reading it into memory would not help.
 pub const MAX_RESPONSE: usize = 1 << 20;
 
+/// The content type anago's own API speaks.
+pub const JSON: &str = "application/json";
+
 /// An HTTP method, spelled the way the request line needs it.
+// The Cloudflare surface (`Put`, [`HeaderValue::bearer`], [`Body::new`],
+// [`Response::header`], [`ClientError::BadHeaderValue`]) is exercised by
+// tests here and called for real by `cfapi` in the next slice. Kept
+// together so this module is reviewed as one wire format rather than
+// grown a field at a time.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
     Get,
     Post,
+    /// Cloudflare's full-record update.
+    Put,
     Delete,
 }
 
@@ -43,7 +62,112 @@ impl Method {
         match self {
             Method::Get => "GET",
             Method::Post => "POST",
+            Method::Put => "PUT",
             Method::Delete => "DELETE",
+        }
+    }
+}
+
+/// A header value that is safe to put on the wire.
+///
+/// The one thing this rules out is the one thing that matters: a value
+/// carrying CR or LF would end the header early and let whatever
+/// follows be read as more headers. That is not a hypothetical here —
+/// an API token arrives from a file or an environment variable, and a
+/// **trailing newline on a token file is the normal case**, not an
+/// attack. Catching it as "the token has a newline in it" beats sending
+/// a corrupted request and reading a puzzling 400 back.
+/// Redacts itself in `Debug`, the way [`DeviceToken`] does. Wrapping a
+/// token in this type must not be the step that undoes that protection
+/// — and a Cloudflare token is the widest-reaching secret anago holds
+/// (§13), so it is the last one that should reach a log line.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HeaderValue(String);
+
+impl fmt::Debug for HeaderValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("HeaderValue(redacted)")
+    }
+}
+
+#[allow(dead_code)]
+impl HeaderValue {
+    /// Accepts printable ASCII and horizontal tab, which is what a
+    /// header value may hold.
+    pub fn parse(value: &str) -> Result<HeaderValue, ClientError> {
+        if value.is_empty() {
+            return Err(ClientError::BadHeaderValue("it is empty"));
+        }
+        if value.contains(['\r', '\n']) {
+            return Err(ClientError::BadHeaderValue(
+                "it contains a line break — check for a trailing newline",
+            ));
+        }
+        if value
+            .chars()
+            .any(|c| c != '\t' && (c.is_control() || !c.is_ascii()))
+        {
+            return Err(ClientError::BadHeaderValue(
+                "it contains a character that is not printable ASCII",
+            ));
+        }
+        Ok(HeaderValue(value.to_string()))
+    }
+
+    /// `Bearer <secret>` for an API token that came from outside —
+    /// `--cf-token`, an environment variable, a file (§8).
+    pub fn bearer(secret: &str) -> Result<HeaderValue, ClientError> {
+        HeaderValue::parse(&format!("Bearer {secret}"))
+    }
+
+    /// `Bearer <token>` for a device token. Infallible: [`DeviceToken`]
+    /// is 64 hex characters by construction (§7.1), so there is nothing
+    /// left to check.
+    pub fn device_token(token: &DeviceToken) -> HeaderValue {
+        HeaderValue(format!("Bearer {}", token.as_str()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A request body and the type it is sent as.
+///
+/// The content type is carried rather than assumed because M1 talks to
+/// somebody else's API: `application/json` is anago's own answer, not
+/// a universal one.
+/// The content is redacted in `Debug` too: a join body carries the join
+/// code, which is the registration right itself (§7.2). The type and
+/// the length are what someone debugging a request actually wants.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Body<'a> {
+    pub content_type: &'a str,
+    pub content: &'a str,
+}
+
+impl fmt::Debug for Body<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Body")
+            .field("content_type", &self.content_type)
+            .field("bytes", &self.content.len())
+            .finish()
+    }
+}
+
+#[allow(dead_code)]
+impl<'a> Body<'a> {
+    pub fn json(content: &'a str) -> Body<'a> {
+        Body {
+            content_type: JSON,
+            content,
+        }
+    }
+
+    pub fn new(content_type: &'a str, content: &'a str) -> Body<'a> {
+        Body {
+            content_type,
+            content,
         }
     }
 }
@@ -58,20 +182,36 @@ pub struct Request<'a> {
     pub port: u16,
     /// Absolute path, already percent-encoded.
     pub path: &'a str,
-    pub body: Option<&'a str>,
-    pub token: Option<&'a DeviceToken>,
+    pub body: Option<Body<'a>>,
+    /// The `Authorization` header, when there is one. A device token
+    /// for anago's own API, an API token for Cloudflare.
+    pub authorization: Option<&'a HeaderValue>,
 }
 
 /// What came back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Response {
     pub status: u16,
+    /// Header names lower-cased, values as sent. Kept because a rate
+    /// limit answers with `Retry-After`, and §13 says anago follows
+    /// that rather than guessing its own interval.
+    pub headers: Vec<(String, String)>,
     pub body: String,
 }
 
 impl Response {
     pub fn is_success(&self) -> bool {
         (200..300).contains(&self.status)
+    }
+
+    /// First value of a header, matched without regard to case.
+    #[allow(dead_code)]
+    pub fn header(&self, name: &str) -> Option<&str> {
+        let name = name.to_ascii_lowercase();
+        self.headers
+            .iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| value.as_str())
     }
 }
 
@@ -92,18 +232,20 @@ pub fn request_bytes(request: &Request) -> Vec<u8> {
         host = host_header(request.host, request.port),
         version = env!("CARGO_PKG_VERSION"),
     );
-    if let Some(token) = request.token {
-        text.push_str(&format!("Authorization: Bearer {}\r\n", token.as_str()));
+    if let Some(authorization) = request.authorization {
+        text.push_str(&format!("Authorization: {}\r\n", authorization.as_str()));
     }
-    if let Some(body) = request.body {
-        text.push_str("Content-Type: application/json\r\n");
-        text.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    if let Some(body) = &request.body {
+        text.push_str(&format!("Content-Type: {}\r\n", body.content_type));
+        // Bytes, not characters: a Korean device name in a JSON body
+        // would otherwise under-count and truncate the request.
+        text.push_str(&format!("Content-Length: {}\r\n", body.content.len()));
     }
     text.push_str("\r\n");
 
     let mut bytes = text.into_bytes();
-    if let Some(body) = request.body {
-        bytes.extend_from_slice(body.as_bytes());
+    if let Some(body) = &request.body {
+        bytes.extend_from_slice(body.content.as_bytes());
     }
     bytes
 }
@@ -175,26 +317,41 @@ pub fn parse_response(bytes: &[u8]) -> Result<Response, ClientError> {
         .and_then(|code| code.parse().ok())
         .ok_or(ClientError::Malformed("no status code"))?;
 
-    // The server never chunks — it writes one JSON body — but a proxy
-    // in between might, and silently handing back framing bytes as JSON
-    // would be worse than saying so.
-    if head
-        .lines()
-        .skip(1)
-        .any(|line| line.to_ascii_lowercase().starts_with("transfer-encoding:"))
-    {
+    let headers = parse_headers(head);
+
+    // Neither anago nor Cloudflare chunks — each writes one JSON body —
+    // but a proxy in between might, and silently handing back framing
+    // bytes as JSON would be worse than saying so.
+    if headers.iter().any(|(name, _)| name == "transfer-encoding") {
         return Err(ClientError::Malformed(
             "chunked responses are not supported",
         ));
     }
 
-    Ok(Response { status, body })
+    Ok(Response {
+        status,
+        headers,
+        body,
+    })
+}
+
+/// Splits header lines into lower-cased names and trimmed values.
+///
+/// A line without a colon is dropped rather than refused: a header this
+/// client does not need is not a reason to fail a response that is
+/// otherwise fine.
+fn parse_headers(head: &str) -> Vec<(String, String)> {
+    head.lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
+        .collect()
 }
 
 /// Sends a request and reads the answer.
 ///
 /// **Human verification needed**: this opens a socket and completes a
-/// TLS handshake against a real hub.
+/// TLS handshake against a real host — the hub, or Cloudflare.
 pub fn send(request: &Request) -> Result<Response, ClientError> {
     let config = client_config()?;
     let server_name = rustls::pki_types::ServerName::try_from(request.host.to_string())
@@ -390,6 +547,10 @@ pub fn describe(status: u16, body: &str) -> Failure {
 /// join` needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientError {
+    /// A header value could not be sent as given — see
+    /// [`HeaderValue::parse`].
+    #[allow(dead_code)]
+    BadHeaderValue(&'static str),
     /// The domain is not a name TLS can verify.
     BadHost(String),
     /// DNS said nothing.
@@ -421,40 +582,49 @@ pub enum ClientError {
 impl fmt::Display for ClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ClientError::BadHeaderValue(why) => {
+                write!(f, "that credential cannot be sent as a header: {why}")
+            }
             ClientError::BadHost(host) => {
                 write!(
                     f,
                     "{host:?} is not a hostname a certificate can be checked against"
                 )
             }
+            // These reach a person for calls to the hub *and* to
+            // Cloudflare now, so nothing here may assume which one it
+            // was. Naming the host is what tells them which end to
+            // look at; sending someone to check their own A record
+            // because api.cloudflare.com failed to resolve would point
+            // them at the wrong end entirely.
             ClientError::Resolve { host, source } => write!(
                 f,
-                "could not resolve {host}: {source} — is the A record in place?"
+                "could not resolve {host}: {source} — check that the name has a DNS record"
             ),
             ClientError::Connect { address, source } => write!(
                 f,
-                "could not reach {address}: {source} — is the port open on the server?"
+                "could not reach {address}: {source} — check that the port is open"
             ),
             ClientError::Tls(detail) => write!(
                 f,
-                "TLS failed: {detail} — if the hub uses a private CA \\
+                "TLS failed: {detail} — if that was your hub and it uses a private CA \
                  (a Cloudflare origin certificate, say), install that CA on this device"
             ),
             ClientError::Io(detail) => write!(f, "the connection broke: {detail}"),
             ClientError::Timeout { what, after } => write!(
                 f,
-                "timed out after {}s {what} — the hub answered the connection but not the request",
+                "timed out after {}s {what} — the connection was accepted but the \
+                 request was not answered",
                 after.as_secs()
             ),
-            ClientError::TooLarge(limit) => write!(
-                f,
-                "the hub's answer is larger than {limit} bytes, which no anago response is"
-            ),
+            ClientError::TooLarge(limit) => {
+                write!(f, "the answer is larger than {limit} bytes")
+            }
             ClientError::NoRoots => write!(
                 f,
-                "this machine has no CA certificates installed, so the hub cannot be verified"
+                "this machine has no CA certificates installed, so the server cannot be verified"
             ),
-            ClientError::Malformed(what) => write!(f, "the hub's answer made no sense: {what}"),
+            ClientError::Malformed(what) => write!(f, "the answer made no sense: {what}"),
         }
     }
 }
@@ -464,6 +634,291 @@ impl std::error::Error for ClientError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------- redaction
+
+    #[test]
+    fn a_credential_never_reaches_a_debug_line() {
+        // Wrapping a token must not be the step that undoes
+        // `DeviceToken`'s protection, and a Cloudflare token is the
+        // widest-reaching secret anago holds (§13).
+        let cf = HeaderValue::bearer("cf-api-token").unwrap();
+        assert_eq!(format!("{cf:?}"), "HeaderValue(redacted)");
+        assert!(!format!("{cf:?}").contains("cf-api-token"));
+
+        let device = HeaderValue::device_token(&token());
+        assert!(!format!("{device:?}").contains(token().as_str()));
+    }
+
+    #[test]
+    fn debugging_a_request_prints_neither_the_token_nor_the_body() {
+        // A join body carries the join code, which is the registration
+        // right itself (§7.2).
+        let cf = HeaderValue::bearer("cf-api-token").unwrap();
+        let body = r#"{"code":"7QX4-M2KD"}"#;
+        let request = Request {
+            method: Method::Post,
+            host: "api.cloudflare.com",
+            port: 443,
+            path: "/client/v4/zones",
+            body: Some(Body::json(body)),
+            authorization: Some(&cf),
+        };
+        let printed = format!("{request:?}");
+        assert!(!printed.contains("cf-api-token"), "{printed}");
+        assert!(!printed.contains("7QX4-M2KD"), "{printed}");
+        // What is left is what someone debugging actually wants.
+        assert!(printed.contains("api.cloudflare.com"), "{printed}");
+        assert!(printed.contains("application/json"), "{printed}");
+        assert!(
+            printed.contains(&format!("bytes: {}", body.len())),
+            "{printed}"
+        );
+        // The value still goes on the wire in full.
+        assert!(text(&request).contains("Authorization: Bearer cf-api-token\r\n"));
+    }
+
+    // ------------------------------------------------ error wording
+
+    #[test]
+    fn errors_do_not_send_a_person_to_the_wrong_end() {
+        // The same errors now come from Cloudflare calls, so none of
+        // them may assume the hub was the other end.
+        let errors = [
+            ClientError::Resolve {
+                host: "api.cloudflare.com".to_string(),
+                source: "no address".to_string(),
+            },
+            ClientError::Connect {
+                address: "1.2.3.4:443".to_string(),
+                source: "refused".to_string(),
+            },
+            ClientError::Timeout {
+                what: "waiting for the answer",
+                after: READ_TIMEOUT,
+            },
+            ClientError::TooLarge(MAX_RESPONSE),
+            ClientError::NoRoots,
+            ClientError::Malformed("no status code"),
+            ClientError::Io("reset".to_string()),
+        ];
+        for error in errors {
+            let message = error.to_string();
+            assert!(!message.contains("hub"), "{message}");
+            assert!(!message.contains("A record"), "{message}");
+            assert!(!message.contains("anago response"), "{message}");
+            // And nothing carries a stray line continuation.
+            assert!(!message.contains('\\'), "{message}");
+            for line in message.lines() {
+                assert!(!line.trim_start().contains("  "), "{message}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_errors_that_can_name_a_host_do() {
+        // Which end to look at is the one thing the message can still
+        // say once it stops guessing.
+        let resolve = ClientError::Resolve {
+            host: "api.cloudflare.com".to_string(),
+            source: "no address".to_string(),
+        }
+        .to_string();
+        assert!(resolve.contains("api.cloudflare.com"), "{resolve}");
+        let connect = ClientError::Connect {
+            address: "1.2.3.4:443".to_string(),
+            source: "refused".to_string(),
+        }
+        .to_string();
+        assert!(connect.contains("1.2.3.4:443"), "{connect}");
+    }
+
+    #[test]
+    fn the_private_ca_hint_is_offered_not_asserted() {
+        // Still useful for the hub — origin certificates are a real
+        // trap (§11) — but phrased so it is not wrong for Cloudflare.
+        let message = ClientError::Tls("UnknownIssuer".to_string()).to_string();
+        assert!(message.contains("if that was your hub"), "{message}");
+        assert!(message.contains("origin certificate"), "{message}");
+    }
+
+    // ------------------------------------------- third-party requests
+
+    fn cf_token() -> HeaderValue {
+        HeaderValue::bearer("cf-api-token").unwrap()
+    }
+
+    fn text(request: &Request) -> String {
+        String::from_utf8(request_bytes(request)).unwrap()
+    }
+
+    #[test]
+    fn every_method_reaches_the_request_line() {
+        for (method, spelled) in [
+            (Method::Get, "GET"),
+            (Method::Post, "POST"),
+            (Method::Put, "PUT"),
+            (Method::Delete, "DELETE"),
+        ] {
+            let request = Request {
+                method,
+                host: "api.cloudflare.com",
+                port: 443,
+                path: "/client/v4/zones",
+                body: None,
+                authorization: Some(&cf_token()),
+            };
+            assert!(
+                text(&request).starts_with(&format!("{spelled} /client/v4/zones HTTP/1.1\r\n")),
+                "{spelled}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_third_party_host_gets_its_own_host_header() {
+        let request = Request {
+            method: Method::Get,
+            host: "api.cloudflare.com",
+            port: 443,
+            path: "/client/v4/zones",
+            body: None,
+            authorization: Some(&cf_token()),
+        };
+        let text = text(&request);
+        assert!(text.contains("Host: api.cloudflare.com\r\n"), "{text}");
+        assert!(
+            text.contains("Authorization: Bearer cf-api-token\r\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_content_type_follows_the_body_not_a_default() {
+        // M1 talks to somebody else's API, so `application/json` is
+        // anago's own answer rather than a universal one.
+        let body = Body::new("application/jose+json", "{}");
+        let request = Request {
+            method: Method::Post,
+            host: "acme-v02.api.letsencrypt.org",
+            port: 443,
+            path: "/acme/new-order",
+            body: Some(body),
+            authorization: None,
+        };
+        let text = text(&request);
+        assert!(
+            text.contains("Content-Type: application/jose+json\r\n"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("Content-Type: application/json\r\n"),
+            "{text}"
+        );
+        assert!(text.contains("Content-Length: 2\r\n"), "{text}");
+        assert!(text.ends_with("\r\n\r\n{}"), "{text}");
+    }
+
+    #[test]
+    fn content_length_counts_bytes_not_characters() {
+        // A Korean device name in a body would otherwise under-count
+        // and truncate the request.
+        let json = r#"{"name":"맥북"}"#;
+        let request = Request {
+            method: Method::Post,
+            host: "net.example.com",
+            port: 443,
+            path: "/api/v1/join",
+            body: Some(Body::json(json)),
+            authorization: None,
+        };
+        let text = text(&request);
+        assert!(
+            text.contains(&format!("Content-Length: {}\r\n", json.len())),
+            "{text}"
+        );
+        assert_ne!(json.len(), json.chars().count());
+    }
+
+    #[test]
+    fn a_request_without_a_body_declares_neither_type_nor_length() {
+        let request = Request {
+            method: Method::Delete,
+            host: "api.cloudflare.com",
+            port: 443,
+            path: "/client/v4/zones/z1/dns_records/r1",
+            body: None,
+            authorization: Some(&cf_token()),
+        };
+        let text = text(&request);
+        assert!(!text.contains("Content-Type"), "{text}");
+        assert!(!text.contains("Content-Length"), "{text}");
+    }
+
+    // ------------------------------------------------- header values
+
+    #[test]
+    fn a_token_with_a_trailing_newline_is_caught_here() {
+        // The normal case, not an attack: `cat`-ing a token file keeps
+        // the newline, and a raw CR/LF would end the header early and
+        // let what follows be read as more headers.
+        let error = HeaderValue::bearer("cf-api-token\n").unwrap_err();
+        assert_eq!(
+            error,
+            ClientError::BadHeaderValue("it contains a line break — check for a trailing newline")
+        );
+        assert!(error.to_string().contains("trailing newline"));
+        assert!(HeaderValue::bearer("a\rb").is_err());
+    }
+
+    #[test]
+    fn a_header_value_refuses_what_cannot_be_sent() {
+        assert!(HeaderValue::parse("").is_err());
+        assert!(HeaderValue::parse("Bearer \u{7f}").is_err());
+        // Non-ASCII cannot go in a header value as it stands.
+        assert!(HeaderValue::parse("Bearer 토큰").is_err());
+        // Ordinary token characters and tabs are fine.
+        assert!(HeaderValue::parse("Bearer aB3-_.~").is_ok());
+        assert!(HeaderValue::parse("Bearer\ta").is_ok());
+    }
+
+    #[test]
+    fn a_device_token_needs_no_checking() {
+        // 64 hex characters by construction (§7.1), so the infallible
+        // constructor is honest rather than lazy.
+        let value = HeaderValue::device_token(&token());
+        assert_eq!(value.as_str(), format!("Bearer {}", token().as_str()));
+        assert!(HeaderValue::parse(value.as_str()).is_ok());
+    }
+
+    // --------------------------------------------- response headers
+
+    #[test]
+    fn response_headers_are_kept_and_matched_without_case() {
+        // §13: a rate limit answers with `Retry-After`, and anago
+        // follows that rather than guessing its own interval.
+        let raw = b"HTTP/1.1 429 Too Many Requests\r\n\
+                    Retry-After: 42\r\n\
+                    Content-Type: application/json\r\n\
+                    \r\n{}";
+        let response = parse_response(raw).unwrap();
+        assert_eq!(response.status, 429);
+        assert_eq!(response.header("retry-after"), Some("42"));
+        assert_eq!(response.header("Retry-After"), Some("42"));
+        assert_eq!(response.header("RETRY-AFTER"), Some("42"));
+        assert_eq!(response.header("x-absent"), None);
+        assert!(!response.is_success());
+    }
+
+    #[test]
+    fn a_header_line_without_a_colon_does_not_fail_the_response() {
+        // A header this client does not need is no reason to reject an
+        // answer that is otherwise fine.
+        let raw = b"HTTP/1.1 200 OK\r\nnonsense\r\nLocation: /acct/1\r\n\r\n{}";
+        let response = parse_response(raw).unwrap();
+        assert_eq!(response.header("location"), Some("/acct/1"));
+        assert_eq!(response.body, "{}");
+    }
 
     fn token() -> DeviceToken {
         DeviceToken::parse(&"ab".repeat(32)).unwrap()
@@ -481,7 +936,7 @@ mod tests {
             port: 443,
             path: "/api/v1/peers",
             body: None,
-            token: Some(&token()),
+            authorization: Some(&HeaderValue::device_token(&token())),
         };
         let expected = format!(
             "GET /api/v1/peers HTTP/1.1\r\n\
@@ -505,8 +960,8 @@ mod tests {
             host: "net.example.com",
             port: 443,
             path: "/api/v1/join",
-            body: Some(body),
-            token: None,
+            body: Some(Body::json(body)),
+            authorization: None,
         };
         let text = text_of(&request);
         assert!(text.starts_with("POST /api/v1/join HTTP/1.1\r\n"), "{text}");
@@ -534,7 +989,7 @@ mod tests {
             port: 8443,
             path: "/api/v1/peers",
             body: None,
-            token: None,
+            authorization: None,
         };
         assert!(text_of(&request).contains("Host: net.example.com:8443\r\n"));
     }
@@ -549,8 +1004,8 @@ mod tests {
             host: "net.example.com",
             port: 443,
             path: "/api/v1/join",
-            body: Some(body),
-            token: None,
+            body: Some(Body::json(body)),
+            authorization: None,
         };
         let text = text_of(&request);
         assert!(text.contains("Content-Length: 17\r\n"), "{text}");
@@ -652,13 +1107,17 @@ mod tests {
             host: "net.example.com".to_string(),
             source: "nodename nor servname provided".to_string(),
         };
-        assert!(e.to_string().contains("is the A record in place?"), "{e}");
+        assert!(
+            e.to_string()
+                .contains("check that the name has a DNS record"),
+            "{e}"
+        );
 
         let e = ClientError::Connect {
             address: "203.0.113.7:443".to_string(),
             source: "Connection refused".to_string(),
         };
-        assert!(e.to_string().contains("is the port open"), "{e}");
+        assert!(e.to_string().contains("check that the port is open"), "{e}");
 
         let e = ClientError::Tls("invalid peer certificate: UnknownIssuer".to_string());
         assert!(

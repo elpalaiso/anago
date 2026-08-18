@@ -153,7 +153,7 @@ fn remove_remotely(
         port: config.api_port(),
         path: &path,
         body: None,
-        token: Some(&token),
+        authorization: Some(&client::HeaderValue::device_token(&token)),
     })
     .map_err(RmError::Client)?;
 
