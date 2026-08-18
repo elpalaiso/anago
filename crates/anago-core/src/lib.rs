@@ -4,6 +4,7 @@
 //! these pure functions.
 
 pub mod json;
+pub mod proto;
 pub mod subnet;
 
 #[cfg(test)]
