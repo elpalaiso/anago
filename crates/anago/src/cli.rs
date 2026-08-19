@@ -914,6 +914,10 @@ needs the token, which is also what lets anago add the A record for
 you. The token can come from --cf-token-file (safest), --cf-token
 (visible to `ps` and in shell history), or {env}.
 
+Create the token with both Zone → DNS → Edit and Zone → Zone → Read, on
+the zone that holds the domain. The second is what finds the zone, and
+a token without it passes every other check before it fails.
+
 --acme-staging orders from Let's Encrypt's staging CA. Nothing trusts
 those certificates, so `anago join` will refuse them — it is for
 checking the wiring without spending a rate limit.
@@ -940,9 +944,12 @@ for this name.
 A flag that changes *which* certificate you would get — moving between
 {staging} and the real CA, or taking over a hub set up with
 --tls-cert/--tls-key — orders one straight away; --force is not needed
-and would not mean anything. A flag that does not (--acme-email,
---acme-challenge, the token) is written down and applies from the next
-renewal.
+and would not mean anything. Going *to* {staging} is the one to think
+about: what it orders replaces the certificate this hub is serving, and
+nothing trusts it, so `join` fails until --acme-production brings a real
+one back. A flag that does not change which certificate you get
+(--acme-email, --acme-challenge, the token) is written down and applies
+from the next renewal.
 
 --dns pushes the A record at this machine's current address and stops.
 That is for a server whose public IP changed; nothing else here does
@@ -968,8 +975,13 @@ no wg config and no device file. --name is required there, because the
 hostname default would name this machine. `conf` prints the config,
 `--out` puts it in a file at 0600 instead (an existing file is an error,
 never an overwrite). `qr` draws it on the terminal and takes no --out —
-anago writes no image files. Either way the text holds the phone's
-private key: move it, then clear the file or the scrollback.
+anago writes no image files. Its width follows the hub's name, so 80
+columns is enough for an ordinary one and a long name needs more; the
+size is only known once the hub has answered, and a window too narrow
+for it is refused rather than drawn wrapped. Either way what comes out
+is the phone's private key: move it, then delete the file — or, on
+screen, clear the screen and then the scrollback, which are two
+different commands.
 
 Join codes are single use and expire; ask the server for another with
 `anago code`. Format: {code}
@@ -997,7 +1009,8 @@ the unit file says why it is silent.
 --install-timer writes the unit and starts it: a systemd timer on
 Linux, a LaunchDaemon on macOS. Where neither exists, it prints a cron
 line instead of pretending. --interval takes 90s, 5m or 1h — between
-{min} and {max}.
+{min} and {max}. A cron line narrows that further, to periods that divide
+an hour or a day: cron repeats on the clock, not on a stopwatch.
 ",
             default = "5m",
             min = "1m",
@@ -1041,8 +1054,9 @@ usage:
   -h, --help                        show this, or `anago help <command>`
   -V, --version                     show the version
 
-Later milestones: `--export qr|conf` (M1), `anago ping` and
-`anago server status` (M3).
+`anago join --export qr|conf` registers a phone; `anago sync
+--install-timer` schedules the check. Later milestones: `anago ping`
+and `anago server status` (M3).
 "
         ),
     }
@@ -2291,7 +2305,7 @@ mod tests {
     }
 
     #[test]
-    fn help_text_covers_every_m0_command() {
+    fn help_text_covers_every_built_command() {
         let general = help(None);
         for command in [
             "server init",
@@ -2304,8 +2318,14 @@ mod tests {
         ] {
             assert!(general.contains(command), "general help omits {command}");
         }
-        // And says where the rest went.
-        assert!(general.contains("M1"), "{general}");
+        // The two flags M1 added are not subcommands, so the list
+        // above cannot carry them and the footer does.
+        assert!(general.contains("--export qr|conf"), "{general}");
+        assert!(general.contains("--install-timer"), "{general}");
+        // And what is still unbuilt says so, so its absence does not
+        // read as a bug. M1 is built now: deferring it here would send
+        // somebody looking for a flag they already have.
+        assert!(!general.contains("(M1)"), "{general}");
         assert!(general.contains("M3"), "{general}");
 
         for topic in ["server", "renew", "sync", "join", "code", "ls", "rm"] {

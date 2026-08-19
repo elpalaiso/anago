@@ -137,7 +137,7 @@ pub fn format_handshake(handshake: LastHandshake, now: i64) -> String {
 /// Coarse relative time. Nobody reading `ls` needs the seconds in "3
 /// days ago", and a clock that ran backwards should not print a
 /// negative age.
-fn format_ago(seconds: i64) -> String {
+pub fn format_ago(seconds: i64) -> String {
     match seconds {
         i64::MIN..=9 => "just now".to_string(),
         10..=59 => format!("{seconds}s ago"),
@@ -388,20 +388,30 @@ pub fn export_warning(form: ExportForm, name: &DeviceName, out_path: Option<&str
         "WARNING: this is {name}'s private key in plain text. Anyone who reads it\n\
          can join the network as that device.\n"
     );
-    match out_path {
-        Some(path) => out.push_str(&format!(
+    match (form, out_path) {
+        (_, Some(path)) => out.push_str(&format!(
             "  Written to {path} (0600). Delete it once the phone has imported it.\n"
         )),
-        None => out.push_str(
+        (ExportForm::Conf, None) => out.push_str(
             "  To put it in a file, use --out: a shell redirect (>) leaves the mode\n\
              \x20 to your umask, which is usually world-readable.\n",
         ),
+        // Not "use --out": `--export qr` takes none, because anago
+        // writes no image files (§8). Naming a flag this build refuses
+        // would be advice that fails when it is followed.
+        (ExportForm::Qr, None) => {
+            out.push_str("  For a file instead, `--export conf --out <path>` writes one at 0600.\n")
+        }
     }
     if form == ExportForm::Qr {
+        // Two commands, and the order matters: clearing the record
+        // first only files the screen away after it (§7.3).
         out.push_str(
-            "  The code stays in this terminal's scrollback, which `clear` does not\n\
-             \x20 erase and some terminals write to disk. Clear the scrollback after\n\
-             \x20 scanning it.\n",
+            "  Then take it off the screen and out of the record, in that order:\n\
+             \x20 `clear` moves it from the screen into the scrollback, and your\n\
+             \x20 terminal's own Clear Scrollback (`clear-history` under tmux)\n\
+             \x20 empties that. Neither alone is enough, and some terminals keep\n\
+             \x20 scrollback on disk.\n",
         );
     }
     out.push_str(&format!(
@@ -795,13 +805,30 @@ mod tests {
     }
 
     #[test]
-    fn a_qr_warns_about_the_scrollback() {
+    fn a_qr_warns_about_the_screen_and_the_record() {
+        // Both, and in that order: `clear` empties the screen into the
+        // scrollback, and the command that empties the scrollback
+        // leaves the pane as it is. A note naming one reads as a whole
+        // instruction while leaving the key in the half it did not
+        // name (§7.3).
         let qr = export_warning(ExportForm::Qr, &phone(), None);
-        assert!(qr.contains("scrollback"), "{qr}");
-        assert!(qr.contains("`clear` does not"), "{qr}");
-        // A plain conf has no scrollback problem to describe.
-        let conf = export_warning(ExportForm::Conf, &phone(), None);
+        assert!(qr.contains("off the screen and out of the record"), "{qr}");
+        assert!(qr.contains("in that order"), "{qr}");
+        assert!(qr.contains("into the scrollback"), "{qr}");
+        assert!(qr.contains("Clear Scrollback"), "{qr}");
+        assert!(qr.contains("Neither alone is enough"), "{qr}");
+        // A file has neither problem: it is deleted instead.
+        let conf = export_warning(ExportForm::Conf, &phone(), Some("/tmp/p.conf"));
         assert!(!conf.contains("scrollback"), "{conf}");
+    }
+
+    #[test]
+    fn a_qr_is_never_told_to_use_out() {
+        // `--export qr` takes no --out (§8). Advising it here would
+        // fail the moment somebody followed it.
+        let qr = export_warning(ExportForm::Qr, &phone(), None);
+        assert!(!qr.contains("use --out"), "{qr}");
+        assert!(qr.contains("--export conf --out"), "{qr}");
     }
 
     #[test]

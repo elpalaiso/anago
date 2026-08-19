@@ -371,7 +371,13 @@ pub fn run(
             reservation.commit();
             Ok(Joined { config })
         }
-        Err(e) => Err(post_registration(&response.body, domain, api_port, &e)),
+        Err(e) => Err(post_registration(
+            &response.body,
+            domain,
+            api_port,
+            NOTHING_SAVED,
+            &e,
+        )),
     }
 }
 
@@ -528,7 +534,13 @@ pub fn export_conf(
                 handed: to.handed(),
             })
         }
-        Err(e) => Err(post_registration(&response.body, domain, api_port, &e)),
+        Err(e) => Err(post_registration(
+            &response.body,
+            domain,
+            api_port,
+            NOTHING_HANDED_OVER,
+            &e,
+        )),
     }
 }
 
@@ -782,6 +794,23 @@ pub fn export_note(name: &DeviceName, handed: &Handed) -> String {
         "itself — it has no anago and no token — so",
         &format!("`anago rm {name}` on the hub is how it goes away."),
     ]));
+    // A code that is too wide is refused before it is drawn
+    // (`JoinError::TooNarrow`). A code that is drawn and still will not
+    // scan has no error to report: the terminal's font decides whether
+    // the half-height blocks meet, and anago cannot see the screen. So
+    // the way out is said here, beside the code, while the person is
+    // still looking at it — and it is the removal above, because the
+    // key is only on this screen and there is no re-drawing it.
+    if matches!(handed, Handed::Qr) {
+        note.push('\n');
+        note.push_str(&indented(&[
+            "If the phone will not read it, that is the way out too:",
+            "some fonts draw the half-height blocks with a seam, and a",
+            "code nothing can scan cannot be re-sent — the key is only",
+            &format!("on this screen. `anago rm {name}`, a fresh `anago code`,"),
+            "then `--export conf` hands the same config over as text.",
+        ]));
+    }
     note
 }
 
@@ -849,13 +878,32 @@ fn accepted(
     Ok((config, profile))
 }
 
+/// What a failed local join leaves undone.
+const NOTHING_SAVED: &str = "nothing could be saved on this machine";
+
+/// What a failed export leaves undone. Deliberately not the same
+/// sentence: that path writes no local files at all (§8), so "nothing
+/// could be saved" would send somebody looking on this machine for a
+/// file that was never going to be here.
+const NOTHING_HANDED_OVER: &str = "the config never reached the phone";
+
 /// Turns a failure that happened after registration into an error that
 /// says what state the hub is in.
+///
+/// `what` is the half of that sentence only the caller knows — the two
+/// paths leave different things undone, and one wording for both would
+/// be wrong for whichever it was not written for.
 ///
 /// The credentials for undoing are read from the raw body, not from the
 /// decoded config — the point is to still clean up when it was a *later*
 /// field that was unreadable.
-fn post_registration(body: &str, domain: &str, api_port: u16, cause: &JoinError) -> JoinError {
+fn post_registration(
+    body: &str,
+    domain: &str,
+    api_port: u16,
+    what: &'static str,
+    cause: &JoinError,
+) -> JoinError {
     let outcome = match undo_credentials(body) {
         Some((name, token)) => {
             if undo_registration(domain, api_port, &name, &token).is_ok() {
@@ -869,6 +917,7 @@ fn post_registration(body: &str, domain: &str, api_port: u16, cause: &JoinError)
         None => Undo::Unknown,
     };
     JoinError::SavedNothing {
+        what,
         source: cause.to_string(),
         recovery: recovery_note(outcome),
     }
@@ -1319,9 +1368,17 @@ pub enum JoinError {
         kind: std::io::ErrorKind,
         source: String,
     },
-    /// The hub registered this device and the local files could not be
-    /// saved — the one failure that leaves the two sides disagreeing.
-    SavedNothing { source: String, recovery: String },
+    /// The hub registered this device and this side could not finish —
+    /// the one failure that leaves the two sides disagreeing. `what`
+    /// says which side of the finish it was: files that could not be
+    /// written, or a config that never reached the phone.
+    SavedNothing {
+        /// What did not happen, in the terms of the path that failed:
+        /// a local join saves files, an export hands a config over.
+        what: &'static str,
+        source: String,
+        recovery: String,
+    },
     /// A rendered config could not be written to standard output — a
     /// closed pipe, most often. Its own variant because there is no
     /// file and no owner to blame, only a destination that went away.
@@ -1394,10 +1451,13 @@ impl fmt::Display for JoinError {
                 Some(target),
                 *kind,
             )),
-            JoinError::SavedNothing { source, recovery } => write!(
+            JoinError::SavedNothing {
+                what,
+                source,
+                recovery,
+            } => write!(
                 f,
-                "the hub registered this device but nothing could be saved locally \
-                 ({source}) — {recovery}"
+                "the hub registered this device but {what} ({source}) — {recovery}"
             ),
             JoinError::Unsent(detail) => write!(
                 f,
@@ -1628,7 +1688,13 @@ mod tests {
         // the hub belong to nothing. Same door as every other failure
         // after the hub answers.
         let e = JoinError::Taken(PathBuf::from("/tmp/phone.conf"));
-        let after = post_registration(&body_with_credentials(), "net.example.com", 443, &e);
+        let after = post_registration(
+            &body_with_credentials(),
+            "net.example.com",
+            443,
+            NOTHING_HANDED_OVER,
+            &e,
+        );
         assert!(matches!(after, JoinError::SavedNothing { .. }), "{after:?}");
         assert!(after.to_string().contains("/tmp/phone.conf"), "{after}");
     }
@@ -1739,7 +1805,13 @@ mod tests {
         // Found after the answer, it goes out through the same door
         // every post-registration failure does — the phone got nothing,
         // so the hub must not keep a name and an address for it.
-        let after = post_registration(&body_with_credentials(), "net.example.com", 443, &e);
+        let after = post_registration(
+            &body_with_credentials(),
+            "net.example.com",
+            443,
+            NOTHING_HANDED_OVER,
+            &e,
+        );
         assert!(matches!(after, JoinError::SavedNothing { .. }), "{after:?}");
         assert!(after.to_string().contains("Widen the window"), "{after}");
     }
@@ -1752,7 +1824,13 @@ mod tests {
         let e = JoinError::Unsent("Broken pipe (os error 32)".to_string());
         assert!(e.to_string().contains("nothing reached the phone"), "{e}");
 
-        let after = post_registration(&body_with_credentials(), "net.example.com", 443, &e);
+        let after = post_registration(
+            &body_with_credentials(),
+            "net.example.com",
+            443,
+            NOTHING_HANDED_OVER,
+            &e,
+        );
         assert!(matches!(after, JoinError::SavedNothing { .. }), "{after:?}");
         assert!(
             after.to_string().contains("nothing reached the phone"),
@@ -2229,6 +2307,7 @@ mod tests {
         assert!(unknown.contains("anago ls"), "{unknown}");
 
         let e = JoinError::SavedNothing {
+            what: NOTHING_SAVED,
             source: "No space left on device".to_string(),
             recovery: stuck,
         };

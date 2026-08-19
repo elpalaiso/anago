@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anago_core::acme::ChallengeToken;
+use anago_core::render;
 use anago_core::state::{self, Acme, Challenge, ServerState};
 use axum::extract::{Path as AxumPath, State};
 use axum::http::{header, StatusCode};
@@ -1197,6 +1198,162 @@ pub fn no_automatic_switch() -> String {
     )
 }
 
+/// What to add to a CA refusal that was a rate limit.
+///
+/// The renewal loop already says this from the schedule's side
+/// ([`waiting_line`]): it knows it is about to wait an hour and has to
+/// explain the hour. A person who typed `server init` or `server renew`
+/// gets no schedule and no second attempt, so all that reaches them is
+/// the CA's own sentence — and what is worth knowing is not in it: that
+/// a limit refills over hours rather than minutes, so running the
+/// command again now spends an attempt and changes nothing, and what
+/// the CA asked to be waited (§13).
+///
+/// **What is *not* here is the way round it.** That depends on whether
+/// this hub has a certificate already, which an error type cannot know
+/// — see [`rate_limit_advice`], which the two commands add themselves.
+///
+/// Empty for every other failure. Guessing "maybe a rate limit" onto an
+/// ordinary error would send somebody off to wait for a wall that is
+/// not there.
+fn rate_limit_note(detail: &str, retry_after: Option<Duration>) -> String {
+    if classify(detail) == FailureKind::Ordinary {
+        return String::new();
+    }
+    // Its own line, like the other advice this module appends: the CA's
+    // sentence ends where it ends, and gluing onto it means guessing
+    // whether it left a full stop behind.
+    let mut note = String::from(
+        "\nThat is a rate limit rather than a fault in what you typed. ACME limits \
+         refill over hours, not minutes, so running this again now spends an attempt \
+         and changes nothing.",
+    );
+    // §13: what the CA said about timing is passed on rather than
+    // re-guessed. Only the unattended path was using it, and it is the
+    // person typing the command who has to decide when to come back.
+    if let Some(wait) = retry_after {
+        note.push_str(&format!(
+            " It asked for about {} before the next attempt.",
+            about(wait)
+        ));
+    }
+    note
+}
+
+/// Whether the hub has a certificate to lose when a rate limit is hit,
+/// and — when it has one — how much of it is left.
+///
+/// This is the whole difference between the two pieces of advice, and
+/// getting it wrong is not a matter of tone. `server renew
+/// --acme-staging` is a **CA change**, a CA change re-issues (§8), and
+/// the re-issue overwrites what the hub is serving — so "use staging
+/// while you wait", printed to somebody whose hub is up, swaps a
+/// certificate every device trusts for one nothing trusts.
+///
+/// The dates ride along because the other half of the advice — that
+/// waiting is free — is a claim about a clock. A renewal is run when
+/// something is already wrong, sometimes after the certificate has
+/// lapsed, and a limit's wait can outlast what is left of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Standing {
+    /// `server init`: there is no hub yet, so there is nothing a
+    /// staging certificate could replace and nothing to run out.
+    NoCertificateYet,
+    /// `server renew`: this hub is serving a certificate right now,
+    /// whoever issued it. `not_after` is `None` when the expiry could
+    /// not be read out of it (§9.1) — then nothing is claimed about it.
+    Serving { not_after: Option<i64>, now: i64 },
+}
+
+/// The way round a rate limit, in the terms of the command that hit it.
+///
+/// Empty when the failure was not a rate limit, and empty for the
+/// failures that never came from the CA — a port that would not bind is
+/// not something the CA is limiting.
+pub fn rate_limit_advice(error: &AcmeError, hub: Standing) -> String {
+    if classify(error.ca_detail().unwrap_or_default()) == FailureKind::Ordinary {
+        return String::new();
+    }
+    match hub {
+        Standing::NoCertificateYet => {
+            "\n--acme-staging orders from a CA with its own separate limits, and nothing \
+             here has a certificate yet to lose — that is where to check the wiring \
+             while this one refills."
+                .to_string()
+        }
+        // The staging half is the same whatever the clock says, and it
+        // is worded to stay true when the certificate has already
+        // lapsed: a staging one would not fix that either, and it would
+        // take the real file with it.
+        Standing::Serving { not_after, now } => format!(
+            "\n{}\nNot --acme-staging: that flag is a different CA, a different CA \
+             re-issues, and nothing trusts a staging certificate — it would replace what \
+             is on disk with one `join` refuses.",
+            while_you_wait(not_after, now, error.retry_after())
+        ),
+    }
+}
+
+/// What the certificate on disk means for a wait — the half of "come
+/// back later" that decides whether later is fine.
+///
+/// This was a fixed clause once ("the certificate on disk keeps working
+/// until it expires"), which is a claim and not always a true one. A
+/// renewal runs because something is already wrong, sometimes after the
+/// certificate has lapsed; and a rate limit's wait can be longer than
+/// what is left of one that has not. Then waiting is **not** free — the
+/// control API stops being trusted — and saying it is sends somebody
+/// away from a hub that is about to go quiet.
+///
+/// `wait` is how long the next attempt is away when that is known.
+/// Without it the comparison cannot be made, and is not pretended.
+///
+/// The branches where something *does* go down answer the question a
+/// person asks next, and the answer is the same in both: **WireGuard
+/// uses no certificate.** Tunnels that are up stay up through all of
+/// this (§8); what an expiry takes away is the control API — `join`,
+/// `sync`, `ls`, `rm`. The branch where nothing goes down does not say
+/// it, because there is nothing there to reassure anybody about.
+pub fn while_you_wait(not_after: Option<i64>, now: i64, wait: Option<Duration>) -> String {
+    let Some(not_after) = not_after else {
+        return "anago could not read the expiry from the certificate on disk, so whether \
+                it outlasts that wait is worth checking by hand."
+            .to_string();
+    };
+    let left = not_after.saturating_sub(now);
+    if left <= 0 {
+        return format!(
+            "The certificate on disk expired {}, so the control API is untrusted already \
+             and stays that way until one arrives. Tunnels are not affected — WireGuard \
+             uses no certificate — but `join` and `sync` cannot reach the hub.",
+            render::format_ago(now.saturating_sub(not_after))
+        );
+    }
+    let waiting = wait.map(|wait| i64::try_from(wait.as_secs()).unwrap_or(i64::MAX));
+    match waiting {
+        Some(waiting) if waiting >= left => format!(
+            "The certificate on disk expires {}, sooner than that — the control API stops \
+             being trusted in the meantime. Tunnels are not affected — WireGuard uses no \
+             certificate — but `join` and `sync` cannot reach the hub until a certificate \
+             arrives.",
+            render::format_in(left)
+        ),
+        Some(_) => format!(
+            "The certificate on disk keeps working until it expires {}, so waiting costs \
+             nothing.",
+            render::format_in(left)
+        ),
+        // A wait nobody named cannot be compared to anything. What is
+        // left is still worth saying — it is half of the comparison the
+        // person now has to make themselves.
+        None => format!(
+            "The certificate on disk expires {}, and the CA did not say how long its \
+             limit takes to refill — which comes first is worth watching.",
+            render::format_in(left)
+        ),
+    }
+}
+
 /// Orders a certificate for `domain`, proving control by writing a TXT
 /// record — no port 80 anywhere.
 ///
@@ -2054,7 +2211,15 @@ where
                 eprintln!("anago: the state file could not be read, so the certificate cannot be checked: {detail}");
                 eprintln!(
                     "       {}",
-                    waiting_line(delay, unreadable.failures(), FailureKind::Ordinary)
+                    // No state file means no expiry to reason about,
+                    // which `while_you_wait` says rather than guesses.
+                    waiting_line(
+                        delay,
+                        unreadable.failures(),
+                        FailureKind::Ordinary,
+                        None,
+                        at
+                    )
                 );
                 (
                     Tick::Waiting {
@@ -2082,7 +2247,13 @@ where
                     eprintln!("anago: renewal failed: {failure}");
                     eprintln!(
                         "       {}",
-                        waiting_line(delay, renewals.failures(), failure.kind)
+                        waiting_line(
+                            delay,
+                            renewals.failures(),
+                            failure.kind,
+                            current.as_ref().and_then(|tls| tls.not_after),
+                            at,
+                        )
                     );
                 }
             }
@@ -2097,21 +2268,48 @@ where
 /// It says how long, and — when the CA named a rate limit — why the
 /// wait is longer than the failure count would suggest. Without that,
 /// an hour of silence after one failure looks like a hang.
-pub fn waiting_line(delay: Duration, failures: u32, kind: FailureKind) -> String {
-    let when = match delay.as_secs() {
-        secs if secs >= 3600 => format!("{} hours", secs / 3600),
-        secs => format!("{} minutes", secs / 60),
-    };
+pub fn waiting_line(
+    delay: Duration,
+    failures: u32,
+    kind: FailureKind,
+    not_after: Option<i64>,
+    now: i64,
+) -> String {
+    let when = about(delay);
+    // The same clause the typed commands use, for the same reason: an
+    // unattended run that has been failing for weeks can be sitting
+    // beside a certificate that has already lapsed, and "keeps working
+    // until it expires" is exactly the wrong thing to log there.
+    let meanwhile = while_you_wait(not_after, now, Some(delay));
     match kind {
+        // Not "rate limiting this account": which limit was hit is
+        // the CA's business and the limits are not all per account —
+        // certificates per registered domain is a different bucket —
+        // so naming one would send somebody to check the wrong thing.
         FailureKind::RateLimited => format!(
-            "the CA is rate limiting this account, so the next attempt is in about \
-             {when}. The certificate on disk keeps working until it expires"
+            "the CA is rate limiting this hub, so the next attempt is in about \
+             {when}. {meanwhile}"
         ),
-        FailureKind::Ordinary => format!(
-            "attempt {failures} — the next one is in about {when}. The certificate on \
-             disk keeps working until it expires"
-        ),
+        FailureKind::Ordinary => {
+            format!("attempt {failures} — the next one is in about {when}. {meanwhile}")
+        }
     }
+}
+
+/// A wait in the words somebody reads it in.
+///
+/// Rounded **up**, in both directions it could go wrong: a fractional
+/// hour reported as the hour it has passed would say a shorter wait
+/// than the clock will keep, and a minute reported as `0 minutes` would
+/// not read as a wait at all.
+fn about(delay: Duration) -> String {
+    let secs = delay.as_secs();
+    let (count, unit) = if secs >= 3600 {
+        (secs.div_ceil(3600), "hour")
+    } else {
+        (secs.div_ceil(60).max(1), "minute")
+    };
+    format!("{count} {unit}{}", if count == 1 { "" } else { "s" })
 }
 
 /// Why the account step failed.
@@ -2255,7 +2453,8 @@ impl fmt::Display for AcmeError {
                 f,
                 "could not register an account with the CA at {directory}: {detail}. \
                  Check that this machine can reach it, and that the address given to \
-                 --acme-email is one the CA will accept"
+                 --acme-email is one the CA will accept.{}",
+                rate_limit_note(detail, None)
             ),
             AcmeError::SignIn { directory, detail } => write!(
                 f,
@@ -2343,12 +2542,28 @@ impl fmt::Display for AcmeError {
                 "the DNS-01 challenge record for {domain} could not be managed: {detail}\n{}",
                 no_automatic_switch()
             ),
-            AcmeError::Propagation { detail } => {
-                write!(f, "{detail}\n{}", no_automatic_switch())
-            }
-            AcmeError::Order { domain, detail, .. } => write!(
+            // The record is the piece of state this failure leaves
+            // lying around, so the message accounts for it — but only
+            // as far as it can. The guard that owns it removes it as
+            // this run unwinds, which has already happened by the time
+            // anything prints, and it says so itself when it could not
+            // (`cfapi::left_behind`). Saying "removed" here would be
+            // saying it before the attempt.
+            AcmeError::Propagation { detail } => write!(
                 f,
-                "the certificate order for {domain} did not go through: {detail}"
+                "{detail}\nThe challenge record is taken back out of the zone as this run \
+                 stops; if that did not work, the warning above says which record to \
+                 delete by hand.\n{}",
+                no_automatic_switch()
+            ),
+            AcmeError::Order {
+                domain,
+                detail,
+                retry_after,
+            } => write!(
+                f,
+                "the certificate order for {domain} did not go through: {detail}{}",
+                rate_limit_note(detail, *retry_after)
             ),
             AcmeError::NoChallenge { domain, challenge } => write!(
                 f,
@@ -2364,21 +2579,22 @@ impl fmt::Display for AcmeError {
                 challenge: Challenge::Http01,
                 looked_at,
                 detail,
-                ..
+                retry_after,
             } => write!(
                 f,
                 "the CA could not verify {domain}: {detail}. It fetches {} from outside, \
                  so the thing to check is that port 80 is open all the way in — the cloud \
                  security group as well as the host firewall — and that the name resolves \
-                 to this server",
-                looked_at.join(", ")
+                 to this server.{}",
+                looked_at.join(", "),
+                rate_limit_note(detail, *retry_after)
             ),
             AcmeError::Validation {
                 domain,
                 challenge: Challenge::Dns01,
                 looked_at,
                 detail,
-                ..
+                retry_after,
             } => write!(
                 f,
                 "the CA could not verify {domain}: {detail}. It resolves {} itself, from \
@@ -2386,15 +2602,21 @@ impl fmt::Display for AcmeError {
                  machine: whether the zone anago wrote into is the one actually answering \
                  for that name (a delegated subzone answers for itself), whether something \
                  stale is still at it, and whether the token may edit the zone that \
-                 matters.\n{}",
+                 matters.{}\n{}",
                 looked_at.join(", "),
+                rate_limit_note(detail, *retry_after),
                 no_automatic_switch()
             ),
-            AcmeError::Finalize { domain, detail, .. } => write!(
+            AcmeError::Finalize {
+                domain,
+                detail,
+                retry_after,
+            } => write!(
                 f,
                 "{domain} was verified and the certificate still did not arrive: {detail}. \
                  Nothing was saved; running this again re-uses the authorization the CA \
-                 already granted"
+                 already granted.{}",
+                rate_limit_note(detail, *retry_after)
             ),
             AcmeError::Unreadable { path, detail } => write!(
                 f,
@@ -3891,17 +4113,109 @@ mod tests {
 
     #[test]
     fn the_waiting_line_says_how_long_and_why() {
+        // A certificate with a month left, which is the ordinary shape
+        // of a failed renewal: due at two thirds of the lifetime, so
+        // there is a third of it still to go.
+        let month = Some(NOW_RENEW + 30 * DAY);
+
         // An hour of silence after one failure looks like a hang unless
         // it says otherwise.
-        let ordinary = waiting_line(RETRY_BASE, 1, FailureKind::Ordinary);
+        let ordinary = waiting_line(RETRY_BASE, 1, FailureKind::Ordinary, month, NOW_RENEW);
         assert!(ordinary.contains("15 minutes"), "{ordinary}");
         assert!(ordinary.contains("attempt 1"), "{ordinary}");
         // The reassurance that matters most: nothing is down yet.
         assert!(ordinary.contains("keeps working"), "{ordinary}");
 
-        let limited = waiting_line(RATE_LIMITED_FLOOR, 1, FailureKind::RateLimited);
-        assert!(limited.contains("1 hours"), "{limited}");
+        let limited = waiting_line(
+            RATE_LIMITED_FLOOR,
+            1,
+            FailureKind::RateLimited,
+            month,
+            NOW_RENEW,
+        );
+        assert!(limited.contains("1 hour"), "{limited}");
+        assert!(!limited.contains("1 hours"), "one of them: {limited}");
         assert!(limited.contains("rate limiting"), "{limited}");
+
+        // And the reassurance is not a fixed clause. A hub whose
+        // renewals have been failing long enough can be sitting beside
+        // a certificate that already lapsed, and this is the line that
+        // would otherwise tell its log it was fine.
+        let lapsed = waiting_line(
+            RETRY_BASE,
+            9,
+            FailureKind::Ordinary,
+            Some(NOW_RENEW - DAY),
+            NOW_RENEW,
+        );
+        assert!(!lapsed.contains("keeps working"), "{lapsed}");
+        assert!(lapsed.contains("expired"), "{lapsed}");
+    }
+
+    #[test]
+    fn whether_waiting_is_free_is_a_question_for_the_clock() {
+        let hour = Duration::from_secs(3600);
+
+        // The common case: weeks left, an hour to wait.
+        let fine = while_you_wait(Some(NOW_RENEW + 30 * DAY), NOW_RENEW, Some(hour));
+        assert!(fine.contains("keeps working until it expires"), "{fine}");
+        assert!(fine.contains("waiting costs nothing"), "{fine}");
+        assert!(fine.contains("in 30d"), "{fine}");
+
+        // The case the fixed clause got wrong: the wait outlasts what
+        // is left. Waiting is not free here — it is an outage with a
+        // date on it — so it must not say it is.
+        let overtaken = while_you_wait(Some(NOW_RENEW + 1800), NOW_RENEW, Some(hour));
+        assert!(!overtaken.contains("costs nothing"), "{overtaken}");
+        assert!(overtaken.contains("sooner than that"), "{overtaken}");
+        assert!(overtaken.contains("stops being trusted"), "{overtaken}");
+        // The boundary itself counts as overtaken: a certificate that
+        // expires exactly when the next attempt is allowed leaves no
+        // room for the attempt to succeed in.
+        let exactly = while_you_wait(Some(NOW_RENEW + 3600), NOW_RENEW, Some(hour));
+        assert!(exactly.contains("sooner than that"), "{exactly}");
+
+        // Already gone. Not a wait at all — the hub is down now.
+        let gone = while_you_wait(Some(NOW_RENEW - 3 * DAY), NOW_RENEW, Some(hour));
+        assert!(gone.contains("expired 3d ago"), "{gone}");
+        assert!(gone.contains("untrusted already"), "{gone}");
+        assert!(!gone.contains("costs nothing"), "{gone}");
+
+        // Where something does go down, the next question is what —
+        // and the answer is the same both times (§8). Where nothing
+        // goes down there is nothing to answer, and saying it anyway
+        // would put an outage in a message that has none.
+        for said in [&overtaken, &gone] {
+            assert!(said.contains("WireGuard uses no certificate"), "{said}");
+        }
+        assert!(!fine.contains("WireGuard"), "{fine}");
+
+        // No expiry to compare, and no wait to compare it to: neither
+        // is guessed at.
+        let unreadable = while_you_wait(None, NOW_RENEW, Some(hour));
+        assert!(
+            unreadable.contains("could not read the expiry"),
+            "{unreadable}"
+        );
+        assert!(!unreadable.contains("costs nothing"), "{unreadable}");
+
+        let untimed = while_you_wait(Some(NOW_RENEW + 30 * DAY), NOW_RENEW, None);
+        assert!(untimed.contains("did not say how long"), "{untimed}");
+        assert!(!untimed.contains("costs nothing"), "{untimed}");
+    }
+
+    #[test]
+    fn a_wait_is_never_reported_shorter_than_it_is() {
+        // Rounding down is the direction that misleads: it tells
+        // somebody to come back before the CA will have them.
+        assert_eq!(about(Duration::from_secs(900)), "15 minutes");
+        assert_eq!(about(Duration::from_secs(3600)), "1 hour");
+        assert_eq!(about(Duration::from_secs(5400)), "2 hours");
+        assert_eq!(about(Duration::from_secs(3 * 24 * 60 * 60)), "72 hours");
+        // And a wait is a wait, however short — `0 minutes` reads as
+        // none at all.
+        assert_eq!(about(Duration::from_secs(30)), "1 minute");
+        assert_eq!(about(Duration::ZERO), "1 minute");
     }
 
     #[test]

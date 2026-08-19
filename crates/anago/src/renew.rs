@@ -543,7 +543,14 @@ pub fn run(
             artifacts = Some(Artifacts::watching(&wanted, paths)?);
             let issued =
                 acme::renew_blocking(&wanted, paths, token.clone().zip(settled.zone.clone()), now)
-                    .map_err(RenewError::Acme)?;
+                    .map_err(|source| RenewError::Acme {
+                        source: Box::new(source),
+                        // The certificate being replaced, not the one
+                        // being asked for: it is the one still on disk
+                        // when this fails.
+                        not_after: state.tls.not_after,
+                        now,
+                    })?;
             warnings.extend(issued.warnings.iter().cloned());
             Some(issued)
         }
@@ -943,7 +950,18 @@ pub enum RenewError {
     /// The hub's TLS settings changed while this run was working.
     Moved,
     Cloudflare(cfapi::CfError),
-    Acme(acme::AcmeError),
+    /// The CA refused. The two dates ride along because what to do
+    /// about a rate limit depends on them: whether the certificate
+    /// this hub is serving outlasts the wait, or has already lapsed
+    /// (§13). `not_after` is `None` when it could not be read (§9.1).
+    Acme {
+        // Boxed: `AcmeError` is by some way the largest thing this enum
+        // can hold, and every `Result<_, RenewError>` in this module
+        // pays for it by value.
+        source: Box<acme::AcmeError>,
+        not_after: Option<i64>,
+        now: i64,
+    },
     State(String),
 }
 
@@ -997,7 +1015,26 @@ impl fmt::Display for RenewError {
                  was recorded. Run it again",
             ),
             RenewError::Cloudflare(e) => write!(f, "{e}"),
-            RenewError::Acme(e) => write!(f, "{e}"),
+            // A renewal always has a certificate on disk — that is
+            // what it is renewing — so the advice here is the opposite
+            // of `init`'s: do not reach for the flag that would replace
+            // it. Whether *waiting* is free is a question for the
+            // dates, which is why they came along.
+            RenewError::Acme {
+                source,
+                not_after,
+                now,
+            } => write!(
+                f,
+                "{source}{}",
+                acme::rate_limit_advice(
+                    source,
+                    acme::Standing::Serving {
+                        not_after: *not_after,
+                        now: *now
+                    }
+                )
+            ),
             RenewError::State(e) => write!(f, "{e}"),
         }
     }

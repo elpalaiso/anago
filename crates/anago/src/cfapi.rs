@@ -1193,6 +1193,23 @@ impl<'a> Challenge<'a> {
     }
 }
 
+/// What to say when the challenge record could not be taken back out.
+///
+/// A pure function rather than two `eprintln!`s inside [`Drop`],
+/// because this is the half of DNS-01 cleanup that a test can never
+/// reach through the guard itself — and it is the half that has to be
+/// right. A stray TXT record is harmless to everything but tidiness
+/// (nothing reads it after validation), but nobody goes looking for one
+/// they were not told about, so it is named in full: the id to delete
+/// and the name it sits at.
+pub fn left_behind(name: &str, record_id: &str, error: &CfError) -> String {
+    format!(
+        "anago: warning: the DNS-01 challenge record could not be removed: {error}\n\
+         \x20      delete the TXT record {record_id} at {name} in the Cloudflare \
+         dashboard; nothing needs it after validation\n"
+    )
+}
+
 impl Drop for Challenge<'_> {
     fn drop(&mut self) {
         let Some(record_id) = self.record_id.take() else {
@@ -1204,12 +1221,7 @@ impl Drop for Challenge<'_> {
             .map_err(CfError::Client)
             .and_then(|authorization| delete_record(&authorization, &self.zone_id, &record_id));
         if let Err(e) = removed {
-            eprintln!("anago: warning: the DNS-01 challenge record could not be removed: {e}");
-            eprintln!(
-                "       delete the TXT record {record_id} at {} in the Cloudflare dashboard; \
-                 nothing needs it after validation",
-                self.name
-            );
+            eprint!("{}", left_behind(&self.name, &record_id, &e));
         }
     }
 }
@@ -1410,7 +1422,11 @@ impl fmt::Display for CfError {
             CfError::ZoneNotFound { domain, tried } => write!(
                 f,
                 "no Cloudflare zone holds {domain} (tried {}). Either the domain is not \
-                 on this Cloudflare account, or the token is scoped to a different zone",
+                 on the account this token belongs to, or the token cannot see the zone \
+                 it is on — one scoped to a single zone lists that zone and no other, \
+                 which looks exactly like an empty account from here. Look for the \
+                 domain in that account's dashboard, and add the zone to the token's \
+                 Zone Resources",
                 tried.join(", ")
             ),
             CfError::ZoneAmbiguous { name, count } => write!(
@@ -2169,8 +2185,12 @@ mod tests {
         assert!(notice.contains("Nothing else is affected"), "{notice}");
         assert!(notice.contains("by hand"), "{notice}");
         // The reason travels with it, so the person can fix the token
-        // rather than wonder why the automation went quiet.
-        assert!(notice.contains("scoped to a different zone"), "{notice}");
+        // rather than wonder why the automation went quiet — and both
+        // reasons do, because a token that cannot see the zone and an
+        // account that does not hold it look identical from here.
+        assert!(notice.contains("not on the account"), "{notice}");
+        assert!(notice.contains("cannot see the zone"), "{notice}");
+        assert!(notice.contains("Zone Resources"), "{notice}");
     }
 
     #[test]

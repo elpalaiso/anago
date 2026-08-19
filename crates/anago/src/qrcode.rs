@@ -142,6 +142,48 @@ mod tests {
     }
 
     #[test]
+    fn the_code_grows_with_the_hub_name_and_the_usage_says_so() {
+        // `anago help join` says 80 columns is enough for an ordinary
+        // hub name and that a long one needs more. Neither half of that
+        // is obvious, and the fixture above — a 15-character name —
+        // only ever exercises the first. This pins both, so the wording
+        // cannot quietly become a promise.
+        use anago_core::state::PrivateKey;
+        use anago_core::subnet::Subnet;
+        use anago_core::wgconf::{export_profile, ClientProfile};
+
+        let with_name = |domain: &str| {
+            let profile = export_profile(&ClientProfile {
+                address: "10.100.0.234".parse().unwrap(),
+                subnet: Subnet::parse("10.100.0.0/24").unwrap(),
+                private_key: PrivateKey::new("cGhvbmUgcHJpdmF0ZSBrZXkgaGVyZSAxMjM0NTY3OD0="),
+                server_public_key: "Xtt7u1I5qnMB8k6yMkjTDpJAc+3tPLPV9dg/yeb+qdE=".to_string(),
+                server_endpoint: format!("{domain}:51820"),
+            });
+            let modules = encode(&profile).expect("a config is nowhere near too long");
+            qr::columns(modules.size(), Blocks::Half)
+        };
+
+        // An ordinary name, and one at the far end of ordinary.
+        assert!(with_name("net.example.com") <= ASSUMED_COLUMNS);
+        assert!(with_name(&format!("{}.example.com", "a".repeat(30))) <= ASSUMED_COLUMNS);
+
+        // And a name DNS would still carry — 253 characters is the
+        // limit — does not fit, which is why the usage says the width
+        // follows the name rather than promising a number. A hub like
+        // that is refused before it is drawn, not drawn wrapped
+        // (`JoinError::TooNarrow`); the join code is spent by then,
+        // which is the cost this sentence exists to warn about.
+        let label = "a".repeat(63);
+        let longest = [&label[..], &label, &label, &label[..61]].join(".");
+        assert_eq!(longest.len(), 253);
+        assert!(
+            with_name(&longest) > ASSUMED_COLUMNS,
+            "if this ever fits, the usage can promise it"
+        );
+    }
+
+    #[test]
     fn a_terminal_that_cannot_be_asked_is_assumed_narrow() {
         // Under `cargo test` standard output is a pipe, so this is the
         // fallback path. Guessing wider than eighty would draw a code

@@ -1116,7 +1116,15 @@ impl fmt::Display for InitError {
             InitError::Tls(e) => write!(f, "{e}"),
             InitError::Plan(e) => write!(f, "{e}"),
             InitError::Cloudflare(e) => write!(f, "{e}"),
-            InitError::Acme(e) => write!(f, "{e}"),
+            // The way round a rate limit depends on what this hub
+            // would be giving up, and `init` is the run where the
+            // answer is "nothing" — it refuses to touch a hub that
+            // already exists (`AlreadyInitialized`).
+            InitError::Acme(e) => write!(
+                f,
+                "{e}{}",
+                acme::rate_limit_advice(e, acme::Standing::NoCertificateYet)
+            ),
             InitError::AfterIssuance { source } => write!(
                 f,
                 "{source}\n       A certificate had already been issued and was \

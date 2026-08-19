@@ -407,13 +407,20 @@ pub enum ProbeError {
 impl fmt::Display for ProbeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            // What became of the record is deliberately not said here.
+            // This module publishes nothing and removes nothing — the
+            // record belongs to `cfapi::Challenge`, whose guard takes
+            // it out as the run unwinds and says so itself when it
+            // cannot. Claiming "the record has been removed" from here
+            // would be a claim made before the attempt, and on the
+            // path where the attempt fails a person would be told both
+            // that it is gone and to go and delete it.
             ProbeError::NotServed { name, waited } => write!(
                 f,
                 "the DNS-01 record for {name} was published, and the nameservers for the \
                  zone were still not serving it {} seconds later — so anago did not ask \
-                 for a validation that was going to fail. The record has been removed. \
-                 Try again, or use HTTP-01 (--acme-challenge http-01), which does not \
-                 wait on DNS at all",
+                 for a validation that was going to fail. Try again, or use HTTP-01 \
+                 (--acme-challenge http-01), which does not wait on DNS at all",
                 waited.as_secs()
             ),
             ProbeError::Name(e) => write!(f, "{e}"),
@@ -639,10 +646,15 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains(NAME), "{message}");
         assert!(message.contains("60 seconds"), "{message}");
-        // Two things the person needs: the record is not still sitting
-        // there, and HTTP-01 does not wait on DNS at all.
-        assert!(message.contains("has been removed"), "{message}");
+        // What the person needs from *this* module: HTTP-01 does not
+        // wait on DNS at all.
         assert!(message.contains("http-01"), "{message}");
+        // And what it must not say: this module publishes no record and
+        // removes none, so it cannot report on one. The claim used to
+        // be here, made before the removal was even attempted — and on
+        // the path where the attempt fails the person was told both
+        // that it was gone and to go and delete it.
+        assert!(!message.contains("removed"), "{message}");
     }
 
     #[test]
