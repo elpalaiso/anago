@@ -85,4 +85,4 @@ M0의 수동 경로는 **그대로 남긴다** — `--tls-cert/--tls-key`로 기
 - [x] 에러 메시지·usage 일괄 점검: :80 점유·권한, CF 토큰 권한 부족·zone 없음, 프록시 켜짐, ACME 레이트 리밋, DNS 전파 타임아웃, 타이머 설치 불가, QR 미지원 터미널
 - [x] README 갱신: M1 사용법(자동 TLS·DNS 경로와 M0 수동 경로 둘 다), 폰 join(QR) 절차, 타이머 설치·확인 방법, 필요한 방화벽 포트 변경(:80)
 - [x] DESIGN.md §11의 M1 상태 갱신 + `HUMAN-VERIFY.md`에 M1 절 추가: 실 ACME 발급·갱신 성공, :80 개방(HTTP-01), CF A 레코드 실제 반영·프록시 off, DNS-01 발급, 폰이 QR로 합류해 상호 ping, 타이머가 실제로 주기 실행됨, 재부팅 후 타이머·인증서 유지
-- [ ] `cargo test`·`cargo build`(가능하면 `cargo clippy`) 그린 확인, REVIEW.md 지적 반영 여부 점검 (커밋은 지시가 있을 때만)
+- [x] `cargo test`·`cargo build`(가능하면 `cargo clippy`) 그린 확인, REVIEW.md 지적 반영 여부 점검 (커밋은 지시가 있을 때만)
