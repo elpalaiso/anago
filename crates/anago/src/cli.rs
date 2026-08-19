@@ -158,10 +158,30 @@ pub struct Join {
     pub domain: String,
     pub code: JoinCode,
     /// `None` means the client fills in this machine's hostname.
+    ///
+    /// **Never `None` when `export` is set.** The parser refuses that
+    /// combination, because the hostname belongs to the machine typing
+    /// the command and what is being registered is a phone (§8).
     pub name: Option<DeviceName>,
     /// Control-API port. Must match the hub's `--api-port`, which is
     /// why it is a flag and not a guess.
     pub api_port: u16,
+    /// `Some` turns this from "register this machine" into "register a
+    /// phone on its behalf" (§8, §7.3). Nothing is applied locally: no
+    /// wg config, no `device.json`.
+    pub export: Option<Export>,
+}
+
+/// What `--export` produces, and where it goes (§7.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Export {
+    /// `--export qr` — drawn on the terminal, and only there. There is
+    /// no `--out` for it: anago writes no image files, because §10.2
+    /// keeps an image crate out of the binary.
+    Qr,
+    /// `--export conf` — the config text, on stdout unless `--out`
+    /// names a file to put it in instead.
+    Conf { out: Option<PathBuf> },
 }
 
 /// `anago rm <name>`.
@@ -453,16 +473,10 @@ fn join(argv: &[String]) -> Result<Command, CliError> {
         Flag::value("name"),
         Flag::value("api-port"),
         Flag::value("export"),
+        Flag::value("out"),
     ];
     let parsed = ParsedArgs::parse(argv, &spec)?;
-
-    if parsed.is_set("export") {
-        return Err(CliError::NotYet {
-            what: "--export",
-            milestone: "M1",
-            because: "phones join through the official WireGuard app once it can emit a config",
-        });
-    }
+    let export = export(&parsed)?;
 
     let positionals = parsed.positionals();
     let (host, code) = match positionals {
@@ -477,6 +491,15 @@ fn join(argv: &[String]) -> Result<Command, CliError> {
             flag: "name",
             message: e.to_string(),
         })?),
+        // Fine for this machine, never for a phone: see [`Join::name`].
+        None if export.is_some() => {
+            return Err(CliError::Needs {
+                flag: "--export",
+                needs: "--name",
+                because: "without it the name would be this machine's hostname, and what \
+                          is being registered is the phone",
+            })
+        }
         None => None,
     };
 
@@ -489,7 +512,59 @@ fn join(argv: &[String]) -> Result<Command, CliError> {
             message: e.to_string(),
         })?,
         name,
+        export,
     }))
+}
+
+/// `--export qr|conf`, and the `--out` that belongs to one of them.
+///
+/// Two flags, three rules.
+///
+/// The **value** is one of exactly two words. Anything else names both,
+/// rather than leaving somebody to guess whether `png` or `image` was
+/// the one meant.
+///
+/// **`--out` belongs to `conf` alone.** With `qr` it is not a narrower
+/// request but an impossible one — a QR code goes on the terminal, and
+/// anago writes no image file to put one in (§10.2). Refused rather
+/// than ignored: a flag accepted and dropped looks exactly like a flag
+/// that worked, and this one would have somebody looking for a file
+/// that was never going to exist.
+///
+/// **`--out` without `--export` is nothing at all.** A local join
+/// writes `/etc/wireguard/anago.conf` and `device.json` at paths §9
+/// decides; there is no output for `--out` to redirect.
+fn export(parsed: &ParsedArgs) -> Result<Option<Export>, CliError> {
+    let out = out(parsed);
+    let Some(kind) = parsed.value("export") else {
+        if out.is_some() {
+            return Err(CliError::Orphan {
+                flag: "--out",
+                needs: "--export conf",
+            });
+        }
+        return Ok(None);
+    };
+    match kind {
+        "conf" => Ok(Some(Export::Conf { out })),
+        "qr" => match out {
+            None => Ok(Some(Export::Qr)),
+            Some(_) => Err(CliError::Contradiction("--export qr", "--out")),
+        },
+        other => Err(CliError::BadValue {
+            flag: "export",
+            message: format!("{other:?} is not qr or conf"),
+        }),
+    }
+}
+
+/// `--out <path>`.
+///
+/// No demand that it be absolute — unlike `--config`, this one is typed
+/// by a person in a shell that has a working directory they can see.
+/// Empty is already refused a layer down, where every flag's value is.
+fn out(parsed: &ParsedArgs) -> Option<PathBuf> {
+    parsed.value("out").map(PathBuf::from)
 }
 
 fn sync(argv: &[String]) -> Result<Command, CliError> {
@@ -730,6 +805,14 @@ pub enum CliError {
         flag: &'static str,
         needs: &'static str,
     },
+    /// A flag that cannot stand without another one — the mirror of
+    /// [`CliError::Orphan`], where it is the *given* flag that is
+    /// incomplete rather than the one left over.
+    Needs {
+        flag: &'static str,
+        needs: &'static str,
+        because: &'static str,
+    },
     /// Flags that do not together describe a hub anago can set up
     /// ([`acme::plan`]).
     Plan(PlanError),
@@ -773,6 +856,11 @@ impl fmt::Display for CliError {
             CliError::Orphan { flag, needs } => {
                 write!(f, "{flag} only means something with {needs}")
             }
+            CliError::Needs {
+                flag,
+                needs,
+                because,
+            } => write!(f, "{flag} needs {needs} — {because}"),
             CliError::Plan(e) => write!(f, "{e}"),
             CliError::Token(e) => write!(f, "{e}"),
             CliError::BadArgument { what, message } => write!(f, "{what}: {message}"),
@@ -865,6 +953,8 @@ it, and `server init` refuses to run twice.
         Some("join") => format!(
             "\
 usage: anago join <domain> <code> [--name <name>] [--api-port <port>]
+       anago join <domain> <code> --export conf --name <name> [--out <path>]
+       anago join <domain> <code> --export qr --name <name>
 
 Registers this device with the hub at <domain>. The wg keypair is made
 here and the private key never leaves — the server sees the public half
@@ -872,6 +962,14 @@ only. Without --name the machine's hostname is used.
 
 --api-port has to match the hub's; pass it when the server was set up
 with a non-default one.
+
+--export registers a phone instead, and leaves nothing on this machine:
+no wg config and no device file. --name is required there, because the
+hostname default would name this machine. `conf` prints the config,
+`--out` puts it in a file at 0600 instead (an existing file is an error,
+never an overwrite). `qr` draws it on the terminal and takes no --out —
+anago writes no image files. Either way the text holds the phone's
+private key: move it, then clear the file or the scrollback.
 
 Join codes are single use and expire; ask the server for another with
 `anago code`. Format: {code}
@@ -1107,6 +1205,8 @@ mod tests {
                 code: JoinCode::parse("7QX4-M2KD").unwrap(),
                 name: None,
                 api_port: DEFAULT_API_PORT,
+                // Plain `join` registers *this* machine.
+                export: None,
             })
         );
 
@@ -1118,6 +1218,7 @@ mod tests {
                 code: JoinCode::parse("7QX4-M2KD").unwrap(),
                 name: Some(DeviceName::parse("맥북").unwrap()),
                 api_port: DEFAULT_API_PORT,
+                export: None,
             })
         );
     }
@@ -1241,11 +1342,163 @@ mod tests {
         }
     }
 
+    fn joined(args: &[&str]) -> Result<Join, CliError> {
+        let mut line = vec!["join", "net.example.com", "7QX4-M2KD"];
+        line.extend_from_slice(args);
+        match parse_args(&line)? {
+            Command::Join(join) => Ok(join),
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
-    fn later_flags_answer_the_same_way() {
-        let e =
-            parse_args(&["join", "net.example.com", "7QX4-M2KD", "--export", "qr"]).unwrap_err();
-        assert!(e.to_string().starts_with("--export arrives in M1"), "{e}");
+    fn export_names_the_two_things_it_can_produce() {
+        assert_eq!(
+            joined(&["--export", "conf", "--name", "폰"])
+                .unwrap()
+                .export,
+            Some(Export::Conf { out: None })
+        );
+        assert_eq!(
+            joined(&["--export", "qr", "--name", "폰"]).unwrap().export,
+            Some(Export::Qr)
+        );
+        // Anything else says both words rather than leaving somebody to
+        // guess whether `png` or `image` was the one meant.
+        for wrong in ["png", "CONF", "Qr", "qr conf", "qr,conf"] {
+            let e = joined(&["--export", wrong, "--name", "폰"]).unwrap_err();
+            assert_eq!(
+                e,
+                CliError::BadValue {
+                    flag: "export",
+                    message: format!("{wrong:?} is not qr or conf"),
+                },
+                "{wrong:?}"
+            );
+            assert_eq!(exit_code(&e), 2, "a mistake in typing, not a refusal");
+        }
+    }
+
+    #[test]
+    fn an_export_registers_a_phone_and_leaves_this_machine_alone() {
+        // Same domain, same code, same port — what changes is whose
+        // device this is. Nothing local follows from it (§8).
+        assert_eq!(
+            joined(&["--export", "conf", "--name", "폰", "--api-port", "8443"]).unwrap(),
+            Join {
+                domain: "net.example.com".to_string(),
+                code: JoinCode::parse("7QX4-M2KD").unwrap(),
+                name: Some(DeviceName::parse("폰").unwrap()),
+                api_port: 8443,
+                export: Some(Export::Conf { out: None }),
+            }
+        );
+        // The order the flags were typed in is not part of the meaning.
+        assert_eq!(
+            joined(&["--name", "폰", "--export", "qr"]).unwrap().export,
+            Some(Export::Qr)
+        );
+        // And a name still has to be a name.
+        assert!(matches!(
+            joined(&["--export", "conf", "--name", "phone.local"]),
+            Err(CliError::BadValue { flag: "name", .. })
+        ));
+    }
+
+    #[test]
+    fn exporting_needs_a_name_because_the_default_names_the_wrong_machine() {
+        // Without --name a join takes this machine's hostname, which is
+        // right for this machine and always wrong for the phone being
+        // registered on its behalf (§8).
+        for kind in ["conf", "qr"] {
+            let e = joined(&["--export", kind]).unwrap_err();
+            assert_eq!(
+                e,
+                CliError::Needs {
+                    flag: "--export",
+                    needs: "--name",
+                    because: "without it the name would be this machine's hostname, and \
+                              what is being registered is the phone",
+                },
+                "{kind}"
+            );
+            assert!(e.to_string().contains("--export needs --name"), "{e}");
+            assert_eq!(e.to_string().lines().count(), 1, "{e}");
+        }
+        // The rule belongs to --export and to nothing else: a local
+        // join still fills the name in from the hostname.
+        assert_eq!(joined(&[]).unwrap().name, None);
+    }
+
+    #[test]
+    fn out_belongs_to_conf_and_to_nothing_else() {
+        assert_eq!(
+            joined(&["--export", "conf", "--name", "폰", "--out", "phone.conf"])
+                .unwrap()
+                .export,
+            Some(Export::Conf {
+                out: Some(PathBuf::from("phone.conf")),
+            })
+        );
+        // Not a narrower request but an impossible one: a QR code goes
+        // on the terminal, and anago writes no image files (§10.2).
+        // Refused rather than dropped — a flag accepted and ignored
+        // looks exactly like one that worked, and this one would leave
+        // somebody looking for a file that was never coming.
+        assert_eq!(
+            joined(&["--export", "qr", "--name", "폰", "--out", "phone.png"]),
+            Err(CliError::Contradiction("--export qr", "--out"))
+        );
+        // A local join writes at the paths §9 decides; there is no
+        // output for --out to redirect.
+        assert_eq!(
+            joined(&["--out", "phone.conf"]),
+            Err(CliError::Orphan {
+                flag: "--out",
+                needs: "--export conf",
+            })
+        );
+        assert_eq!(
+            joined(&["--name", "맥북", "--out", "phone.conf"]),
+            Err(CliError::Orphan {
+                flag: "--out",
+                needs: "--export conf",
+            })
+        );
+    }
+
+    #[test]
+    fn an_empty_value_is_refused_before_it_means_anything() {
+        // `--out "$FILE"` with FILE unset, and the same for --export.
+        // Neither reaches the rules above: every flag's value is
+        // checked for emptiness a layer down, so there is one answer
+        // for all of them instead of one per flag.
+        for flag in ["out", "export"] {
+            let e = joined(&["--export", "conf", "--name", "폰", &format!("--{flag}"), ""])
+                .unwrap_err();
+            assert_eq!(
+                e,
+                CliError::Arg(ArgError::EmptyValue(if flag == "out" {
+                    "out"
+                } else {
+                    "export"
+                }))
+            );
+            assert!(e.to_string().contains("needs a non-empty value"), "{e}");
+        }
+    }
+
+    #[test]
+    fn the_usage_text_shows_both_shapes_of_join() {
+        let text = help(Some("join"));
+        assert!(
+            text.contains("--export conf --name <name> [--out <path>]"),
+            "{text}"
+        );
+        assert!(text.contains("--export qr --name <name>"), "{text}");
+        // The two things a person has to know before running it.
+        assert!(text.contains("leaves nothing on this machine"), "{text}");
+        assert!(text.contains("private key"), "{text}");
     }
 
     #[test]

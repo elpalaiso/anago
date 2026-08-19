@@ -235,6 +235,17 @@ fn manage_timer(
 
 /// `anago join <domain> <code>`.
 fn join_device(args: &cli::Join) -> ! {
+    // Stop before anything local happens. `--export` registers a
+    // *phone* and writes nothing here (§8), so falling through would
+    // put that phone's key in /etc/wireguard and its `device.json` in
+    // this user's config directory — the opposite of what was asked.
+    if args.export.is_some() {
+        eprintln!("anago: exporting a phone's config is not wired up yet — the flags are");
+        eprintln!("       understood, but rendering the config and drawing the QR land");
+        eprintln!("       next. Nothing was registered, so the join code is still good.");
+        std::process::exit(EXIT_FAILED);
+    }
+
     let client_paths = match paths::client_config_dir_from_env() {
         Ok(paths) => paths,
         Err(e) => {
