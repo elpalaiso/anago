@@ -30,10 +30,6 @@ mod dnsprobe;
 mod fsutil;
 mod init;
 mod join;
-// The mac half of the sync timer: the property list and the two
-// `launchctl` lines. Written and tested here; the command that installs
-// them lands next, alongside systemd's.
-#[allow(dead_code)]
 mod launchd;
 mod ls;
 mod paths;
@@ -44,6 +40,7 @@ mod serve;
 mod store;
 mod sync;
 mod systemd;
+mod timer;
 mod tls;
 mod wg;
 mod wgapply;
@@ -155,14 +152,11 @@ fn server_run() -> ! {
 
 /// `anago sync` — on a device, pull the peer list (§6.3).
 fn sync_device(args: &cli::Sync) -> ! {
-    if args.timer.is_some() {
-        eprintln!("anago: installing the sync timer is not wired up yet — the flags are");
-        eprintln!("       understood, but writing the unit lands next. Meanwhile `anago sync`");
-        eprintln!("       run by hand does the same work (§6.3).");
-        std::process::exit(EXIT_FAILED);
+    let wg_config = paths::wg_config(paths::DEFAULT_WG_DIR);
+    if let Some(timer) = args.timer {
+        manage_timer(timer, args.config.as_deref(), &wg_config);
     }
 
-    let wg_config = paths::wg_config(paths::DEFAULT_WG_DIR);
     let synced = sync::run(args.config.as_deref(), &wg_config, args.quiet);
     if !synced.report.is_empty() {
         // stdout is what the run found; stderr is what it could not
@@ -176,6 +170,67 @@ fn sync_device(args: &cli::Sync) -> ! {
         }
     }
     std::process::exit(synced.ending.exit_code());
+}
+
+/// `anago sync --install-timer` / `--uninstall-timer` (§8).
+///
+/// The device file is resolved here, while `sudo` still says who ran
+/// the command — the unit itself will run with none of that (§8).
+fn manage_timer(
+    timer: cli::Timer,
+    config: Option<&std::path::Path>,
+    wg_config: &std::path::Path,
+) -> ! {
+    let machine = timer::scheduler_here();
+    let unit_dir = std::path::Path::new(systemd::UNIT_DIR);
+    let daemon_dir = std::path::Path::new(launchd::DAEMON_DIR);
+
+    let result = match timer {
+        cli::Timer::Install { interval } => {
+            let device_file = match sync::device_file(config) {
+                Ok(path) => path,
+                Err(e) => {
+                    eprintln!("anago: {e}");
+                    std::process::exit(EXIT_FAILED);
+                }
+            };
+            // A unit needs an absolute program path, and a guess would
+            // be baked into a file that runs as root.
+            let exec = match std::env::current_exe() {
+                Ok(exec) => exec,
+                Err(e) => {
+                    eprintln!(
+                        "anago: could not find this binary's own path ({e}), and a schedule \n       \
+                         has to name it in full — run `anago sync` by hand instead"
+                    );
+                    std::process::exit(EXIT_FAILED);
+                }
+            };
+            timer::install(
+                machine,
+                &timer::Setup {
+                    exec: &exec,
+                    device_file: &device_file,
+                    wg_config,
+                    interval,
+                    unit_dir,
+                    daemon_dir,
+                },
+            )
+        }
+        cli::Timer::Uninstall => timer::uninstall(&timer::removal(machine, unit_dir, daemon_dir)),
+    };
+
+    match result {
+        Ok(report) => {
+            print!("{report}");
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("anago: {e}");
+            std::process::exit(EXIT_FAILED);
+        }
+    }
 }
 
 /// `anago join <domain> <code>`.

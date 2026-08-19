@@ -25,6 +25,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use crate::wg::Cmd;
+
 /// Where the units go, and what `systemctl` calls them.
 pub const UNIT_NAME: &str = "anago.service";
 pub const UNIT_DIR: &str = "/etc/systemd/system";
@@ -42,12 +44,7 @@ pub const UNIT_DIR: &str = "/etc/systemd/system";
 /// The names share the `anago-sync` stem on purpose: it is what
 /// `systemctl list-timers 'anago-sync*'` matches, and it is what lets
 /// the timer name the service it starts (§8).
-// The four pieces below are the whole text of the sync timer, and
-// they are pure: what `--install-timer` writes is decided and tested
-// here, and the slice that installs them adds only the writing.
-#[allow(dead_code)]
 pub const SYNC_SERVICE: &str = "anago-sync.service";
-#[allow(dead_code)]
 pub const SYNC_TIMER: &str = "anago-sync.timer";
 
 /// Full path of an installed unit.
@@ -270,7 +267,6 @@ fn shown(path: &Path) -> String {
 /// `ProtectSystem=strict` still appears in the unit while granting the
 /// run the whole filesystem, which is worse than no sandbox at all:
 /// it reads as one.
-#[allow(dead_code)]
 pub fn writable_dir(file: &Path) -> Result<&Path, Unusable> {
     let dir = file
         .parent()
@@ -306,7 +302,6 @@ pub fn writable_dir(file: &Path) -> Result<&Path, Unusable> {
 /// whether `BindPaths=` reaches a device file under `/home` through
 /// `ProtectHome=tmpfs` — `systemd-analyze security anago-sync.service`
 /// lists what is on, and one actual sync proves nothing else was shut.
-#[allow(dead_code)]
 pub fn sync_service_text(
     exec: &Path,
     device_file: &Path,
@@ -377,7 +372,6 @@ PrivateTmp=yes
 /// than the period, which is every machine where somebody is typing
 /// `--install-timer`, that seed has already elapsed and the first sync
 /// runs at once.
-#[allow(dead_code)]
 pub fn sync_timer_text(interval: Duration) -> String {
     let every = span(interval);
     format!(
@@ -406,7 +400,6 @@ WantedBy=timers.target
 /// two readings `--interval` refuses to guess between (§8). `min`
 /// leaves nothing to read twice. Whole seconds only; the parser only
 /// ever produces those.
-#[allow(dead_code)]
 pub fn span(interval: Duration) -> String {
     let seconds = interval.as_secs();
     if seconds == 0 {
@@ -419,6 +412,40 @@ pub fn span(interval: Duration) -> String {
         return format!("{}min", seconds / 60);
     }
     format!("{seconds}s")
+}
+
+/// The tool that loads them.
+pub const SYSTEMCTL: &str = "systemctl";
+
+/// `systemctl daemon-reload` — makes a written unit visible.
+pub fn daemon_reload() -> Cmd {
+    Cmd::new(SYSTEMCTL, &["daemon-reload"])
+}
+
+/// `systemctl enable --now anago-sync.timer` — starts it and brings it
+/// back at boot.
+///
+/// **The timer, never the service.** Enabling the service would run one
+/// sync at boot and never another, which is exactly the mistake its
+/// missing `[Install]` section is there to prevent.
+pub fn enable_sync_timer() -> Cmd {
+    Cmd::new(SYSTEMCTL, &["enable", "--now", SYNC_TIMER])
+}
+
+/// `systemctl disable --now anago-sync.timer` — stops it and takes it
+/// out of boot.
+pub fn disable_sync_timer() -> Cmd {
+    Cmd::new(SYSTEMCTL, &["disable", "--now", SYNC_TIMER])
+}
+
+/// `systemctl is-active anago-sync.timer` — exit 0 while it is armed.
+///
+/// Asked after a stop that failed, to turn "the command returned
+/// something" into an answer. An exit code is a contract; the wording
+/// of an error is not, and a removal that reads systemd's prose to
+/// decide whether a root timer is still running would be guessing.
+pub fn is_active_sync_timer() -> Cmd {
+    Cmd::new(SYSTEMCTL, &["is-active", SYNC_TIMER])
 }
 
 /// Writes the unit, reloads systemd, and enables it for boot.
@@ -454,7 +481,7 @@ pub fn is_available() -> bool {
 
 /// **Human verification needed**: runs `systemctl`.
 fn systemctl(args: &[&str]) -> Result<(), SystemdError> {
-    let output = Command::new("systemctl")
+    let output = Command::new(SYSTEMCTL)
         .args(args)
         .output()
         .map_err(|e| SystemdError::Run {

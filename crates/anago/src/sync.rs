@@ -324,7 +324,12 @@ impl Home {
 /// `--config` wins outright. Without it the §9 rules apply, which need
 /// a user session — which is exactly why a timer carries the path on
 /// its command line instead (§8).
-fn device_file(config_path: Option<&Path>) -> Result<PathBuf, SyncError> {
+///
+/// `--install-timer` resolves the path through this same function and
+/// bakes the answer into the unit (§8). One resolver, so the file the
+/// schedule reads is by construction the file a person's own
+/// `anago sync` would have read.
+pub fn device_file(config_path: Option<&Path>) -> Result<PathBuf, SyncError> {
     match config_path {
         Some(path) => Ok(path.to_path_buf()),
         None => paths::client_config_dir_from_env()

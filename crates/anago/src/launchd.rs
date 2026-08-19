@@ -86,7 +86,7 @@ pub fn sync_plist(
 ) -> Result<String, Unrepresentable> {
     let exec = string(exec)?;
     let device_file = string(device_file)?;
-    let seconds = interval.as_secs();
+    let seconds = start_interval(interval);
     Ok(format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -135,6 +135,19 @@ pub fn bootstrap(plist: &Path) -> Cmd {
 /// next boot.
 pub fn bootout() -> Cmd {
     Cmd::new(LAUNCHCTL, &["bootout", &target()])
+}
+
+/// `launchctl print system/<label>` — exit 0 while it is loaded.
+///
+/// The command §8 tells people to run, and the one a removal runs
+/// itself when a `bootout` failed: whether the daemon is still there is
+/// a question with a yes-or-no answer, and this asks it rather than
+/// reading launchctl's wording for a hint.
+///
+/// No `sudo` here — the removal is already root. The *printed* advice
+/// keeps it, because a person's shell is not.
+pub fn print() -> Cmd {
+    Cmd::new(LAUNCHCTL, &["print", &target()])
 }
 
 /// The period, as launchd counts it.

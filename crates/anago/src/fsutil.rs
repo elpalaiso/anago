@@ -25,6 +25,17 @@ pub const PRIVATE_FILE_MODE: u32 = 0o600;
 /// Mode for the directories those files sit in.
 pub const PRIVATE_DIR_MODE: u32 = 0o700;
 
+/// Mode for the files anago writes for the *system* to read: a systemd
+/// unit, a launchd property list.
+///
+/// Readable by anyone, writable by root alone. Both halves matter.
+/// World-writable would let any user rewrite what root runs at the next
+/// reload — and launchd refuses a group- or world-writable daemon
+/// outright. Unreadable would break `systemctl cat anago-sync.service`,
+/// which §8 tells people to run to see which device file the schedule
+/// reads, and the file holds nothing but paths anyway.
+pub const SYSTEM_FILE_MODE: u32 = 0o644;
+
 /// Writes `contents` to `path` atomically, 0600.
 ///
 /// The temp file is a sibling because `rename(2)` is only atomic within
@@ -44,6 +55,36 @@ pub fn write_private_bytes(path: &Path, contents: &[u8]) -> io::Result<()> {
     write_private_owned(path, contents, None)
 }
 
+/// Writes `contents` to `path` atomically, [`SYSTEM_FILE_MODE`]
+/// exactly.
+///
+/// Atomically because the reader is not a person: a systemd unit or a
+/// launchd plist half on disk is one a reload can pick up as a whole
+/// file. A rename means the name flips from the old contents to the new
+/// ones with nothing in between.
+pub fn write_system(path: &Path, contents: &str) -> io::Result<()> {
+    let tmp = temp_sibling(path)?;
+    let mut file = create_new_with(&tmp, SYSTEM_FILE_MODE)?;
+    let wrote = file
+        .write_all(contents.as_bytes())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(e) = wrote {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    match fs::rename(&tmp, path) {
+        Ok(()) => {
+            sync_parent(path);
+            Ok(())
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
 /// [`write_private`], giving the result to `owner`.
 ///
 /// The `fchown` happens on the temp file's own descriptor, before the
@@ -58,13 +99,19 @@ pub fn write_private_owned(
     let tmp = temp_sibling(path)?;
 
     let mut file = create_private_new(&tmp)?;
-    file.write_all(contents)?;
-    if let Some((uid, gid)) = owner {
-        give_fd_to(&file, uid, gid)?;
-    }
-    // Durability before visibility: rename must not expose a file whose
-    // contents are still in the page cache.
-    file.sync_all()?;
+    // Every step from here on has to undo the create if it fails: the
+    // error says nothing happened, so nothing may be left at the temp
+    // name to say otherwise.
+    let written = file
+        .write_all(contents)
+        .and_then(|()| match owner {
+            Some((uid, gid)) => give_fd_to(&file, uid, gid),
+            None => Ok(()),
+        })
+        // Durability before visibility: rename must not expose a file
+        // whose contents are still in the page cache.
+        .and_then(|()| file.sync_all());
+    let file = or_remove(file, &tmp, written)?;
     drop(file);
 
     match fs::rename(&tmp, path) {
@@ -253,17 +300,54 @@ fn sibling(path: &Path, suffix: &str) -> io::Result<PathBuf> {
 /// exclusively means the content never exists under a looser mode, and
 /// `O_NOFOLLOW` means a symlink left in its place is not followed.
 fn create_private_new(path: &Path) -> io::Result<File> {
+    create_new_with(path, PRIVATE_FILE_MODE)
+}
+
+/// The same, at whatever mode the caller needs.
+///
+/// The mode is set twice on purpose. `open(2)` takes it as a *maximum*
+/// — the umask can only clear bits, never add them, so the file can
+/// never arrive looser than asked — and then `fchmod` puts it exactly
+/// where it was asked for. Without the second step a tight umask would
+/// hand back a 0600 systemd unit, and what a file's permissions are
+/// would depend on the shell that ran the command.
+///
+/// `fchmod` on the descriptor rather than `chmod` on the name, for the
+/// same reason [`give_fd_to`] uses `fchown`.
+fn create_new_with(path: &Path, mode: u32) -> io::Result<File> {
     match fs::remove_file(path) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    OpenOptions::new()
+    let file = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(PRIVATE_FILE_MODE)
+        .mode(mode)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
+        .open(path)?;
+    let permissions = file.set_permissions(fs::Permissions::from_mode(mode));
+    or_remove(file, path, permissions)
+}
+
+/// Keeps a just-created file, or takes it away again and reports why.
+///
+/// Anything that fails **after** the create has to undo the create.
+/// Every caller here is writing a temp sibling it is about to rename,
+/// and the error it returns says nothing happened — so a file left at
+/// `<name>.tmp` is both a lie and litter for the next run to trip over.
+///
+/// Closed before it is unlinked, so nothing is still holding the inode
+/// when the name goes.
+fn or_remove(file: File, path: &Path, outcome: io::Result<()>) -> io::Result<File> {
+    match outcome {
+        Ok(()) => Ok(file),
+        Err(e) => {
+            drop(file);
+            let _ = fs::remove_file(path);
+            Err(e)
+        }
+    }
 }
 
 /// Best-effort directory flush so the rename itself survives a power
@@ -798,6 +882,108 @@ mod tests {
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "{\"version\":1}");
         assert_eq!(mode_of(&path), PRIVATE_FILE_MODE);
+    }
+
+    #[test]
+    fn a_system_file_is_readable_by_everyone_and_writable_by_root_alone() {
+        // A systemd unit or a launchd plist decides what runs as root.
+        // World-writable means any user can rewrite it before the next
+        // reload, and launchd refuses a group-writable daemon outright.
+        // Unreadable would break `systemctl cat anago-sync.service`,
+        // which §8 tells people to run.
+        let dir = TempDir::new();
+        let path = dir.join("anago-sync.timer");
+        write_system(&path, "[Timer]\nOnBootSec=5min\n").unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "[Timer]\nOnBootSec=5min\n"
+        );
+        assert_eq!(mode_of(&path), SYSTEM_FILE_MODE);
+        assert_eq!(mode_of(&path) & 0o022, 0, "nobody but root may write it");
+        assert_ne!(mode_of(&path) & 0o044, 0, "everybody may read it");
+
+        // The bound holds under every umask, because a umask can only
+        // clear bits and never add them — so this file can never
+        // arrive looser than it was asked for, whatever shell ran the
+        // command. The `fchmod` behind `write_system` is what makes it
+        // land on exactly this mode rather than something tighter.
+    }
+
+    #[test]
+    fn a_step_that_fails_after_the_create_takes_the_file_away_again() {
+        // Every writer here creates a temp sibling and renames it. A
+        // failure between those two returns an error saying nothing
+        // happened, so a file left at `<name>.tmp` is both a lie and
+        // litter — and the timer's rollback only knows about the final
+        // unit path, so it would never find it.
+        //
+        // The failing step is handed in rather than provoked: `fchmod`
+        // on a file this process just created does not fail on any
+        // machine a test can arrange, and the decision worth pinning is
+        // what happens when it does.
+        let dir = TempDir::new();
+        let path = dir.join("anago-sync.timer.tmp");
+
+        let file = create_new_with(&path, SYSTEM_FILE_MODE).unwrap();
+        assert!(path.exists(), "the create worked");
+        let e = or_remove(
+            file,
+            &path,
+            Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+        )
+        .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "the real cause");
+        assert!(!path.exists(), "and nothing left at {}", path.display());
+
+        // The success side hands the same file back untouched.
+        let mut kept = or_remove(
+            create_new_with(&path, SYSTEM_FILE_MODE).unwrap(),
+            &path,
+            Ok(()),
+        )
+        .unwrap();
+        kept.write_all(b"still open").unwrap();
+        drop(kept);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "still open");
+    }
+
+    #[test]
+    fn a_write_that_fails_leaves_no_temp_beside_the_target() {
+        // The whole-directory version of the rule above: whatever goes
+        // wrong, the only name that may exist afterwards is the one the
+        // caller asked for. Here the rename is what fails, because the
+        // target name is a directory.
+        let dir = TempDir::new();
+        let path = dir.join("anago-sync.service");
+        fs::create_dir(&path).unwrap();
+
+        assert!(write_system(&path, "[Service]\n").is_err());
+        let mut entries: Vec<String> = fs::read_dir(&dir.path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        entries.sort();
+        assert_eq!(entries, ["anago-sync.service"], "no .tmp left behind");
+    }
+
+    #[test]
+    fn a_system_file_arrives_whole_or_not_at_all() {
+        // A reload can pick up a half-written unit as if it were the
+        // whole file, so the name flips from the old contents to the
+        // new with nothing in between — and no temp file is left for
+        // the next run to find.
+        let dir = TempDir::new();
+        let path = dir.join("anago-sync.service");
+        write_system(&path, "the first version, which is longer").unwrap();
+        write_system(&path, "short").unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "short");
+        let entries: Vec<String> = fs::read_dir(&dir.path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries, ["anago-sync.service"]);
     }
 
     #[test]

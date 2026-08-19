@@ -69,7 +69,7 @@ M0의 수동 경로는 **그대로 남긴다** — `--tls-cert/--tls-key`로 기
 - [x] `sync.rs`(bin): 실패 처리 — 401(제거된 기기)일 때의 정리 안내, 네트워크 실패 시 타이머가 스팸하지 않도록 하는 종료 코드·로그 규약, 동시 실행 방지 잠금 + 유닛 테스트
 - [x] `systemd.rs`: `anago-sync.service` + `anago-sync.timer` 텍스트 생성 순수 함수(기본 주기, 사용자 단위 여부, 샌드박스 설정) + 유닛 테스트
 - [x] `launchd.rs`: 맥 plist 생성 순수 함수(`StartInterval`, 라벨, 로그 경로) + `launchctl bootstrap/bootout` 명령 조립 순수 함수 + 유닛 테스트
-- [ ] `sync --install-timer` / `--uninstall-timer`: 플랫폼 감지 → systemd 또는 launchd 설치·활성화, 비-systemd·비-맥 환경에서는 설치하지 않고 수동 실행 방법을 안내 + 설치 경로 결정부 유닛 테스트
+- [x] `sync --install-timer` / `--uninstall-timer`: 플랫폼 감지 → systemd 또는 launchd 설치·활성화, 비-systemd·비-맥 환경에서는 설치하지 않고 수동 실행 방법을 안내 + 설치 경로 결정부 유닛 테스트
 - [ ] `join` 성공 후 타이머 안내/자동 설치(A단계 결정대로) 반영 + 문구 유닛 테스트
 
 ## G. 폰 경로 — `join --export qr|conf`
