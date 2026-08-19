@@ -249,6 +249,15 @@ impl Tls {
         }
     }
 
+    /// The ACME details to change after a renewal — the same test as
+    /// [`Tls::renewable`], for the caller that has just been to the CA.
+    pub fn renewable_mut(&mut self) -> Option<&mut Acme> {
+        match &mut self.source {
+            TlsSource::Acme(acme) => Some(acme),
+            TlsSource::Manual => None,
+        }
+    }
+
     /// The ACME details when this certificate is ours to renew, `None`
     /// when it is somebody else's file.
     pub fn renewable(&self) -> Option<&Acme> {

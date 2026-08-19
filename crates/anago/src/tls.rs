@@ -174,11 +174,37 @@ pub fn io_hint(kind: io::ErrorKind) -> &'static str {
 /// **Human verification needed**: binding a port and completing a
 /// handshake needs a real machine and a real certificate; the parts
 /// that can be decided from bytes are tested above.
-pub async fn serve(addr: SocketAddr, config: ServerConfig, app: Router) -> io::Result<()> {
-    let tls = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(config));
+pub async fn serve(addr: SocketAddr, tls: Reloadable, app: Router) -> io::Result<()> {
     axum_server::bind_rustls(addr, tls)
         .serve(app.into_make_service())
         .await
+}
+
+/// The live TLS configuration, as a handle the listener reads on every
+/// handshake.
+///
+/// This is what makes renewal worth doing while the hub runs: the
+/// config is fetched per connection rather than captured once, so
+/// [`reload`] changes what the next handshake presents without dropping
+/// the connections already open, and without a restart nobody asked
+/// for.
+pub type Reloadable = axum_server::tls_rustls::RustlsConfig;
+
+/// A handle the listener will read from.
+pub fn reloadable(config: ServerConfig) -> Reloadable {
+    Reloadable::from_config(Arc::new(config))
+}
+
+/// Puts an already-loaded certificate in front of the listener.
+///
+/// **This cannot fail, and that is the point.** Reading and validating
+/// the new pair is [`load`]'s job and belongs *before* the state file
+/// is written; if the swap could fail after that, a hub would record a
+/// renewal it is not actually serving and then sit on the old
+/// certificate until it expired — the next check would see a fresh
+/// `renew_after` and do nothing (§9.1).
+pub fn swap(handle: &Reloadable, config: ServerConfig) {
+    handle.reload_from_config(Arc::new(config));
 }
 
 /// Why some PEM bytes are not a usable certificate and key.
@@ -273,6 +299,15 @@ impl std::error::Error for TlsError {}
 
 #[cfg(test)]
 mod tests {
+
+    /// A throwaway self-signed pair, so that the reload below swaps one
+    /// real certificate for another rather than a stub for a stub.
+    /// Generated for these tests; the key is public by construction and
+    /// belongs to nothing.
+    const CERT_A: &str = "-----BEGIN CERTIFICATE-----\nMIIBizCCATGgAwIBAgIUXys43iONJV3kteA847Y5xzoj17IwCgYIKoZIzj0EAwIw\nGjEYMBYGA1UEAwwPbmV0LmV4YW1wbGUuY29tMCAXDTI2MDgxOTAxMDMzMVoYDzIx\nMjYwNzI2MDEwMzMxWjAaMRgwFgYDVQQDDA9uZXQuZXhhbXBsZS5jb20wWTATBgcq\nhkjOPQIBBggqhkjOPQMBBwNCAASIPDFfU6+LAbNbhiXtHYBvPGNb5Lp0tn3wCtNs\nCWrwvUKevnHcY3CpHbUPD9kvdFLf4iBc+1X1GrobIk/QuNyyo1MwUTAdBgNVHQ4E\nFgQUsKLJkykZ5Mf5ggjV7x7w60lfNB0wHwYDVR0jBBgwFoAUsKLJkykZ5Mf5ggjV\n7x7w60lfNB0wDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNIADBFAiAv3pv/\nBs1Xj/35QG7dLCSCdtW5I6IDtUczwK65XhZyLAIhAOtE22DgWemYIHCCivp6FbtW\n/g/Xq40tYP8VUqc3Fj3Q\n-----END CERTIFICATE-----\n";
+    const KEY_A: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgp10L63N+7ARRCawO\n8pJL1eNELGVFFaLLNTSTOMxnDyehRANCAASIPDFfU6+LAbNbhiXtHYBvPGNb5Lp0\ntn3wCtNsCWrwvUKevnHcY3CpHbUPD9kvdFLf4iBc+1X1GrobIk/QuNyy\n-----END PRIVATE KEY-----\n";
+    const CERT_B: &str = "-----BEGIN CERTIFICATE-----\nMIIBizCCATGgAwIBAgIUE6efSE+EQmY2ekTk7j/rS4NRFSwwCgYIKoZIzj0EAwIw\nGjEYMBYGA1UEAwwPaHViLmV4YW1wbGUuY29tMCAXDTI2MDgxOTAxMDMzMVoYDzIx\nMjYwNzI2MDEwMzMxWjAaMRgwFgYDVQQDDA9odWIuZXhhbXBsZS5jb20wWTATBgcq\nhkjOPQIBBggqhkjOPQMBBwNCAATEhl6fe5R+QSX6ZKriCNz2c8SL6Wya5KzML+3r\nFRrvUhoVa5lxmlUrP4orq6b4+kenCMqRoz96ppNvzYxxgq0ro1MwUTAdBgNVHQ4E\nFgQU6+bq37P6bQZEe33mpuCwWKQxGt4wHwYDVR0jBBgwFoAU6+bq37P6bQZEe33m\npuCwWKQxGt4wDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNIADBFAiEA0Ijg\nGiMB5fb4jBmzBBXwqBc5ZiMs133hw97eDNUvRnUCIC98UgP1FrpeMv0eIOnNC+i1\n6Fw/trHxdI/h+9TYS+AQ\n-----END CERTIFICATE-----\n";
+    const KEY_B: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgX7aCvnsuEiXKyS/s\ntWHFaxT7bXCgzf2oEe+7ZBlLEDuhRANCAATEhl6fe5R+QSX6ZKriCNz2c8SL6Wya\n5KzML+3rFRrvUhoVa5lxmlUrP4orq6b4+kenCMqRoz96ppNvzYxxgq0r\n-----END PRIVATE KEY-----\n";
     use super::*;
     use std::fs;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -538,5 +573,69 @@ mod tests {
         assert!(io_hint(io::ErrorKind::PermissionDenied).contains("as root"));
         assert!(io_hint(io::ErrorKind::IsADirectory).contains("not the directory"));
         assert!(io_hint(io::ErrorKind::Other).contains("exists and is readable"));
+    }
+
+    #[test]
+    fn a_renewed_certificate_reaches_the_listener_without_a_restart() {
+        // Without this the renewal is pointless: the config is built
+        // once at startup, so a hub would keep presenting the expired
+        // certificate until somebody restarted it.
+        let dir = std::env::temp_dir().join(format!("anago-tls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("fullchain.pem");
+        let key = dir.join("privkey.pem");
+        std::fs::write(&cert, CERT_A).unwrap();
+        std::fs::write(&key, KEY_A).unwrap();
+
+        let loaded = load(&cert, &key).expect("the first pair");
+        let handle = reloadable(loaded.config);
+        let before = handle.get_inner();
+
+        // What a renewal does: replace both files, load the new pair,
+        // and only then swap it in.
+        std::fs::write(&cert, CERT_B).unwrap();
+        std::fs::write(&key, KEY_B).unwrap();
+        let renewed = load(&cert, &key).expect("the renewed pair");
+        swap(&handle, renewed.config);
+
+        let after = handle.get_inner();
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "the listener is still holding the configuration it started with"
+        );
+        // And the handle the listener holds is the same one — the swap
+        // happens underneath it, not beside it.
+        assert!(Arc::ptr_eq(&after, &handle.get_inner()));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_half_written_pair_leaves_the_old_certificate_serving() {
+        // The reload reads the files again rather than taking what the
+        // issuance had in memory, so a pair that does not match is
+        // caught here — while the hub is still serving the old one —
+        // instead of at the next restart.
+        let dir = std::env::temp_dir().join(format!("anago-tls-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("fullchain.pem");
+        let key = dir.join("privkey.pem");
+        std::fs::write(&cert, CERT_A).unwrap();
+        std::fs::write(&key, KEY_A).unwrap();
+
+        let handle = reloadable(load(&cert, &key).expect("the first pair").config);
+        let before = handle.get_inner();
+
+        // The certificate of one pair with the key of another. The
+        // load fails, so there is nothing to swap — the failure lands
+        // before the state file is written, not after.
+        std::fs::write(&cert, CERT_B).unwrap();
+        assert!(load(&cert, &key).is_err());
+        assert!(
+            Arc::ptr_eq(&before, &handle.get_inner()),
+            "a mismatched pair was put in front of the listener"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

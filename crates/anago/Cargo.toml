@@ -47,4 +47,7 @@ instant-acme = { version = "0.8", default-features = false, features = ["ring", 
 [dev-dependencies]
 # Drives the router in tests without binding a port.
 tower = { version = "0.5", default-features = false, features = ["util"] }
+# `tokio::time::pause` — the renewal loop waits in days, and a test that
+# waited with it would too.
+tokio = { version = "1", features = ["test-util"] }
 # tokio/axum/rustls/serde는 M0 서버 구현이 요구할 때 추가한다 (원칙 4).

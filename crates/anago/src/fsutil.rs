@@ -663,13 +663,12 @@ impl FileLock {
 
     /// Takes the lock if it is free, `None` if someone else holds it.
     ///
-    /// Only tests take a lock this way. Every caller in the program
-    /// waits instead: a `server init` that gave up because another one
-    /// held the lock for a moment would be worse than one that waited.
-    /// Keeping it here — rather than reimplementing `flock` in the
-    /// tests — means the contention they check is this lock, not a
-    /// lookalike.
-    #[cfg(test)]
+    /// Most callers wait instead: a `server init` that gave up because
+    /// another one held the lock for a moment would be worse than one
+    /// that waited. The renewal timer is the exception — if a person is
+    /// already renewing by hand, the timer has nothing to add by
+    /// queueing behind them for two minutes, and coming back later is
+    /// exactly what a timer is for.
     pub fn try_acquire(path: &Path) -> io::Result<Option<FileLock>> {
         let file = lock_file(path)?;
         match flock(&file, libc::LOCK_EX | libc::LOCK_NB) {

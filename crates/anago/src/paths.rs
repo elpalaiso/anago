@@ -73,6 +73,20 @@ impl ServerPaths {
         self.tls_dir().join("account.key")
     }
 
+    /// The flock target that serializes **issuance** — the renewal
+    /// timer against a `server renew` typed by hand (§9.1).
+    ///
+    /// Not the state lock: an issuance takes minutes (a CA looks, a
+    /// record spreads), and holding the state lock for that would stop
+    /// every join in the meantime. This one is held for the whole
+    /// attempt and protects what an issuance owns — the account file,
+    /// the certificate pair, and the CA's opinion of how often it is
+    /// being asked.
+    #[allow(dead_code)]
+    pub fn issue_lock(&self) -> PathBuf {
+        self.root.join("issue.lock")
+    }
+
     /// The flock target that serializes concurrent joins (§13).
     ///
     /// A separate file, not `state.json` itself: the writer replaces

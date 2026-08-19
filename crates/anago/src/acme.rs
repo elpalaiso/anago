@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anago_core::acme::ChallengeToken;
-use anago_core::state::{Acme, Challenge};
+use anago_core::state::{self, Acme, Challenge, ServerState};
 use axum::extract::{Path as AxumPath, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -31,6 +31,7 @@ use instant_acme::RetryPolicy;
 use crate::cfapi::{self, CfError, Source, Token, Zone};
 use crate::dnsprobe;
 use crate::fsutil;
+use crate::paths::ServerPaths;
 
 /// What `server init` was told.
 ///
@@ -1026,6 +1027,7 @@ pub async fn issue_http01(
         .map_err(|e| AcmeError::Order {
             domain: domain.to_string(),
             detail: e.to_string(),
+            retry_after: retry_after_of(&e),
         })?;
 
     // First pass: what the CA will ask for. The token's shape is
@@ -1037,6 +1039,7 @@ pub async fn issue_http01(
         let mut authorization = authorization.map_err(|e| AcmeError::Order {
             domain: domain.to_string(),
             detail: e.to_string(),
+            retry_after: retry_after_of(&e),
         })?;
         // An authorization the CA already considers valid — a recent
         // order for the same name — needs no challenge at all.
@@ -1096,6 +1099,7 @@ async fn tell_the_ca(order: &mut instant_acme::Order, domain: &str) -> Result<()
         let mut authorization = authorization.map_err(|e| AcmeError::Order {
             domain: domain.to_string(),
             detail: e.to_string(),
+            retry_after: retry_after_of(&e),
         })?;
         if authorization.status == instant_acme::AuthorizationStatus::Valid {
             continue;
@@ -1107,6 +1111,7 @@ async fn tell_the_ca(order: &mut instant_acme::Order, domain: &str) -> Result<()
         challenge.set_ready().await.map_err(|e| AcmeError::Order {
             domain: domain.to_string(),
             detail: e.to_string(),
+            retry_after: retry_after_of(&e),
         })?;
     }
     Ok(())
@@ -1120,19 +1125,20 @@ async fn wait_for_ready(
     challenge: Challenge,
     looked_at: &[String],
 ) -> Result<(), AcmeError> {
-    let failed = |detail: String| AcmeError::Validation {
+    let failed = |detail: String, retry_after: Option<Duration>| AcmeError::Validation {
         domain: domain.to_string(),
         challenge,
         looked_at: looked_at.to_vec(),
         detail,
+        retry_after,
     };
 
     let status = order
         .poll_ready(&retry_policy())
         .await
-        .map_err(|e| failed(e.to_string()))?;
+        .map_err(|e| failed(e.to_string(), retry_after_of(&e)))?;
     if status != instant_acme::OrderStatus::Ready {
-        return Err(failed(format!("the CA left the order {status:?}")));
+        return Err(failed(format!("the CA left the order {status:?}"), None));
     }
     Ok(())
 }
@@ -1143,6 +1149,7 @@ async fn finish(order: &mut instant_acme::Order, domain: &str) -> Result<Issued,
     let private_key = order.finalize().await.map_err(|e| AcmeError::Finalize {
         domain: domain.to_string(),
         detail: e.to_string(),
+        retry_after: retry_after_of(&e),
     })?;
     let certificate =
         order
@@ -1151,6 +1158,7 @@ async fn finish(order: &mut instant_acme::Order, domain: &str) -> Result<Issued,
             .map_err(|e| AcmeError::Finalize {
                 domain: domain.to_string(),
                 detail: e.to_string(),
+                retry_after: retry_after_of(&e),
             })?;
     Ok(Issued {
         certificate,
@@ -1218,6 +1226,7 @@ pub async fn issue_dns01(
         .map_err(|e| AcmeError::Order {
             domain: domain.to_string(),
             detail: e.to_string(),
+            retry_after: retry_after_of(&e),
         })?;
 
     // First pass: the values the CA will look for. For one hub that is
@@ -1229,6 +1238,7 @@ pub async fn issue_dns01(
         let mut authorization = authorization.map_err(|e| AcmeError::Order {
             domain: domain.to_string(),
             detail: e.to_string(),
+            retry_after: retry_after_of(&e),
         })?;
         if authorization.status == instant_acme::AuthorizationStatus::Valid {
             continue;
@@ -1312,6 +1322,7 @@ async fn tell_the_ca_dns01(order: &mut instant_acme::Order, domain: &str) -> Res
         let mut authorization = authorization.map_err(|e| AcmeError::Order {
             domain: domain.to_string(),
             detail: e.to_string(),
+            retry_after: retry_after_of(&e),
         })?;
         if authorization.status == instant_acme::AuthorizationStatus::Valid {
             continue;
@@ -1323,6 +1334,7 @@ async fn tell_the_ca_dns01(order: &mut instant_acme::Order, domain: &str) -> Res
         challenge.set_ready().await.map_err(|e| AcmeError::Order {
             domain: domain.to_string(),
             detail: e.to_string(),
+            retry_after: retry_after_of(&e),
         })?;
     }
     Ok(())
@@ -1365,6 +1377,690 @@ pub fn save(certificate: &Path, key: &Path, issued: &Issued) -> Result<(), AcmeE
         path: format!("{} and {}", key.display(), certificate.display()),
         detail: e.to_string(),
     })
+}
+
+// -------------------------------------------------------- renewal
+
+/// How often the hub looks at its own certificate.
+///
+/// Renewal windows are measured in days (§9.1), so this could be far
+/// rarer; an hour is chosen because it is also how quickly the hub
+/// notices a certificate somebody replaced by hand, and because a check
+/// costs a comparison against a number already in memory.
+pub const CHECK_EVERY: Duration = Duration::from_secs(60 * 60);
+
+/// The first wait after a failed renewal.
+///
+/// Fifteen minutes is not politeness, it is arithmetic: Let's Encrypt
+/// counts **failed validations per account, per hostname, per hour**
+/// (§13), and a hub that retries every minute would spend that budget
+/// in five minutes and then be locked out of the one hour when the
+/// problem might have been fixed. Doubling from fifteen puts three
+/// attempts in the first hour and fewer after that.
+pub const RETRY_BASE: Duration = Duration::from_secs(15 * 60);
+
+/// The longest anago will wait between attempts.
+///
+/// A day, because the renewal window is a third of a certificate's
+/// life — weeks — so a hub that fails for a day has lost nothing, and
+/// something that is broken for a day usually needs a person anyway.
+pub const RETRY_CAP: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The shortest wait after the CA says "you are doing this too often".
+///
+/// Not the ordinary backoff. Rate limits at Let's Encrypt refill over
+/// hours (§13), so creeping back up from fifteen minutes would spend
+/// several attempts learning what the CA already said.
+pub const RATE_LIMITED_FLOOR: Duration = Duration::from_secs(60 * 60);
+
+/// Why an attempt failed, as far as the schedule is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    /// Anything anago might fix by trying again — a DNS record that had
+    /// not spread, a network blip, a web server that was in the way.
+    Ordinary,
+    /// The CA refused because of a rate limit.
+    RateLimited,
+}
+
+/// Whether the CA said this was a rate limit.
+///
+/// Read out of the error text, because that is what there is:
+/// `instant-acme` reports the CA's problem document as an error and
+/// does not hand back the `Retry-After` header separately. Getting this
+/// wrong in either direction only changes how long anago waits, never
+/// whether it gives up — so a loose match is the right shape here.
+pub fn classify(detail: &str) -> FailureKind {
+    let detail = detail.to_ascii_lowercase();
+    if detail.contains("ratelimited")
+        || detail.contains("rate limit")
+        || detail.contains("too many")
+    {
+        FailureKind::RateLimited
+    } else {
+        FailureKind::Ordinary
+    }
+}
+
+/// The ordinary backoff: [`RETRY_BASE`] doubling to [`RETRY_CAP`].
+pub fn retry_delay(failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(16);
+    RETRY_BASE
+        .checked_mul(1u32 << doublings)
+        .unwrap_or(RETRY_CAP)
+        .min(RETRY_CAP)
+}
+
+/// How long to wait before the next attempt.
+///
+/// The longest of three things, because each of them is a floor rather
+/// than a preference:
+///
+/// - the ordinary backoff, which keeps anago inside the CA's
+///   failed-validation budget;
+/// - a floor for a rate limit the CA has already named;
+/// - anything the CA asked for explicitly (`Retry-After`), which is not
+///   a suggestion — ignoring it is how a temporary limit becomes a
+///   longer one (§13).
+pub fn next_attempt(failures: u32, kind: FailureKind, retry_after: Option<Duration>) -> Duration {
+    retry_delay(failures).max(ca_cooldown(kind, retry_after))
+}
+
+/// The part of the wait that belongs to the CA rather than to anago:
+/// the floor for a limit it named, and anything it asked for outright.
+///
+/// Zero when the CA said nothing about timing — an ordinary failure
+/// with no `Retry-After` is anago's own business, and only the backoff
+/// applies.
+pub fn ca_cooldown(kind: FailureKind, retry_after: Option<Duration>) -> Duration {
+    let floor = match kind {
+        FailureKind::Ordinary => Duration::ZERO,
+        FailureKind::RateLimited => RATE_LIMITED_FLOOR,
+    };
+    floor.max(retry_after.unwrap_or(Duration::ZERO))
+}
+
+/// A certificate this run obtained, and where it went.
+#[derive(Debug)]
+pub struct Renewed {
+    pub certificate_path: String,
+    pub key_path: String,
+    /// The zone a DNS-01 renewal actually used. `None` for HTTP-01,
+    /// which never looks one up.
+    pub zone_id: Option<String>,
+    /// The account URL the CA answered with — it can change when the
+    /// account was registered again (§9.1).
+    pub account_url: String,
+    /// What the certificate expires at, when anago could read it. `None`
+    /// keeps the conservative fallback in `Acme::issued` (§9.1).
+    pub not_after: Option<i64>,
+    pub warnings: Vec<String>,
+}
+
+/// One renewal, from the state file to files on disk.
+///
+/// The order is §9.1's, and it is the order that makes a failure
+/// harmless: the account credentials only after the certificate is in
+/// hand, the certificate and key as one pair, and the state file last
+/// — written by the caller, which holds the lock.
+///
+/// **Human verification needed**: this talks to a real CA.
+pub async fn renew(
+    state: &ServerState,
+    paths: &ServerPaths,
+    now: i64,
+) -> Result<Renewed, AcmeError> {
+    let acme = state.tls.renewable().ok_or_else(|| AcmeError::NotOurs {
+        path: state.tls.cert_path.clone(),
+    })?;
+    let contact = acme.contact.clone().unwrap_or_default();
+
+    let plan = registration(
+        Some(acme),
+        &acme.directory,
+        &contact,
+        &paths.account_key(),
+        // The **recorded** path, which is what `registration` decides
+        // against. Asking about the default instead would read a hub
+        // whose account lives somewhere else as one whose account is
+        // gone, and register a new one for no reason (§9.1).
+        Path::new(&acme.account_key_path).exists(),
+    );
+    let signed = sign_in(&plan, &acme.directory, &contact).await?;
+
+    let mut zone_id = None;
+    let issued = match acme.challenge {
+        Challenge::Http01 => issue_http01(&signed.account, &state.domain, CHALLENGE_PORT).await?,
+        Challenge::Dns01 => {
+            let (token, zone) = cloudflare_for(state)?;
+            zone_id = Some(zone.id.clone());
+            issue_dns01(&signed.account, &state.domain, &zone, &token, now).await?
+        }
+    };
+
+    // The account is only worth keeping once it has produced
+    // something: see `Pending::commit`.
+    signed.credentials.commit()?;
+    save(&paths.certificate(), &paths.private_key(), &issued)?;
+
+    Ok(Renewed {
+        certificate_path: paths.certificate().display().to_string(),
+        key_path: paths.private_key().display().to_string(),
+        zone_id,
+        account_url: signed.url,
+        // Reading the expiry out of the certificate lands with the rest
+        // of the DER work; until then the conservative fallback stands.
+        not_after: None,
+        warnings: issued.warnings,
+    })
+}
+
+/// The token and zone a DNS-01 renewal needs.
+///
+/// The zone is looked up rather than taken from `cloudflare.zone_id`
+/// alone, because the propagation check needs the zone's **nameservers**
+/// and those are not in the state file. It is one or two requests every
+/// six weeks, and the alternative is a renewal that publishes a record
+/// and then cannot see whether anyone serves it (§9.1).
+fn cloudflare_for(state: &ServerState) -> Result<(Token, Zone), AcmeError> {
+    let cloudflare = state.cloudflare.as_ref().ok_or_else(|| AcmeError::Dns01 {
+        domain: state.domain.clone(),
+        detail: "this hub has no Cloudflare settings recorded".to_string(),
+    })?;
+    let path = cloudflare
+        .token_path
+        .as_ref()
+        .ok_or_else(|| AcmeError::Dns01 {
+            domain: state.domain.clone(),
+            detail: "no Cloudflare token was kept for renewals".to_string(),
+        })?;
+    let loaded = cfapi::load(Source::File(PathBuf::from(path)), None, None)
+        .map_err(|e| dns01_error(&state.domain, e))?;
+    if let Some(warning) = loaded.warning {
+        eprintln!("anago: warning: {warning}");
+    }
+    let zone = cfapi::find_zone(&loaded.token, &state.domain)
+        .map_err(|e| dns01_error(&state.domain, e))?;
+    if zone.id != cloudflare.zone_id {
+        // The domain moved between Cloudflare accounts or zones. The
+        // record belongs where the name answers from, so the lookup
+        // wins — and `record` writes the new id back, or this warning
+        // and this extra lookup repeat at every renewal for ever.
+        eprintln!(
+            "anago: the zone for {} is now {} (was {})",
+            state.domain, zone.id, cloudflare.zone_id
+        );
+    }
+    Ok((loaded.token, zone))
+}
+
+/// Writes what a renewal changed into the state, ready to commit.
+///
+/// Pure over the state, so what a renewal records — and what it leaves
+/// alone — is a test rather than a thing to read off a running hub.
+pub fn record(state: &mut ServerState, renewed: &Renewed, now: i64) {
+    state.tls.not_after = renewed.not_after;
+    state.tls.cert_path.clone_from(&renewed.certificate_path);
+    state.tls.key_path.clone_from(&renewed.key_path);
+    if let Some(acme) = state.tls.renewable_mut() {
+        acme.account_url.clone_from(&renewed.account_url);
+        acme.issued(now, renewed.not_after);
+    }
+    if let (Some(zone_id), Some(cloudflare)) = (&renewed.zone_id, state.cloudflare.as_mut()) {
+        if cloudflare.zone_id != *zone_id {
+            // A zone the domain has moved to. The cached record id
+            // belonged to the old zone and means nothing in the new one
+            // (§9.1), so it goes with it.
+            cloudflare.zone_id.clone_from(zone_id);
+            cloudflare.record_id = None;
+        }
+    }
+}
+
+/// What the CA asked to be waited before the next attempt.
+///
+/// `instant-acme` does not hand back the `Retry-After` header itself,
+/// but it does carry the one place it matters most: a poll that timed
+/// out remembers when the server suggested coming back. Everything else
+/// is `None`, and the schedule falls back to its own arithmetic.
+pub fn retry_after_of(e: &instant_acme::Error) -> Option<Duration> {
+    match e {
+        instant_acme::Error::Timeout(Some(at)) => {
+            Some(at.saturating_duration_since(std::time::Instant::now()))
+        }
+        _ => None,
+    }
+}
+
+/// A failed renewal, in the terms the schedule needs.
+///
+/// The loop cannot work from a message: **how long to wait is a
+/// decision, and the CA gets a say in it** (§13). So a failure carries
+/// what it was — an ordinary problem or a rate limit — and how long the
+/// CA asked for, if it asked. Losing either of those to a `to_string()`
+/// is how a hub retries in an hour when it was told to come back in
+/// three days.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenewalFailure {
+    pub detail: String,
+    pub kind: FailureKind,
+    pub retry_after: Option<Duration>,
+}
+
+impl RenewalFailure {
+    /// Something that went wrong on this machine — the state file, the
+    /// disk, the listener. Never a rate limit, and never something the
+    /// CA has an opinion about the timing of.
+    pub fn local(detail: impl Into<String>) -> RenewalFailure {
+        RenewalFailure {
+            detail: detail.into(),
+            kind: FailureKind::Ordinary,
+            retry_after: None,
+        }
+    }
+
+    /// Somebody else is already issuing — a `server renew` typed by
+    /// hand while the timer came round.
+    ///
+    /// Not a failure of anything, and it is only carried as one because
+    /// the backoff is exactly the behaviour that suits it: come back
+    /// later, and not immediately, since retrying the moment the lock
+    /// frees would race the same person's next command.
+    pub fn busy() -> RenewalFailure {
+        RenewalFailure::local("another renewal is already running on this hub")
+    }
+}
+
+impl From<AcmeError> for RenewalFailure {
+    fn from(e: AcmeError) -> RenewalFailure {
+        RenewalFailure {
+            kind: classify(e.ca_detail().unwrap_or_default()),
+            retry_after: e.retry_after(),
+            detail: e.to_string(),
+        }
+    }
+}
+
+impl fmt::Display for RenewalFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+/// What the renewal loop remembers between attempts.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Renewals {
+    failures: u32,
+    /// The ordinary backoff: no attempt before this (epoch seconds).
+    not_before: i64,
+    /// The TLS settings the ordinary backoff was earned under.
+    ///
+    /// A backoff is only meaningful for the thing that failed. If the
+    /// CA, the challenge, the account or the certificate changes while
+    /// anago is waiting — `server renew` by hand is the ordinary way —
+    /// then what is being waited for no longer exists, and making the
+    /// new settings serve the old punishment is how a hub that was just
+    /// fixed still sits still for a day.
+    against: Option<Attempt>,
+    /// A wait the **CA** imposed. Kept apart from the one above,
+    /// because they answer to different people — see [`Cooldown`].
+    cooldown: Option<Cooldown>,
+}
+
+/// What a failure was against — enough of it to tell whether the next
+/// attempt would be the same request to the same CA.
+///
+/// **Not the whole TLS state.** The exponential backoff exists to stay
+/// inside the CA's failed-validation budget (§13), and that budget is
+/// counted per **account, hostname and CA** — the challenge type is not
+/// part of it. So four failures on HTTP-01 followed by
+/// `--acme-challenge dns-01` is still four failures already spent, and
+/// forgetting them would let the fifth attempt go out at once and the
+/// backoff start again at fifteen minutes.
+///
+/// What does make it a different budget is a different account or a
+/// different CA. And what makes the whole question moot is a
+/// certificate arriving from somewhere else, which is a success —
+/// `server renew` typed by hand while the timer waits.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct Attempt {
+    directory: Option<String>,
+    account: Option<String>,
+    /// The certificate in place when this failed. A different one means
+    /// somebody else succeeded in the meantime.
+    issued_at: Option<i64>,
+}
+
+impl Attempt {
+    fn of(tls: &state::Tls) -> Attempt {
+        match tls.renewable() {
+            Some(acme) => Attempt {
+                directory: Some(acme.directory.clone()),
+                account: Some(acme.account_url.clone()),
+                issued_at: Some(acme.issued_at),
+            },
+            None => Attempt::default(),
+        }
+    }
+}
+
+/// What, if anything, made a schedule stop applying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Forgotten {
+    /// The schedule still applies.
+    Nothing,
+    /// A certificate arrived from somewhere else — a success, whoever
+    /// managed it.
+    Certificate,
+    /// A different account or a different CA: a different budget, and
+    /// the old one says nothing about it.
+    Scope,
+}
+
+/// A wait the CA asked for: a rate limit it named, or a `Retry-After`
+/// it sent.
+///
+/// Separate from the ordinary backoff because **changing anago's
+/// settings does not change the CA's mind.** Let's Encrypt counts
+/// against an account, a hostname and a CA (§13) — not against a
+/// challenge type — so a hub that meets a limit and then switches from
+/// HTTP-01 to DNS-01 is the same hub asking the same CA for the same
+/// name. Clearing the wait there would turn "the CA said come back in
+/// three days" into a new order at the next hourly check, which is how
+/// a temporary limit becomes a longer one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Cooldown {
+    until: i64,
+    /// The directory the limit was met at, when it is known. Only a
+    /// different one lifts the wait: staging and production keep
+    /// separate limits, and a hub moved between them is not the hub
+    /// that was refused.
+    directory: Option<String>,
+}
+
+impl Renewals {
+    pub fn new() -> Renewals {
+        Renewals::default()
+    }
+
+    pub fn failures(&self) -> u32 {
+        self.failures
+    }
+
+    /// The moment the next attempt is allowed: the later of the
+    /// ordinary backoff and anything the CA asked for.
+    pub fn not_before(&self) -> i64 {
+        let cooldown = self.cooldown.as_ref().map_or(0, |wait| wait.until);
+        self.not_before.max(cooldown)
+    }
+
+    /// Records a failure against the settings it happened under, and
+    /// returns how long the next attempt waits.
+    pub fn failed(
+        &mut self,
+        now: i64,
+        kind: FailureKind,
+        retry_after: Option<Duration>,
+        against: Option<&state::Tls>,
+    ) -> Duration {
+        self.failures = self.failures.saturating_add(1);
+        self.against = against.map(Attempt::of);
+        self.not_before = now.saturating_add(retry_delay(self.failures).as_secs() as i64);
+
+        // What the CA had to say about the timing is recorded on its
+        // own, so that anago changing its mind cannot un-say it.
+        let imposed = ca_cooldown(kind, retry_after);
+        if !imposed.is_zero() {
+            let until = now.saturating_add(imposed.as_secs() as i64);
+            let directory = self
+                .against
+                .as_ref()
+                .and_then(|attempt| attempt.directory.clone());
+            match &mut self.cooldown {
+                // A longer wait already stands; the CA does not get to
+                // shorten itself by failing again.
+                Some(existing) if existing.until >= until => {}
+                slot => *slot = Some(Cooldown { until, directory }),
+            }
+        }
+
+        Duration::from_secs(self.not_before().saturating_sub(now).max(0) as u64)
+    }
+
+    /// Forgets a backoff that belongs to settings this hub no longer
+    /// has, and says whether it did.
+    ///
+    /// Two things reach here, and both mean the same thing — *what
+    /// failed is not what would be attempted now*:
+    ///
+    /// - the issuance settings changed (a different CA, challenge, or
+    ///   account), so the failure says nothing about what would happen
+    ///   next;
+    /// - a certificate arrived from somewhere else — `server renew` by
+    ///   hand — which moves `issued_at` and the schedule with it, and
+    ///   the next window's first failure should start at fifteen
+    ///   minutes rather than resume yesterday's twelve hours.
+    pub fn settings_changed(&mut self, tls: &state::Tls) -> Forgotten {
+        let now = Attempt::of(tls);
+
+        // A wait the CA imposed is only lifted by a different CA — not
+        // by anago rearranging its own settings (see [`Cooldown`]).
+        if let Some(cooldown) = &self.cooldown {
+            let elsewhere = match (&cooldown.directory, &now.directory) {
+                (Some(refused_at), Some(directory)) => directory != refused_at,
+                _ => false,
+            };
+            if elsewhere {
+                self.cooldown = None;
+            }
+        }
+
+        let Some(against) = &self.against else {
+            return Forgotten::Nothing;
+        };
+        let forgotten = if against.issued_at != now.issued_at {
+            // Somebody got a certificate. Whatever was failing is over.
+            Forgotten::Certificate
+        } else if against.directory != now.directory || against.account != now.account {
+            Forgotten::Scope
+        } else {
+            // Anything else — the challenge, a contact address, a path
+            // — is the same request to the same CA, and the attempts
+            // already spent are still spent.
+            return Forgotten::Nothing;
+        };
+
+        self.failures = 0;
+        self.not_before = 0;
+        self.against = None;
+        if forgotten == Forgotten::Certificate {
+            // A CA that issued has said the limit is not in the way.
+            self.cooldown = None;
+        }
+        forgotten
+    }
+
+    /// A certificate arrived: the schedule goes back to normal.
+    ///
+    /// **Only success resets this.** A run that is restarted resets it
+    /// too, by starting from a fresh value — which is a real hole in
+    /// the policy and a deliberate one: a hub whose renewal is broken
+    /// and whose operator keeps restarting it will retry more often
+    /// than the backoff intends, and the alternative is writing the
+    /// failure count into the state file, where it would outlive the
+    /// problem and delay a renewal that would have worked.
+    pub fn succeeded(&mut self) {
+        *self = Renewals::new();
+    }
+}
+
+/// What the loop should do on this tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tick {
+    /// Renew now.
+    Renew,
+    /// The certificate is fine.
+    NotDue { due_at: i64 },
+    /// Due, but the last attempt failed and its wait has not run out.
+    Waiting { until: i64 },
+    /// This hub serves a certificate somebody else issues (§9.1). anago
+    /// renews nothing here, and the loop keeps looking only because
+    /// `server renew --acme-email` can change that underneath it.
+    NotOurs,
+}
+
+/// Decides what to do, given the state on disk and the schedule in
+/// memory.
+///
+/// Pure, and it takes `now` rather than reading a clock, so every
+/// boundary below is a test rather than a thing to find out in eleven
+/// weeks.
+pub fn tick(tls: &state::Tls, now: i64, renewals: &Renewals) -> Tick {
+    let Some(due_at) = tls.renewal_due(state::RENEWAL_LEAD_SECS) else {
+        return Tick::NotOurs;
+    };
+    if !tls.needs_renewal(now, state::RENEWAL_LEAD_SECS) {
+        return Tick::NotDue { due_at };
+    }
+    if now < renewals.not_before() {
+        return Tick::Waiting {
+            until: renewals.not_before(),
+        };
+    }
+    Tick::Renew
+}
+
+/// How long to sleep before looking again.
+///
+/// Never longer than [`CHECK_EVERY`], so a certificate replaced by hand
+/// or a `server renew` that changed the schedule is noticed within the
+/// hour — and never past the moment something is due, so the renewal
+/// happens when it is meant to rather than up to an hour late.
+pub fn sleep_for(step: Tick, now: i64) -> Duration {
+    let until = match step {
+        Tick::Renew => return Duration::ZERO,
+        Tick::NotOurs => return CHECK_EVERY,
+        Tick::NotDue { due_at } => due_at,
+        Tick::Waiting { until } => until,
+    };
+    let seconds = until.saturating_sub(now).max(1) as u64;
+    Duration::from_secs(seconds).min(CHECK_EVERY)
+}
+
+/// The hub's renewal task: look, renew when it is time, back off when
+/// that fails.
+///
+/// `read` is called every tick rather than once, because the state can
+/// change underneath a running hub — `server renew` by hand, a
+/// certificate swapped for a manual one. `renew` does the issuing; it
+/// lives outside this function because what it takes (an account, a
+/// challenge, a Cloudflare token) belongs to the command that started
+/// the hub, and because it is the part that cannot be tested without a
+/// CA.
+///
+/// This never returns. It is spawned beside the listener and stops when
+/// the process does.
+///
+/// **Human verification needed**: the renewal itself needs a real CA.
+pub async fn renewal_loop<Read, Renew, Fut, Now>(read: Read, renew: Renew, now: Now) -> !
+where
+    Read: Fn() -> Result<state::Tls, String>,
+    Renew: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<(), RenewalFailure>>,
+    Now: Fn() -> i64,
+{
+    let mut renewals = Renewals::new();
+    // A separate schedule, because a state file that cannot be read is
+    // a different problem from a CA that will not issue, and one must
+    // not delay the other.
+    let mut unreadable = Renewals::new();
+
+    loop {
+        let at = now();
+        let (step, current) = match read() {
+            Ok(tls) => {
+                unreadable.succeeded();
+                match renewals.settings_changed(&tls) {
+                    Forgotten::Nothing => {}
+                    Forgotten::Certificate => eprintln!(
+                        "anago: a new certificate arrived from elsewhere — the renewal \
+                         schedule starts over"
+                    ),
+                    Forgotten::Scope => eprintln!(
+                        "anago: this hub has a different ACME account now — the renewal \
+                         schedule starts over"
+                    ),
+                }
+                (tick(&tls, at, &renewals), Some(tls))
+            }
+            // **Not** the same as a manual certificate. Reading the
+            // state failed, so nothing can be decided at all — and
+            // treating that as "nothing to renew" is how a hub sleeps
+            // quietly until its certificate expires. It is said out
+            // loud, and retried on the ordinary backoff.
+            Err(detail) => {
+                let delay = unreadable.failed(at, FailureKind::Ordinary, None, None);
+                eprintln!("anago: the state file could not be read, so the certificate cannot be checked: {detail}");
+                eprintln!(
+                    "       {}",
+                    waiting_line(delay, unreadable.failures(), FailureKind::Ordinary)
+                );
+                (
+                    Tick::Waiting {
+                        until: unreadable.not_before(),
+                    },
+                    None,
+                )
+            }
+        };
+
+        if step == Tick::Renew {
+            match renew().await {
+                Ok(()) => {
+                    renewals.succeeded();
+                    // The certificate is new; the next tick will find
+                    // it and go back to sleep for weeks.
+                    continue;
+                }
+                Err(failure) => {
+                    // The CA's own timing wins over anago's arithmetic:
+                    // `retry_after` travels with the failure for
+                    // exactly this line (§13).
+                    let delay =
+                        renewals.failed(now(), failure.kind, failure.retry_after, current.as_ref());
+                    eprintln!("anago: renewal failed: {failure}");
+                    eprintln!(
+                        "       {}",
+                        waiting_line(delay, renewals.failures(), failure.kind)
+                    );
+                }
+            }
+        }
+
+        tokio::time::sleep(sleep_for(step, at)).await;
+    }
+}
+
+/// The line that follows a failed renewal.
+///
+/// It says how long, and — when the CA named a rate limit — why the
+/// wait is longer than the failure count would suggest. Without that,
+/// an hour of silence after one failure looks like a hang.
+pub fn waiting_line(delay: Duration, failures: u32, kind: FailureKind) -> String {
+    let when = match delay.as_secs() {
+        secs if secs >= 3600 => format!("{} hours", secs / 3600),
+        secs => format!("{} minutes", secs / 60),
+    };
+    match kind {
+        FailureKind::RateLimited => format!(
+            "the CA is rate limiting this account, so the next attempt is in about \
+             {when}. The certificate on disk keeps working until it expires"
+        ),
+        FailureKind::Ordinary => format!(
+            "attempt {failures} — the next one is in about {when}. The certificate on \
+             disk keeps working until it expires"
+        ),
+    }
 }
 
 /// Why the account step failed.
@@ -1413,6 +2109,8 @@ pub enum AcmeError {
     Order {
         domain: String,
         detail: String,
+        /// What the CA asked to be waited, when it said (§13).
+        retry_after: Option<Duration>,
     },
     /// The CA does not offer the challenge type that was chosen.
     NoChallenge {
@@ -1422,6 +2120,10 @@ pub enum AcmeError {
     /// The CA's challenge token is not a shape anago will put in a URL.
     BadToken {
         detail: String,
+    },
+    /// This hub serves a certificate anago did not issue.
+    NotOurs {
+        path: String,
     },
     /// Neither IPv6 nor IPv4 exists on this host.
     NoAddressFamily {
@@ -1448,13 +2150,48 @@ pub enum AcmeError {
         /// record name it resolves for DNS-01.
         looked_at: Vec<String>,
         detail: String,
+        /// What the CA asked to be waited, when it said (§13).
+        retry_after: Option<Duration>,
     },
     /// The order was authorized and the certificate still did not
     /// arrive.
     Finalize {
         domain: String,
         detail: String,
+        /// What the CA asked to be waited, when it said (§13).
+        retry_after: Option<Duration>,
     },
+}
+
+impl AcmeError {
+    /// What the CA asked to be waited, when this failure came from the
+    /// CA and it said.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            AcmeError::Order { retry_after, .. }
+            | AcmeError::Finalize { retry_after, .. }
+            | AcmeError::Validation { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+
+    /// The CA's own words, without anago's advice wrapped round them.
+    ///
+    /// The advice mentions rate limits and ports for reasons of its
+    /// own, so classifying the whole message would read anago's writing
+    /// back as if the CA had said it.
+    pub fn ca_detail(&self) -> Option<&str> {
+        match self {
+            AcmeError::Order { detail, .. }
+            | AcmeError::Finalize { detail, .. }
+            | AcmeError::Validation { detail, .. }
+            | AcmeError::Register { detail, .. }
+            | AcmeError::SignIn { detail, .. }
+            | AcmeError::Dns01 { detail, .. }
+            | AcmeError::Propagation { detail } => Some(detail),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for AcmeError {
@@ -1539,6 +2276,12 @@ impl fmt::Display for AcmeError {
             AcmeError::Listen { port, detail, .. } => {
                 write!(f, "port {port} could not be opened: {detail}")
             }
+            AcmeError::NotOurs { path } => write!(
+                f,
+                "the certificate at {path} is not one anago issued, so there is nothing \
+                 here to renew. `anago server renew --acme-email <you@example.com>` \
+                 switches this hub to certificates anago gets and keeps up to date"
+            ),
             AcmeError::NoAddressFamily { port } => write!(
                 f,
                 "port {port} could not be opened on IPv4 or IPv6 — this host appears to \
@@ -1552,7 +2295,7 @@ impl fmt::Display for AcmeError {
             AcmeError::Propagation { detail } => {
                 write!(f, "{detail}\n{}", no_automatic_switch())
             }
-            AcmeError::Order { domain, detail } => write!(
+            AcmeError::Order { domain, detail, .. } => write!(
                 f,
                 "the certificate order for {domain} did not go through: {detail}"
             ),
@@ -1570,6 +2313,7 @@ impl fmt::Display for AcmeError {
                 challenge: Challenge::Http01,
                 looked_at,
                 detail,
+                ..
             } => write!(
                 f,
                 "the CA could not verify {domain}: {detail}. It fetches {} from outside, \
@@ -1583,6 +2327,7 @@ impl fmt::Display for AcmeError {
                 challenge: Challenge::Dns01,
                 looked_at,
                 detail,
+                ..
             } => write!(
                 f,
                 "the CA could not verify {domain}: {detail}. It resolves {} itself, from \
@@ -1594,7 +2339,7 @@ impl fmt::Display for AcmeError {
                 looked_at.join(", "),
                 no_automatic_switch()
             ),
-            AcmeError::Finalize { domain, detail } => write!(
+            AcmeError::Finalize { domain, detail, .. } => write!(
                 f,
                 "{domain} was verified and the certificate still did not arrive: {detail}. \
                  Nothing was saved; running this again re-uses the authorization the CA \
@@ -2581,6 +3326,7 @@ mod tests {
                 "http://net.example.com/.well-known/acme-challenge/{TOKEN}"
             )],
             detail: "the CA left the order Invalid".to_string(),
+            retry_after: None,
         };
         let message = error.to_string();
         assert!(message.contains(TOKEN), "{message}");
@@ -2604,6 +3350,7 @@ mod tests {
             challenge: Challenge::Dns01,
             looked_at: vec!["the TXT record at _acme-challenge.net.example.com".to_string()],
             detail: "the CA left the order Invalid".to_string(),
+            retry_after: None,
         };
         let message = error.to_string();
         let (diagnosis, offer) = message.split_once('\n').expect("two parts");
@@ -2869,6 +3616,687 @@ mod tests {
             VALIDATION_TIMEOUT <= Duration::from_secs(300),
             "a person is waiting"
         );
+    }
+
+    // ----------------------------------------------------- renewal
+
+    const DAY: i64 = 24 * 60 * 60;
+    const NOW_RENEW: i64 = 1_800_000_000;
+
+    fn acme_tls(renew_after: i64, not_after: i64) -> state::Tls {
+        let mut tls = state::Tls::acme(
+            "/var/lib/anago/tls/fullchain.pem",
+            "/var/lib/anago/tls/privkey.pem",
+            Acme {
+                directory: PRODUCTION.to_string(),
+                contact: Some(EMAIL.to_string()),
+                account_key_path: ACCOUNT_KEY.to_string(),
+                account_url: ACCOUNT_URL.to_string(),
+                challenge: Challenge::Http01,
+                issued_at: NOW_RENEW - 30 * DAY,
+                renew_after,
+            },
+        );
+        tls.not_after = Some(not_after);
+        tls
+    }
+
+    #[test]
+    fn the_backoff_fits_inside_the_cas_failure_budget() {
+        // Let's Encrypt counts failed validations per account, per
+        // hostname, per hour (§13). Retrying every minute would spend
+        // that budget in five minutes and lock the hub out of the hour
+        // in which the problem might have been fixed.
+        assert_eq!(retry_delay(1), RETRY_BASE);
+        assert_eq!(retry_delay(2), RETRY_BASE * 2);
+        assert_eq!(retry_delay(3), RETRY_BASE * 4);
+
+        let mut spent = Duration::ZERO;
+        let mut attempts = 0;
+        while spent < Duration::from_secs(3600) {
+            attempts += 1;
+            spent += retry_delay(attempts);
+        }
+        assert!(
+            attempts <= 5,
+            "{attempts} attempts in the first hour, and the CA allows 5"
+        );
+    }
+
+    #[test]
+    fn the_backoff_stops_growing_and_never_overflows() {
+        assert_eq!(retry_delay(20), RETRY_CAP);
+        assert_eq!(retry_delay(u32::MAX), RETRY_CAP);
+        // A day is long enough to be out of the way and short enough
+        // that a hub which starts working again is noticed the same
+        // week — the renewal window is a third of a certificate's life.
+        assert!(RETRY_CAP <= Duration::from_secs(7 * 24 * 3600));
+    }
+
+    #[test]
+    fn a_rate_limit_waits_longer_than_the_failure_count_would() {
+        // Creeping back up from fifteen minutes would spend several
+        // attempts learning what the CA has already said, and each one
+        // counts against the limit that is already full.
+        assert_eq!(
+            next_attempt(1, FailureKind::RateLimited, None),
+            RATE_LIMITED_FLOOR
+        );
+        assert!(RATE_LIMITED_FLOOR > retry_delay(1));
+        // Once the ordinary backoff is longer, it wins on its own.
+        assert_eq!(
+            next_attempt(6, FailureKind::RateLimited, None),
+            retry_delay(6)
+        );
+    }
+
+    #[test]
+    fn what_the_ca_asked_for_is_never_undercut() {
+        // `Retry-After` is not a suggestion: ignoring it is how a
+        // temporary limit becomes a longer one (§13).
+        let asked = Duration::from_secs(3 * 24 * 3600);
+        assert_eq!(
+            next_attempt(1, FailureKind::Ordinary, Some(asked)),
+            asked,
+            "the CA asked for longer than the cap and gets it"
+        );
+        assert_eq!(
+            next_attempt(1, FailureKind::Ordinary, Some(Duration::from_secs(60))),
+            RETRY_BASE,
+            "and a shorter one does not shorten the backoff"
+        );
+    }
+
+    #[test]
+    fn a_rate_limit_is_recognised_however_the_ca_words_it() {
+        for said in [
+            "urn:ietf:params:acme:error:rateLimited",
+            "Error creating new order :: too many certificates already issued",
+            "rate limit exceeded",
+        ] {
+            assert_eq!(classify(said), FailureKind::RateLimited, "{said}");
+        }
+        for said in [
+            "the CA left the order Invalid",
+            "connection refused",
+            "no such host",
+        ] {
+            assert_eq!(classify(said), FailureKind::Ordinary, "{said}");
+        }
+    }
+
+    #[test]
+    fn a_certificate_that_is_not_due_is_left_alone() {
+        let tls = acme_tls(NOW_RENEW + 10 * DAY, NOW_RENEW + 40 * DAY);
+        assert_eq!(
+            tick(&tls, NOW_RENEW, &Renewals::new()),
+            Tick::NotDue {
+                due_at: NOW_RENEW + 10 * DAY
+            }
+        );
+        // And the sleep runs to the due time, not an hour at a time
+        // forever — but never longer than one look.
+        assert_eq!(
+            sleep_for(
+                Tick::NotDue {
+                    due_at: NOW_RENEW + 10 * DAY
+                },
+                NOW_RENEW
+            ),
+            CHECK_EVERY
+        );
+        assert_eq!(
+            sleep_for(
+                Tick::NotDue {
+                    due_at: NOW_RENEW + 90
+                },
+                NOW_RENEW
+            ),
+            Duration::from_secs(90),
+            "a renewal due in ninety seconds is not an hour late"
+        );
+    }
+
+    #[test]
+    fn a_certificate_that_is_due_is_renewed() {
+        let tls = acme_tls(NOW_RENEW - 1, NOW_RENEW + 20 * DAY);
+        assert_eq!(tick(&tls, NOW_RENEW, &Renewals::new()), Tick::Renew);
+        assert_eq!(sleep_for(Tick::Renew, NOW_RENEW), Duration::ZERO);
+
+        // The safety net: `renew_after` is far off but the certificate
+        // expires inside the lead, so it goes anyway (§9.1).
+        let expiring = acme_tls(NOW_RENEW + 10 * DAY, NOW_RENEW + 3 * DAY);
+        assert_eq!(tick(&expiring, NOW_RENEW, &Renewals::new()), Tick::Renew);
+    }
+
+    #[test]
+    fn a_failure_holds_the_next_attempt_off_even_though_it_is_due() {
+        let tls = acme_tls(NOW_RENEW - 1, NOW_RENEW + 20 * DAY);
+        let mut renewals = Renewals::new();
+
+        let delay = renewals.failed(NOW_RENEW, FailureKind::Ordinary, None, Some(&tls));
+        assert_eq!(delay, RETRY_BASE);
+        let until = NOW_RENEW + RETRY_BASE.as_secs() as i64;
+        assert_eq!(tick(&tls, NOW_RENEW, &renewals), Tick::Waiting { until });
+        assert_eq!(
+            sleep_for(Tick::Waiting { until }, NOW_RENEW),
+            RETRY_BASE,
+            "asleep exactly until the next attempt is allowed"
+        );
+
+        // The moment it runs out, and not before.
+        assert_eq!(tick(&tls, until - 1, &renewals), Tick::Waiting { until });
+        assert_eq!(tick(&tls, until, &renewals), Tick::Renew);
+
+        // Failures accumulate…
+        renewals.failed(until, FailureKind::Ordinary, None, Some(&tls));
+        assert_eq!(renewals.failures(), 2);
+        assert_eq!(
+            renewals.not_before(),
+            until + retry_delay(2).as_secs() as i64
+        );
+        // …and a certificate resets them.
+        renewals.succeeded();
+        assert_eq!(renewals.failures(), 0);
+        assert_eq!(tick(&tls, NOW_RENEW, &renewals), Tick::Renew);
+    }
+
+    #[test]
+    fn a_certificate_anago_did_not_issue_is_not_renewed() {
+        // A manual hub (§9.1). The loop keeps looking only because
+        // `server renew --acme-email` can change that underneath it.
+        let manual =
+            state::Tls::manual("/etc/ssl/anago/fullchain.pem", "/etc/ssl/anago/privkey.pem");
+        assert_eq!(tick(&manual, NOW_RENEW, &Renewals::new()), Tick::NotOurs);
+        assert_eq!(sleep_for(Tick::NotOurs, NOW_RENEW), CHECK_EVERY);
+    }
+
+    #[test]
+    fn the_hub_never_sleeps_past_the_next_look() {
+        // Whatever the arithmetic says, a hub notices a hand-swapped
+        // certificate or a `server renew` within the hour.
+        for step in [
+            Tick::NotDue {
+                due_at: NOW_RENEW + 400 * DAY,
+            },
+            Tick::Waiting {
+                until: NOW_RENEW + 400 * DAY,
+            },
+            Tick::NotOurs,
+        ] {
+            assert_eq!(sleep_for(step, NOW_RENEW), CHECK_EVERY, "{step:?}");
+        }
+        // And never spins: a moment that has already passed still
+        // sleeps rather than looping on the clock.
+        assert!(
+            sleep_for(
+                Tick::Waiting {
+                    until: NOW_RENEW - 5
+                },
+                NOW_RENEW
+            ) >= Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn the_waiting_line_says_how_long_and_why() {
+        // An hour of silence after one failure looks like a hang unless
+        // it says otherwise.
+        let ordinary = waiting_line(RETRY_BASE, 1, FailureKind::Ordinary);
+        assert!(ordinary.contains("15 minutes"), "{ordinary}");
+        assert!(ordinary.contains("attempt 1"), "{ordinary}");
+        // The reassurance that matters most: nothing is down yet.
+        assert!(ordinary.contains("keeps working"), "{ordinary}");
+
+        let limited = waiting_line(RATE_LIMITED_FLOOR, 1, FailureKind::RateLimited);
+        assert!(limited.contains("1 hours"), "{limited}");
+        assert!(limited.contains("rate limiting"), "{limited}");
+    }
+
+    #[test]
+    fn a_renewal_failure_carries_what_the_ca_said_about_timing() {
+        // `to_string()` would lose both of these, and the schedule
+        // needs both: what kind of failure it was, and how long the CA
+        // asked for.
+        let asked = Duration::from_secs(3 * DAY as u64);
+        let failure = RenewalFailure::from(AcmeError::Order {
+            domain: "net.example.com".to_string(),
+            detail: "urn:ietf:params:acme:error:rateLimited".to_string(),
+            retry_after: Some(asked),
+        });
+        assert_eq!(failure.kind, FailureKind::RateLimited);
+        assert_eq!(failure.retry_after, Some(asked));
+
+        // Something that went wrong on this machine is never a rate
+        // limit and never carries the CA's timing.
+        let local = RenewalFailure::local("the state file could not be read");
+        assert_eq!(local.kind, FailureKind::Ordinary);
+        assert_eq!(local.retry_after, None);
+    }
+
+    #[test]
+    fn anagos_own_advice_is_not_read_back_as_the_cas_words() {
+        // The DNS-01 messages mention rate limits and ports for reasons
+        // of their own. Classifying the whole rendered error would turn
+        // anago's writing into a diagnosis of the CA's answer.
+        let ordinary = AcmeError::Validation {
+            domain: "net.example.com".to_string(),
+            challenge: Challenge::Dns01,
+            looked_at: vec!["the TXT record".to_string()],
+            detail: "the CA left the order Invalid".to_string(),
+            retry_after: None,
+        };
+        assert_eq!(RenewalFailure::from(ordinary).kind, FailureKind::Ordinary);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_loop_waits_as_long_as_the_ca_asked_before_trying_again() {
+        // The whole point of carrying `retry_after`: a hub told to come
+        // back in three days must not be back in an hour. Run on
+        // tokio's virtual clock, so three days take no time at all.
+        let started = tokio::time::Instant::now();
+        let epoch = NOW_RENEW;
+        let clock = move || epoch + started.elapsed().as_secs() as i64;
+
+        let attempts: Arc<std::sync::Mutex<Vec<i64>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let asked = Duration::from_secs(3 * DAY as u64);
+
+        let tls = acme_tls(NOW_RENEW - 1, NOW_RENEW + 20 * DAY);
+        let loop_attempts = attempts.clone();
+        let loop_clock = clock;
+        let task = tokio::spawn(async move {
+            renewal_loop(
+                move || Ok(tls.clone()),
+                move || {
+                    let attempts = loop_attempts.clone();
+                    let at = loop_clock();
+                    async move {
+                        attempts.lock().unwrap().push(at);
+                        Err(RenewalFailure {
+                            detail: "rateLimited".to_string(),
+                            kind: FailureKind::RateLimited,
+                            retry_after: Some(asked),
+                        })
+                    }
+                },
+                loop_clock,
+            )
+            .await
+        });
+
+        // Long enough for the ordinary backoff (15 minutes) and the
+        // rate-limit floor (an hour) to have fired several times over.
+        tokio::time::sleep(Duration::from_secs(6 * 60 * 60)).await;
+        assert_eq!(
+            attempts.lock().unwrap().len(),
+            1,
+            "the CA asked for three days and got six hours"
+        );
+
+        tokio::time::sleep(asked).await;
+        let seen = attempts.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "and after three days it tries again");
+        assert_eq!(
+            seen[1] - seen[0],
+            asked.as_secs() as i64,
+            "the gap is the one the CA named"
+        );
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hub_whose_certificate_is_fine_does_not_call_the_ca() {
+        let started = tokio::time::Instant::now();
+        let epoch = NOW_RENEW;
+        let clock = move || epoch + started.elapsed().as_secs() as i64;
+
+        let called = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tls = acme_tls(NOW_RENEW + 10 * DAY, NOW_RENEW + 40 * DAY);
+        let loop_called = called.clone();
+        let task = tokio::spawn(async move {
+            renewal_loop(
+                move || Ok(tls.clone()),
+                move || {
+                    let called = loop_called.clone();
+                    async move {
+                        called.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(())
+                    }
+                },
+                clock,
+            )
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_secs(9 * DAY as u64)).await;
+        assert_eq!(
+            called.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a certificate that is not due was renewed anyway"
+        );
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_state_file_that_cannot_be_read_is_said_out_loud_and_retried() {
+        // The quiet failure this prevents: a read error read as "there
+        // is nothing here to renew", an hour's sleep, and a certificate
+        // that expires without one line of complaint.
+        let started = tokio::time::Instant::now();
+        let epoch = NOW_RENEW;
+        let clock = move || epoch + started.elapsed().as_secs() as i64;
+
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let renews = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loop_reads = reads.clone();
+        let loop_renews = renews.clone();
+        let task = tokio::spawn(async move {
+            renewal_loop(
+                move || {
+                    loop_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err("state.json: permission denied".to_string())
+                },
+                move || {
+                    let renews = loop_renews.clone();
+                    async move {
+                        renews.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(())
+                    }
+                },
+                clock,
+            )
+            .await
+        });
+
+        // Two hours: the ordinary backoff (15m, 30m, 1h) has come round
+        // several times, rather than one silent hour-long sleep.
+        tokio::time::sleep(Duration::from_secs(2 * 60 * 60)).await;
+        let looked = reads.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(looked >= 3, "only looked {looked} times in two hours");
+        assert!(
+            looked <= 9,
+            "looked {looked} times — that is a spin, not a backoff"
+        );
+        assert_eq!(
+            renews.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a hub whose state cannot be read must not order a certificate anyway"
+        );
+        task.abort();
+    }
+
+    #[test]
+    fn attempts_already_spent_survive_a_change_of_challenge() {
+        // The budget the exponential backoff exists to protect is
+        // counted per account, hostname and CA — **not** per challenge
+        // (§13). Four failed validations on HTTP-01 are four failed
+        // validations, and switching to DNS-01 does not hand them back:
+        // forgetting them would let the fifth go out at once and start
+        // the backoff again at fifteen minutes.
+        let failing = acme_tls(NOW_RENEW - 1, NOW_RENEW + 20 * DAY);
+        let mut renewals = Renewals::new();
+        for _ in 0..4 {
+            renewals.failed(NOW_RENEW, FailureKind::Ordinary, None, Some(&failing));
+        }
+        let waited_until = renewals.not_before();
+        assert_eq!(renewals.failures(), 4);
+
+        let mut switched = failing.clone();
+        switched.renewable_mut().unwrap().challenge = Challenge::Dns01;
+        assert_eq!(renewals.settings_changed(&switched), Forgotten::Nothing);
+        assert_eq!(renewals.failures(), 4, "the attempts were handed back");
+        assert_eq!(renewals.not_before(), waited_until);
+        assert_eq!(
+            tick(&switched, NOW_RENEW, &renewals),
+            Tick::Waiting {
+                until: waited_until
+            }
+        );
+
+        // A contact address is the same: it changes nothing about who
+        // is asking what of whom.
+        let mut readdressed = switched.clone();
+        readdressed.renewable_mut().unwrap().contact = Some("someone@example.com".to_string());
+        assert_eq!(renewals.settings_changed(&readdressed), Forgotten::Nothing);
+        assert_eq!(renewals.failures(), 4);
+    }
+
+    #[test]
+    fn a_different_account_is_a_different_budget() {
+        // Failed validations are counted per account as well, so an
+        // account that has just been registered has not spent any.
+        let failing = acme_tls(NOW_RENEW - 1, NOW_RENEW + 20 * DAY);
+        let mut renewals = Renewals::new();
+        for _ in 0..4 {
+            renewals.failed(NOW_RENEW, FailureKind::Ordinary, None, Some(&failing));
+        }
+
+        let mut registered_again = failing.clone();
+        registered_again.renewable_mut().unwrap().account_url =
+            "https://acme-v02.api.letsencrypt.org/acme/acct/9999".to_string();
+        assert_eq!(
+            renewals.settings_changed(&registered_again),
+            Forgotten::Scope
+        );
+        assert_eq!(renewals.failures(), 0);
+        assert_eq!(tick(&registered_again, NOW_RENEW, &renewals), Tick::Renew);
+    }
+
+    #[test]
+    fn changing_a_setting_does_not_change_the_cas_mind() {
+        // The hole this closes: a rate limit met on HTTP-01, then
+        // `server renew --acme-challenge dns-01`, and the next hourly
+        // check orders again — same CA, same account, same name, with
+        // the CA's three days thrown away. Limits are counted per
+        // account, hostname and CA (§13); the challenge is not part of
+        // that.
+        let refused = acme_tls(NOW_RENEW - 1, NOW_RENEW + 20 * DAY);
+        let asked = Duration::from_secs(3 * DAY as u64);
+        let mut renewals = Renewals::new();
+        renewals.failed(
+            NOW_RENEW,
+            FailureKind::RateLimited,
+            Some(asked),
+            Some(&refused),
+        );
+        let until = NOW_RENEW + asked.as_secs() as i64;
+        assert_eq!(renewals.not_before(), until);
+
+        let mut switched = refused.clone();
+        switched.renewable_mut().unwrap().challenge = Challenge::Dns01;
+        // anago's own backoff is dropped — that part was about the
+        // settings…
+        assert_eq!(renewals.settings_changed(&switched), Forgotten::Nothing);
+        // …and the CA's wait is not.
+        assert_eq!(renewals.not_before(), until);
+        assert_eq!(
+            tick(&switched, NOW_RENEW, &renewals),
+            Tick::Waiting { until },
+            "the CA said three days and got an hour"
+        );
+        assert_eq!(tick(&switched, until, &renewals), Tick::Renew);
+    }
+
+    #[test]
+    fn a_different_ca_keeps_its_own_limits() {
+        // Staging and production count separately, so a hub moved
+        // between them is not the hub that was refused. This is the one
+        // change that does lift the wait.
+        let refused = acme_tls(NOW_RENEW - 1, NOW_RENEW + 20 * DAY);
+        let mut renewals = Renewals::new();
+        renewals.failed(
+            NOW_RENEW,
+            FailureKind::RateLimited,
+            Some(Duration::from_secs(3 * DAY as u64)),
+            Some(&refused),
+        );
+
+        let mut moved = refused.clone();
+        moved.renewable_mut().unwrap().directory = STAGING.to_string();
+        assert_eq!(renewals.settings_changed(&moved), Forgotten::Scope);
+        assert_eq!(renewals.not_before(), 0);
+        assert_eq!(tick(&moved, NOW_RENEW, &renewals), Tick::Renew);
+    }
+
+    #[test]
+    fn a_second_failure_cannot_shorten_what_the_ca_already_asked_for() {
+        // Otherwise a hub told to wait three days could talk itself
+        // down to an hour by failing again against the same limit.
+        let refused = acme_tls(NOW_RENEW - 1, NOW_RENEW + 20 * DAY);
+        let asked = Duration::from_secs(3 * DAY as u64);
+        let mut renewals = Renewals::new();
+        renewals.failed(
+            NOW_RENEW,
+            FailureKind::RateLimited,
+            Some(asked),
+            Some(&refused),
+        );
+        let until = renewals.not_before();
+
+        renewals.failed(
+            NOW_RENEW + 60,
+            FailureKind::RateLimited,
+            None,
+            Some(&refused),
+        );
+        assert_eq!(renewals.not_before(), until);
+    }
+
+    #[test]
+    fn a_certificate_clears_everything_including_the_cas_wait() {
+        // A CA that issued has, by doing so, said the limit is not in
+        // the way any more.
+        let refused = acme_tls(NOW_RENEW - 1, NOW_RENEW + 20 * DAY);
+        let mut renewals = Renewals::new();
+        renewals.failed(
+            NOW_RENEW,
+            FailureKind::RateLimited,
+            Some(Duration::from_secs(3 * DAY as u64)),
+            Some(&refused),
+        );
+        renewals.succeeded();
+        assert_eq!(renewals.not_before(), 0);
+        assert_eq!(renewals.failures(), 0);
+    }
+
+    #[test]
+    fn a_certificate_that_arrived_from_somewhere_else_clears_the_backoff() {
+        // `server renew` by hand succeeds while the timer is waiting
+        // out a twelve-hour delay. The next window's first failure
+        // should start at fifteen minutes, not resume yesterday — and
+        // a CA that issued has said its limits are not in the way.
+        let failing = acme_tls(NOW_RENEW - 1, NOW_RENEW + 20 * DAY);
+        let mut renewals = Renewals::new();
+        for _ in 0..6 {
+            renewals.failed(
+                NOW_RENEW,
+                FailureKind::RateLimited,
+                Some(Duration::from_secs(3 * DAY as u64)),
+                Some(&failing),
+            );
+        }
+        assert!(renewals.failures() > 1);
+
+        let mut renewed = failing.clone();
+        renewed.renewable_mut().unwrap().issued(NOW_RENEW + 1, None);
+        assert_eq!(renewals.settings_changed(&renewed), Forgotten::Certificate);
+        assert_eq!(renewals.failures(), 0);
+        assert_eq!(renewals.not_before(), 0);
+    }
+
+    #[test]
+    fn a_zone_the_domain_moved_to_is_written_back() {
+        // Otherwise the warning and the extra lookup repeat at every
+        // renewal for ever, and the cache the design describes never
+        // becomes true.
+        let mut state = renewal_state();
+        state.cloudflare = Some(anago_core::state::Cloudflare {
+            zone_id: "old-zone".to_string(),
+            record_id: Some("a-record-in-the-old-zone".to_string()),
+            token_path: Some("/var/lib/anago/cf-token".to_string()),
+        });
+        let renewed = Renewed {
+            zone_id: Some("new-zone".to_string()),
+            ..renewal_result()
+        };
+
+        record(&mut state, &renewed, NOW_RENEW);
+        let cloudflare = state.cloudflare.as_ref().unwrap();
+        assert_eq!(cloudflare.zone_id, "new-zone");
+        // A record id from the old zone means nothing in the new one
+        // (§9.1).
+        assert_eq!(cloudflare.record_id, None);
+        assert_eq!(
+            cloudflare.token_path.as_deref(),
+            Some("/var/lib/anago/cf-token"),
+            "the token is where it was"
+        );
+    }
+
+    #[test]
+    fn an_http_01_renewal_leaves_the_cloudflare_cache_alone() {
+        // It never looked a zone up, so it has nothing to say about one.
+        let mut state = renewal_state();
+        state.cloudflare = Some(anago_core::state::Cloudflare {
+            zone_id: "the-zone".to_string(),
+            record_id: Some("the-record".to_string()),
+            token_path: None,
+        });
+        record(&mut state, &renewal_result(), NOW_RENEW);
+        let cloudflare = state.cloudflare.as_ref().unwrap();
+        assert_eq!(cloudflare.zone_id, "the-zone");
+        assert_eq!(cloudflare.record_id.as_deref(), Some("the-record"));
+    }
+
+    fn renewal_state() -> anago_core::state::ServerState {
+        anago_core::state::ServerState {
+            domain: "net.example.com".to_string(),
+            subnet: anago_core::subnet::Subnet::parse("10.77.0.0/24").unwrap(),
+            listen_port: 51820,
+            api_port: 443,
+            tls: acme_tls(NOW_RENEW - 1, NOW_RENEW - 1),
+            cloudflare: None,
+            server: anago_core::state::ServerKeys {
+                private_key: anago_core::state::PrivateKey::new("k"),
+                public_key: "p".to_string(),
+                address: "10.77.0.1".parse().unwrap(),
+            },
+            peers: Vec::new(),
+            codes: Vec::new(),
+        }
+    }
+
+    fn renewal_result() -> Renewed {
+        Renewed {
+            certificate_path: "/var/lib/anago/tls/fullchain.pem".to_string(),
+            key_path: "/var/lib/anago/tls/privkey.pem".to_string(),
+            zone_id: None,
+            account_url: "https://acme-v02.api.letsencrypt.org/acme/acct/2".to_string(),
+            not_after: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_renewal_records_what_changed_and_leaves_the_rest() {
+        let mut state = renewal_state();
+        let renewed = renewal_result();
+
+        record(&mut state, &renewed, NOW_RENEW);
+        assert_eq!(state.tls.cert_path, renewed.certificate_path);
+        let acme = state.tls.renewable().expect("still ours");
+        assert_eq!(acme.account_url, renewed.account_url);
+        assert_eq!(acme.issued_at, NOW_RENEW);
+        // No expiry read yet, so the conservative fallback stands
+        // (§9.1): come back in thirty days rather than in two thirds of
+        // a lifetime nobody measured.
+        assert_eq!(
+            acme.renew_after,
+            NOW_RENEW + anago_core::state::UNKNOWN_LIFETIME_RENEW_SECS
+        );
+        // And what a renewal has no business touching is untouched.
+        assert_eq!(state.domain, "net.example.com");
+        assert_eq!(state.api_port, 443);
     }
 
     #[test]
