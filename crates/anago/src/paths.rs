@@ -40,6 +40,27 @@ impl ServerPaths {
         self.root.join("state.json")
     }
 
+    /// Where anago keeps the TLS material it issued itself (§9.1).
+    ///
+    /// Separate from a certificate a person gave anago with
+    /// `--tls-cert`: those files stay where they are and anago only
+    /// reads them. Everything under here is anago's to write and
+    /// replace, which is also what makes going back to a manual
+    /// certificate a matter of pointing the state elsewhere.
+    // Both land in the issuance slice, which writes the account key
+    // and the certificate under this directory.
+    #[allow(dead_code)]
+    pub fn tls_dir(&self) -> PathBuf {
+        self.root.join("tls")
+    }
+
+    /// The ACME account credentials — the account key, and the URL that
+    /// key is known to the CA by (§9.1).
+    #[allow(dead_code)]
+    pub fn account_key(&self) -> PathBuf {
+        self.tls_dir().join("account.key")
+    }
+
     /// The flock target that serializes concurrent joins (§13).
     ///
     /// A separate file, not `state.json` itself: the writer replaces
