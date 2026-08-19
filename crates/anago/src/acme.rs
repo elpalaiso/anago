@@ -861,7 +861,7 @@ pub fn accept_families(port: u16, bound: usize, refused: &[io::Error]) -> Result
 /// the standard library's version.
 pub fn family_unavailable(raw: Option<i32>, kind: io::ErrorKind) -> bool {
     if let Some(raw) = raw {
-        if raw == libc::EAFNOSUPPORT || raw == libc::EPROTONOSUPPORT || raw == libc::EADDRNOTAVAIL {
+        if FAMILY_UNAVAILABLE_CODES.contains(&raw) {
             return true;
         }
     }
@@ -870,6 +870,18 @@ pub fn family_unavailable(raw: Option<i32>, kind: io::ErrorKind) -> bool {
         io::ErrorKind::Unsupported | io::ErrorKind::AddrNotAvailable
     )
 }
+
+/// "This host does not do that address family", in the platform's raw
+/// dialect: errno on unix, WSA codes on Windows.
+#[cfg(unix)]
+const FAMILY_UNAVAILABLE_CODES: [i32; 3] =
+    [libc::EAFNOSUPPORT, libc::EPROTONOSUPPORT, libc::EADDRNOTAVAIL];
+#[cfg(windows)]
+const FAMILY_UNAVAILABLE_CODES: [i32; 3] = [
+    10047, // WSAEAFNOSUPPORT
+    10043, // WSAEPROTONOSUPPORT
+    10049, // WSAEADDRNOTAVAIL
+];
 
 /// The failure to report for a family that could not be bound.
 fn listen_failure(port: u16, refused: &[io::Error]) -> AcmeError {
@@ -896,6 +908,7 @@ fn listen_failure(port: u16, refused: &[io::Error]) -> AcmeError {
 /// does not. Leaving that to the platform means anago cannot tell which
 /// families it actually holds — see [`Http01::start`] — so the option
 /// is set explicitly and the two families are two sockets everywhere.
+#[cfg(unix)]
 fn bind_v6_only(port: u16) -> io::Result<tokio::net::TcpListener> {
     use std::os::fd::{FromRawFd, OwnedFd};
 
@@ -937,10 +950,22 @@ fn bind_v6_only(port: u16) -> io::Result<tokio::net::TcpListener> {
     from_std(listener)
 }
 
+/// Windows defaults `IPV6_V6ONLY` to **on** — the explicitness the unix
+/// version buys with a raw socket is the platform default here, so a
+/// plain `[::]` bind already serves only IPv6.
+#[cfg(windows)]
+fn bind_v6_only(port: u16) -> io::Result<tokio::net::TcpListener> {
+    let listener =
+        std::net::TcpListener::bind((std::net::Ipv6Addr::UNSPECIFIED, port))?;
+    from_std(listener)
+}
+
 /// How many pending connections the kernel holds. One CA fetching one
 /// file needs nothing, and this is what `std` uses.
+#[cfg(unix)]
 const LISTEN_BACKLOG: libc::c_int = 128;
 
+#[cfg(unix)]
 fn set_flag(
     fd: &impl std::os::fd::AsFd,
     level: libc::c_int,
@@ -3026,7 +3051,9 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // asserts unix modes / uses chmod to provoke the failure
     fn the_credentials_file_is_private_from_the_moment_it_exists() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
 
         let dir = TempDir::new();
@@ -3372,6 +3399,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // exercises unix modes/ownership/symlinks
     fn a_family_this_host_does_not_have_is_not_something_in_the_way() {
         // An IPv4-only VPS is an ordinary VPS: the missing family is a
         // fact about the machine, and carrying on with the other one is
@@ -3441,6 +3469,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // exercises unix modes/ownership/symlinks
     fn one_family_is_enough_when_the_other_does_not_exist_here() {
         let missing = io::Error::from_raw_os_error(libc::EAFNOSUPPORT);
         assert_eq!(accept_families(CHALLENGE_PORT, 1, &[missing]), Ok(()));
@@ -3654,6 +3683,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // asserts unix modes / uses chmod to provoke the failure
     fn the_certificate_and_its_key_land_private() {
         let dir = TempDir::new();
         let paths = crate::paths::ServerPaths::new(dir.path.clone());
@@ -3663,6 +3693,7 @@ mod tests {
         );
         save(&paths.certificate(), &paths.private_key(), &issued).expect("saved");
 
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         for path in [paths.certificate(), paths.private_key()] {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
@@ -3742,10 +3773,12 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // asserts unix modes / uses chmod to provoke the failure
     fn a_previous_key_that_cannot_be_read_stops_before_anything_changes() {
         // Without a copy of what is there, a failed second rename could
         // not be undone. Finding that out after publishing is too late,
         // so it is found out before.
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
 
         let dir = TempDir::new();

@@ -538,7 +538,7 @@ impl fmt::Display for SystemdError {
 
 impl std::error::Error for SystemdError {}
 
-#[cfg(test)]
+#[cfg(all(test, unix))] // systemd units only ever run on Linux; path semantics differ on Windows
 mod tests {
     use super::*;
 
@@ -1216,7 +1216,9 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // exercises unix modes/ownership/symlinks
     fn a_path_that_is_not_text_is_refused() {
+        #[cfg(unix)]
         use std::os::unix::ffi::OsStrExt;
 
         // `to_string_lossy` would swap the bad bytes for U+FFFD and

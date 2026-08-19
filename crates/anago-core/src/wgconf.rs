@@ -213,6 +213,29 @@ fn render_client(profile: &ClientProfile, comments: bool) -> String {
     out
 }
 
+/// Drops the keys only wg-quick understands, leaving what `wg
+/// setconf`/`syncconf` accepts.
+///
+/// wg-quick ships a `strip` for this; Windows has no wg-quick (§11.1
+/// 결정 2 — the official client's tunnel service replaces it), so the
+/// stripping anago relies on is a pure function wherever it runs.
+/// Section headers and every plain wg key pass through untouched.
+pub fn strip_quick_keys(conf: &str) -> String {
+    const QUICK_KEYS: [&str; 9] = [
+        "Address", "DNS", "MTU", "Table", "PreUp", "PostUp", "PreDown", "PostDown", "SaveConfig",
+    ];
+    let mut out = String::new();
+    for line in conf.lines() {
+        let key = line.split('=').next().unwrap_or("").trim();
+        if QUICK_KEYS.iter().any(|quick| key.eq_ignore_ascii_case(quick)) {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,5 +614,27 @@ PersistentKeepalive = 25
                 "unexpected line {line:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod strip_tests {
+    use super::strip_quick_keys;
+
+    #[test]
+    fn stripping_leaves_only_what_wg_understands() {
+        let conf = "[Interface]\nAddress = 10.100.0.1/24\nPrivateKey = abc\nListenPort = 51820\nDNS = 1.1.1.1\nMTU = 1420\nPostUp = echo hi\nSaveConfig = true\n\n[Peer]\nPublicKey = xyz\nAllowedIPs = 10.100.0.2/32\nPersistentKeepalive = 25\n";
+        let stripped = strip_quick_keys(conf);
+        assert!(!stripped.contains("Address"), "{stripped}");
+        assert!(!stripped.contains("DNS"), "{stripped}");
+        assert!(!stripped.contains("MTU"), "{stripped}");
+        assert!(!stripped.contains("PostUp"), "{stripped}");
+        assert!(!stripped.contains("SaveConfig"), "{stripped}");
+        // Everything wg itself reads survives, sections included.
+        for kept in ["[Interface]", "PrivateKey = abc", "ListenPort = 51820", "[Peer]", "PublicKey = xyz", "AllowedIPs = 10.100.0.2/32", "PersistentKeepalive = 25"] {
+            assert!(stripped.contains(kept), "{kept} missing:\n{stripped}");
+        }
+        // A key that merely *starts* like a quick key is not one.
+        assert!(strip_quick_keys("AddressBook = x\n").contains("AddressBook"));
     }
 }

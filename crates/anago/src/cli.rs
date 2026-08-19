@@ -37,7 +37,10 @@ pub enum Command {
     ServerRenew(ServerRenew),
     /// The resident process (§8). systemd runs this; a person only
     /// types it after `server init --no-systemd`.
-    ServerRun,
+    ServerRun {
+        /// Windows: hand the process to the SCM dispatcher (§11.1).
+        service: bool,
+    },
     /// `anago sync` (§8): on a device, pull the peer list — or install
     /// the timer that does.
     Sync(Sync),
@@ -260,7 +263,15 @@ fn server(argv: &[String]) -> Result<Command, CliError> {
         Some((head, rest)) => match head.as_str() {
             "init" => server_init(rest),
             "renew" => server_renew(rest),
-            "run" => no_args("server run", rest).map(|_| Command::ServerRun),
+            "run" => {
+                let parsed = ParsedArgs::parse(rest, &[Flag::boolean("service")])?;
+                if !parsed.positionals().is_empty() {
+                    return Err(CliError::TooManyArguments("server run"));
+                }
+                Ok(Command::ServerRun {
+                    service: parsed.is_set("service"),
+                })
+            }
             "status" => Err(CliError::NotYet {
                 what: "anago server status",
                 milestone: "M3",
@@ -722,8 +733,6 @@ fn no_args(name: &'static str, argv: &[String]) -> Result<Command, CliError> {
     Ok(match name {
         "code" => Command::Code,
         "ls" => Command::Ls,
-        // `server run` maps itself; this arm only reports the shape.
-        "server run" => Command::ServerRun,
         other => unreachable!("no_args called for {other}"),
     })
 }
@@ -1325,7 +1334,14 @@ mod tests {
 
     #[test]
     fn server_run_is_routed_for_systemd_and_for_no_systemd_users() {
-        assert_eq!(parse_args(&["server", "run"]), Ok(Command::ServerRun));
+        assert_eq!(
+            parse_args(&["server", "run"]),
+            Ok(Command::ServerRun { service: false })
+        );
+        assert_eq!(
+            parse_args(&["server", "run", "--service"]),
+            Ok(Command::ServerRun { service: true })
+        );
         assert_eq!(
             parse_args(&["server", "run", "now"]),
             Err(CliError::TooManyArguments("server run"))
@@ -1972,6 +1988,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // unix path semantics (absolute-ness, separators)
     fn the_timer_form_is_the_one_the_unit_file_carries() {
         // §8 fixes the installed command line as
         // `anago sync --quiet --config <absolute path>`, so both have
@@ -1986,6 +2003,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // unix path semantics (absolute-ness, separators)
     fn a_relative_config_path_is_refused() {
         // The flag exists because a timer has no working directory a
         // person would recognise: it runs as root, outside the
@@ -2093,6 +2111,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // unix path semantics (absolute-ness, separators)
     fn a_flag_that_would_be_ignored_is_refused_instead() {
         // The failure this prevents is silent: a flag accepted and
         // dropped looks exactly like a flag that worked.

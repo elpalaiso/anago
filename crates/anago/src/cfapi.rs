@@ -202,6 +202,7 @@ fn from_file(contents: &str, path: &Path, mode: Option<u32>) -> Result<Loaded, C
 
 #[cfg(unix)]
 fn file_mode(path: &Path) -> Option<u32> {
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path)
         .ok()
@@ -1480,6 +1481,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn set_mode(path: &Path, mode: u32) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
@@ -1629,6 +1631,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // drives unix file modes
     fn a_real_world_readable_file_is_warned_about_end_to_end() {
         // Proves the mode actually reaches the warning through `load`,
         // not just through the helper it calls.

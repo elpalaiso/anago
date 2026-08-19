@@ -51,7 +51,9 @@ pub const ASSUMED_COLUMNS: usize = 80;
 /// Asks the terminal on standard output how wide it is.
 ///
 /// **Human verification needed**: an ioctl on a real terminal.
+#[cfg(unix)]
 pub fn columns() -> usize {
+    #[cfg(unix)]
     use std::os::unix::io::AsRawFd;
 
     let mut size: libc::winsize = unsafe { std::mem::zeroed() };
@@ -68,6 +70,20 @@ pub fn columns() -> usize {
         return ASSUMED_COLUMNS;
     }
     usize::from(size.ws_col)
+}
+
+/// Windows: `COLUMNS` when the shell exports it (PowerShell does not by
+/// default), the conservative assumption otherwise. The narrow-terminal
+/// refusal still works — it just leans on the assumption more often.
+///
+/// **Human verification needed**: a real Windows console.
+#[cfg(windows)]
+pub fn columns() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&c| c > 0)
+        .unwrap_or(ASSUMED_COLUMNS)
 }
 
 #[cfg(test)]

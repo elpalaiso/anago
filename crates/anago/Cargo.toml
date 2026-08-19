@@ -50,6 +50,12 @@ instant-acme = { version = "0.8", default-features = false, features = ["ring", 
 # 1 gives; drawing the grid on a terminal is, and lives in anago-core.
 qrcodegen = "1.8"
 
+[target.'cfg(windows)'.dependencies]
+# The hub runs as a real Windows service (§11.1 결정 3): login-free
+# start and reboot survival are the SCM's job, and this is the SCM's
+# calling convention.
+windows-service = "0.7"
+
 [dev-dependencies]
 # Drives the router in tests without binding a port.
 tower = { version = "0.5", default-features = false, features = ["util"] }

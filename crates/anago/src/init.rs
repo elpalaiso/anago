@@ -206,6 +206,25 @@ fn still_yours(state: &ServerState, dns: &Dns, public_ip: Option<Ipv4Addr>, now:
         state.api_port
     ));
     out.push_str(&format!("     {}/udp WireGuard\n", state.listen_port));
+    // A home hub sits behind a consumer router (often two — ISP box
+    // plus your own): the same ports must be forwarded there to this
+    // machine, on every layer (§11.1 결정 5).
+    if cfg!(windows) {
+        out.push_str(&format!(
+            "\n     Windows Defender (elevated PowerShell):\n\
+             \x20      netsh advfirewall firewall add rule name=\"anago api\" dir=in action=allow protocol=TCP localport={}\n\
+             \x20      netsh advfirewall firewall add rule name=\"anago wg\" dir=in action=allow protocol=UDP localport={}\n\
+             \x20    And IPv4 forwarding, so devices can reach each other through this hub:\n\
+             \x20      Set-NetIPInterface -InterfaceAlias anago -Forwarding Enabled\n\
+             \x20    Home network: forward the same ports on your router(s) to this PC.\n",
+            state.api_port, state.listen_port
+        ));
+    } else {
+        out.push_str(
+            "\n     Home network: if this hub sits behind a router, forward the same\n\
+             \x20    ports there to this machine (two routers = forward on both).\n",
+        );
+    }
     if wants_port_80(state) {
         // HTTP-01 answers the challenge on :80 again at every renewal.
         // A firewall that let the first issuance through and was then
@@ -768,20 +787,22 @@ pub fn run(
 
     // No systemd on this host means no unit to install, whatever the
     // flag says — offering one would leave a file nothing reads.
-    let start = if args.systemd && systemd::is_available() {
-        match systemd::install(
+    // The platform's service manager, behind one seam (§11.1 결정 3):
+    // systemd, the Windows SCM, or launchd. No manager on this host
+    // means nothing to install, whatever the flag says.
+    let start = if args.systemd && crate::service::is_available() {
+        match crate::service::install(
             &std::env::current_exe().unwrap_or_else(|_| PathBuf::from("anago")),
             root,
             wg_dir,
             Path::new(&state.tls.cert_path),
             Path::new(&state.tls.key_path),
-            Path::new(systemd::UNIT_DIR),
         ) {
-            Ok(path) => systemd_note(&path),
+            Ok(note) => note,
             Err(e) => {
                 // The hub is configured either way; only the babysitter
                 // is missing, and the operator can still run it by hand.
-                warnings.push(format!("could not install the systemd unit: {e}"));
+                warnings.push(format!("could not install the hub service: {e}"));
                 foreground_hint()
             }
         }
@@ -1150,6 +1171,7 @@ mod tests {
     use crate::store::Store;
     use anago_core::state::Challenge;
     use anago_core::subnet::Subnet;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::Ordering;
 
@@ -1261,6 +1283,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // asserts '/'-joined path strings
     fn ordering_a_certificate_puts_it_where_9_fixes() {
         // Known before it exists, which is what lets the state be
         // built — and the CA called against it — before the
@@ -1317,6 +1340,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // asserts unix path strings
     fn an_acme_hub_records_what_a_renewal_will_need() {
         // The state is built before the CA is called, so everything a
         // renewal reads has to be in it already — except what only the
@@ -1347,6 +1371,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // asserts unix path strings
     fn the_token_is_only_kept_when_a_renewal_will_need_it() {
         // §9.1: the secret that can be got rid of is got rid of. A hub
         // that used the token for the A record and took its
@@ -1408,6 +1433,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // asserts '/'-joined path strings
     fn a_dns01_hub_can_still_renew_when_the_a_record_was_not_written() {
         // Regression: a token with no detectable public address left
         // the A record for the operator — and the state then dropped
@@ -1875,6 +1901,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // exercises unix modes/ownership/symlinks
     fn the_token_lands_beside_the_state_and_only_when_it_is_kept() {
         let dir = TempDir::new();
         let root = dir.path.join("var");

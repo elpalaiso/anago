@@ -1086,7 +1086,7 @@ impl fmt::Display for TimerError {
 
 impl std::error::Error for TimerError {}
 
-#[cfg(test)]
+#[cfg(all(test, unix))] // installs systemd/launchd/cron schedules — unix execution surfaces; path semantics differ on Windows
 mod tests {
     use super::*;
 

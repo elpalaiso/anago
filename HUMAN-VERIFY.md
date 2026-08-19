@@ -524,6 +524,67 @@ sudo anago server renew --acme-production
 
 ---
 
+# M1.5 — 윈도우·맥 허브
+
+**검증 환경**: 소유자의 실환경 그대로 — 상주 윈도우 PC(이중 NAT 공유기
+뒤) + 유목 맥북 + 폰. 이 절이 통과하면 "VPS 없이 집 PC가 허브"라는
+M1.5의 존재 이유가 검증된 것이다. 코드 어디에도 윈도우 실기기가 없었으
+므로, 아래는 전부 사람 몫이다.
+
+## 17. 윈도우 허브 — 준비
+
+- [ ] **공식 WireGuard 클라이언트가 설치돼 있다** — `winget install
+      WireGuard.WireGuard`. anago는 wg.exe와 wireguard.exe를 PATH에서,
+      없으면 `%ProgramFiles%\WireGuard`에서 찾는다 — **PATH에 없어도
+      찾는지**가 확인 지점이다(설치기는 PATH를 건드리지 않는다).
+- [ ] **공유기 포트포워딩** — 51820/udp·443/tcp를 이 PC로. 이중 NAT면
+      위층 장비에서 DMZ(또는 같은 포워딩)를 아래층 공유기로. `dig`로
+      도메인이 집 공인 IP를 가리키는지 먼저 확인.
+- [ ] **관리자 PowerShell에서 실행한다** — 일반 셸이면 서비스 생성과
+      %ProgramData% 쓰기에서 접근 거부가 나야 하고, **그 에러가 관리자
+      로 다시 실행하라고 말하는지**도 본다(문구도 기능이다, §8).
+
+## 18. 윈도우 허브 — 세우기와 상주
+
+- [ ] **`anago server init --domain … --cf-token-file …`이 끝까지 간다**
+      — 상태가 `%ProgramData%\anago`에, wg 설정이 그 옆에 만들어지고,
+      터널 서비스(`wg show anago`)와 윈도우 서비스(`sc query anago`)가
+      둘 다 선다. 출력의 netsh 방화벽 안내 2줄을 실행한다.
+- [ ] **`Set-NetIPInterface -InterfaceAlias anago -Forwarding Enabled`**
+      — 피어 중계에 필수. anago는 윈도우에서 이를 감지하지 못하므로
+      (설계상 안내만) 출력이 시키는 대로 했는지가 곧 검증이다.
+- [ ] **재부팅 후 둘 다 돌아온다** — 서비스(`sc query anago`)와 터널
+      (`wg show anago`), 그리고 기기들이 다시 붙는다. 3절의 재부팅
+      검증에 대응하는 윈도우 판.
+- [ ] **`sc stop anago` 후 상태 파일이 멀쩡하다** — 서비스 정지는 즉시
+      종료다(winsvc 설계: 원자적 쓰기라 안전). 정지 → 시작 후 `anago
+      ls`가 이전 기기들을 그대로 보여주는지.
+- [ ] **실패 로그가 남는다** — 인증서 경로를 일부러 틀린 뒤 `sc start
+      anago`: 서비스는 죽고 `%ProgramData%\anago\service.log`에 이유가
+      적혀야 한다(서비스에는 콘솔이 없다).
+
+## 19. 윈도우 허브 — 기기 관점
+
+- [ ] **맥북이 카페 와이파이/LTE에서 join·ping** — 집 공유기 밖에서.
+      허브-스포크가 "항상 된다"의 가정용 판.
+- [ ] **폰이 QR로 붙고, 맥북 ↔ 폰 상호 ping** — 16절과 같은 기준,
+      허브만 집 PC로 바뀐 것.
+- [ ] **공인 IP가 바뀌면** (재현 가능하면) — 통신사 DHCP 갱신 후
+      `anago server renew --dns`가 A 레코드를 새 IP로 밀고, 기기들이
+      다음 핸드셰이크에서 따라오는지.
+
+## 20. 맥 허브 (맥미니가 있다면)
+
+- [ ] **`sudo anago server init …`이 LaunchDaemon까지 세운다** —
+      `/Library/LaunchDaemons/com.github.elpalaiso.anago.plist`,
+      `sudo launchctl print system/com.github.elpalaiso.anago`.
+- [ ] **재부팅 후 데몬·터널·포워딩이 돌아온다** — 특히 포워딩: 맥은
+      sysctl.conf가 없어 **데몬이 기동 시 재설정**한다(§11.1 결정 5).
+      재부팅 → 기기 2대 상호 ping이 곧 검증이다.
+- [ ] **로그가 `/var/log/anago.log`에 쌓인다.**
+
+---
+
 ## 확인되면
 
 1~8절이 통과하면 DESIGN §11의 **M0 행**이, 9절부터도 통과하면 **M1 행**이

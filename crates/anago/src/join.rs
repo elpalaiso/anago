@@ -247,6 +247,7 @@ pub fn name_from_hostname(hostname: &str) -> Option<DeviceName> {
 }
 
 /// This machine's hostname.
+#[cfg(unix)]
 pub fn hostname() -> Option<String> {
     let mut buffer = [0u8; 256];
     // SAFETY: the buffer is valid for `len` bytes and gethostname
@@ -257,6 +258,12 @@ pub fn hostname() -> Option<String> {
     }
     let end = buffer.iter().position(|byte| *byte == 0).unwrap_or(0);
     String::from_utf8(buffer[..end].to_vec()).ok()
+}
+
+/// This machine's hostname — Windows keeps it in the environment.
+#[cfg(windows)]
+pub fn hostname() -> Option<String> {
+    std::env::var("COMPUTERNAME").ok().filter(|name| !name.is_empty())
 }
 
 /// What to tell the person when the hub refuses a join.
@@ -688,7 +695,9 @@ impl Claimed {
     /// no unlink-this-descriptor. What it does is shrink the window
     /// from the whole network call, which is seconds long and easy to
     /// win, to the gap between two syscalls.
+    #[cfg(unix)]
     fn is_ours(&self) -> bool {
+        #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
 
         let (Ok(held), Ok(named)) = (self.file.metadata(), std::fs::symlink_metadata(&self.path))
@@ -696,6 +705,17 @@ impl Claimed {
             return false;
         };
         held.dev() == named.dev() && held.ino() == named.ino()
+    }
+
+    /// Windows: the identity check guards a *root* process against the
+    /// directory's owner swapping the file mid-rollback. There is no
+    /// sudo here and the directory is the user's own, so "a plain file
+    /// still sits at the name" is the whole question.
+    #[cfg(windows)]
+    fn is_ours(&self) -> bool {
+        std::fs::symlink_metadata(&self.path)
+            .map(|m| m.is_file())
+            .unwrap_or(false)
     }
 
     fn keep(&mut self) {
@@ -1231,7 +1251,7 @@ fn prepare_client_dir(
             if matches!(
                 e.kind(),
                 std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotADirectory
-            ) || e.raw_os_error() == Some(libc::ELOOP) =>
+            ) || is_symlink_loop(&e) =>
         {
             Err(JoinError::UnsafeConfigDir(dir.display().to_string()))
         }
@@ -1492,6 +1512,20 @@ impl fmt::Display for JoinError {
 
 impl std::error::Error for JoinError {}
 
+
+/// `ELOOP` — a symlink cycle (or a refused symlink under `O_NOFOLLOW`).
+/// Unix-only as a raw code; Windows surfaces its own kinds, which the
+/// caller's `ErrorKind` checks already cover.
+#[cfg(unix)]
+fn is_symlink_loop(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(libc::ELOOP)
+}
+
+#[cfg(windows)]
+fn is_symlink_loop(_e: &std::io::Error) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1566,6 +1600,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // drives unix file modes
     fn an_out_file_is_taken_before_the_code_is_spent() {
         // A local join claims its two files before asking the hub for
         // anything, so a permission problem is a retry rather than a
@@ -1626,6 +1661,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // identity check is dev/ino — Windows uses existence (§11.1)
     fn a_name_that_stopped_meaning_our_file_is_not_written_off_as_success() {
         // Between the claim and the answer, anybody with write access
         // to that directory — `/tmp` is the ordinary case — can rename
@@ -1657,6 +1693,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // exercises unix modes/ownership/symlinks
     fn a_cleanup_deletes_only_the_file_it_made() {
         let dir = TempDirs::new();
         let path = dir.root.join("phone.conf");
@@ -1833,6 +1870,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // exercises unix modes/ownership/symlinks
     fn a_config_that_never_reached_the_phone_says_so() {
         // A closed pipe — `anago join … --export conf | head -1`. The
         // registration stands, so this goes out through the same door
@@ -1854,6 +1892,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn mode_of(path: &Path) -> u32 {
         use std::os::unix::fs::PermissionsExt;
         std::fs::metadata(path)
@@ -2062,6 +2101,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // exercises unix modes/ownership/symlinks
     fn root_will_not_make_or_take_a_directory_in_somebody_s_home() {
         let dirs = TempDirs::new();
         let me = unsafe { libc::getuid() };
@@ -2099,6 +2139,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // exercises unix modes/ownership/symlinks
     fn moving_the_directory_after_the_check_cannot_redirect_the_write() {
         // The race this design exists for: the person renames
         // `~/.config/anago` between the check and the write, leaving a
@@ -2128,6 +2169,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // exercises unix modes/ownership/symlinks
     fn a_symlinked_config_directory_is_refused_outright() {
         let dirs = TempDirs::new();
         let elsewhere = ClientPaths::new(dirs.root.join("linked"));

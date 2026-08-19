@@ -52,6 +52,26 @@ pub fn startup_banner(state: &ServerState, addr: SocketAddr) -> String {
 /// **Human verification needed**: binds ports, drives `wg-quick`, and
 /// waits on signals — none of which a unit test can stand in for.
 pub fn run(root: &Path, wg_dir: &Path) -> Result<(), ServeError> {
+    // macOS forgets `net.inet.ip.forwarding` at reboot and has no
+    // sysctl.conf to remember it — the daemon re-asserts it on every
+    // start instead (§11.1 결정 5). Failure is a warning: the hub
+    // still answers joins, devices just cannot reach each other yet.
+    #[cfg(target_os = "macos")]
+    {
+        let asserted = std::process::Command::new("sysctl")
+            .args(["-w", "net.inet.ip.forwarding=1"])
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false);
+        if !asserted {
+            eprintln!(
+                "anago: warning: could not turn on IPv4 forwarding \
+                 (sysctl -w net.inet.ip.forwarding=1) — devices will reach \
+                 the hub but not each other"
+            );
+        }
+    }
+
     let store = Store::new(root);
     let state = store.read().map_err(ServeError::State)?;
 

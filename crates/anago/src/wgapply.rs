@@ -106,6 +106,12 @@ pub fn forwarding_hint(platform: Platform) -> &'static str {
             "IPv4 forwarding is off, so devices can reach this server but not each other. \
              Turn it on with `sysctl -w net.inet.ip.forwarding=1` (macOS resets this on reboot)"
         }
+        Platform::Windows => {
+            "IPv4 forwarding is off, so devices can reach this server but not each other. \
+             Turn it on in an elevated PowerShell with \
+             `Set-NetIPInterface -InterfaceAlias anago -Forwarding Enabled` \
+             (and for the LAN adapter the same way — Windows keeps this across reboots)"
+        }
         Platform::Other => {
             "IPv4 forwarding is off, so devices can reach this server but not each other. \
              Enable IP forwarding for this host"
@@ -201,15 +207,17 @@ impl Applier for WgApplier {
 
         match action {
             Action::BringUp => {
-                wg::run(&wg::quick_up(&self.interface.config_path), None)?;
+                wg::bring_up(&self.interface.config_path)?;
             }
             Action::Sync => {
-                // `wg` does not understand wg-quick's keys, so the file
-                // goes through `wg-quick strip` first. The stripped copy
-                // holds the server's private key, so it is written 0600
-                // and removed straight after. Callers hold the state
-                // lock across this, so two applies never share the path.
-                let stripped = wg::run(&wg::quick_strip(&self.interface.config_path), None)?;
+                // `wg` does not understand wg-quick's keys, so the
+                // config is stripped first (wg-quick strip, or the pure
+                // stripper on Windows). The stripped copy holds the
+                // server's private key, so it is written 0600 and
+                // removed straight after. Callers hold the state lock
+                // across this, so two applies never share the path.
+                let stripped =
+                    wg::stripped_config(&self.interface.config_path, wanted.expose())?;
                 let path = self.interface.config_path.with_extension("stripped");
                 fsutil::write_private(&path, &stripped).map_err(|e| WgError::Spawn {
                     line: format!("write {}", path.display()),
@@ -255,6 +263,7 @@ mod tests {
     use super::*;
     use std::fs;
     use std::net::Ipv4Addr;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -314,6 +323,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // exercises unix modes/ownership/symlinks
     fn the_config_is_written_from_the_state() {
         let dir = TempDir::new();
         let path = dir.path.join("anago.conf");
