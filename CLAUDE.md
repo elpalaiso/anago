@@ -1,13 +1,16 @@
 # anago
 
-도메인+서버를 가진 사람을 위한 셀프호스트 WireGuard 개인 네트워크
-부트스트래퍼. **전체 설계는 docs/DESIGN.md — 작업 전에 반드시 먼저 읽을 것.**
+도메인+상주 기기(VPS든 집의 윈도우 PC·맥미니든)를 가진 사람을 위한
+셀프호스트 WireGuard 개인 네트워크 부트스트래퍼.
+**전체 설계는 docs/DESIGN.md — 작업 전에 반드시 먼저 읽을 것.**
 
 ## 현재 상태
 
-설계 단계. DESIGN.md 초안 완료, 코드는 컴파일되는 스캐폴드만 있다.
-다음: M0 — `server init`(수동 DNS, 기존 TLS 인증서 지정) + `join` +
-허브-스포크 통신 + `code`/`ls`/`rm`.
+M0(허브-스포크 코어)·M1(ACME/Cloudflare 자동화·sync 타이머·폰 QR)
+**코드 완성, 실서버 미검증**(HUMAN-VERIFY.md가 검증 러너북).
+진행 중: **M1.5 — 허브 플랫폼 확장**(Windows 서비스·macOS launchd 허브
+1급 지원, 설계는 DESIGN §11.1). M0·M1은 krill plan/duet으로 개발했고,
+M1.5는 이 세션에서 직접 개발한다(사용자 결정).
 
 ## 설계 원칙 (요약 — 상세는 DESIGN.md §4)
 

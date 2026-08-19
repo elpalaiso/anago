@@ -4,13 +4,15 @@
 
 ## 1. 한 줄 요약
 
-도메인과 서버(VPS)를 가진 사람이라면 누구나 10분 안에 자기 소유의
-WireGuard 개인 네트워크를 갖게 해주는 단일 바이너리 셋업 도구.
-certbot이 TLS에 해준 일을 개인 네트워크에 해준다.
+도메인과 **상주 기기 하나**(VPS든, 집의 윈도우 PC든, 맥미니든)를 가진
+사람이라면 누구나 10분 안에 자기 소유의 WireGuard 개인 네트워크를 갖게
+해주는 단일 바이너리 셋업 도구. certbot이 TLS에 해준 일을 개인
+네트워크에 해준다. (M1까지의 허브는 리눅스 서버 전제였고, M1.5가 이
+전제를 "상주 기기"로 넓힌다 — §11.1.)
 
 ## 2. 목표
 
-- `anago server init --domain net.example.com` (VPS에서 1회) +
+- `anago server init --domain net.example.com` (허브 기기에서 1회) +
   `anago join net.example.com <코드>` (각 기기에서 1회) = 끝.
 - 제3자 인프라 의존 0: 조율 서버도, 릴레이도, 인증도 전부 사용자의 서버.
   Tailscale이 회사여야 하는 이유(전 세계 릴레이망 운영)를 "인프라는 이미
@@ -18,7 +20,8 @@ certbot이 TLS에 해준 일을 개인 네트워크에 해준다.
 - 첫날부터 "항상 된다": 허브-스포크(서버 경유)가 기본 토폴로지라서
   NAT/CGNAT 환경(한국 LTE 포함)에서도 무조건 연결된다. 홀펀칭 직결은
   나중에 얹는 성능 최적화다.
-- 오픈소스(MIT), 단일 바이너리, 낮은 서버 사양(1코어 VPS면 충분).
+- 오픈소스(MIT), 단일 바이너리, 낮은 서버 사양(1코어 VPS면 충분 —
+  집에 늘 켜져 있는 PC라면 그것으로도).
 
 ## 3. 비목표 (v1에서 의도적으로 안 만드는 것)
 
@@ -85,7 +88,7 @@ certbot이 TLS에 해준 일을 개인 네트워크에 해준다.
 
 ## 6. 핵심 플로우
 
-### 6.1 서버 초기화 (VPS에서 1회)
+### 6.1 서버 초기화 (허브 기기에서 1회)
 
 ```
 anago server init --domain net.example.com
@@ -2410,6 +2413,7 @@ C 툴체인 요구)를 ACME 클라이언트 밑에 밀어 넣는 것이 이 테�
 |---|---|---|
 | M0 | `server init`(DNS는 수동 안내, TLS는 기존 인증서 지정 — 아래 참조) + `join` + 허브-스포크 통신 + `code`/`ls`/`rm` | 실서버: Cloudflare 도메인 + VPS에서 기기 2대 연결, 서로 ping |
 | M1 | ACME 자동 TLS + Cloudflare A 레코드/DNS-01 자동화 + `sync` timer + `--export qr` | 폰이 QR로 공식 wg 앱에 합류해 기존 기기와 **상호** ping — 아래 합격 기준 |
+| M1.5 | 허브 플랫폼 확장: Windows 서비스·macOS launchd 허브 1급 지원, 플랫폼 씸(wg 제어·상주·경로·포워딩), 방화벽 안내 | 집 윈도우 PC 허브(이중 NAT 공유기 포함)에 맥북+폰 합류, 상호 ping |
 | M2 | 홀펀칭 직결: STUN 관측 → /endpoint 보고 → 서버가 중개 → 실패 시 허브 폴백 유지 | LTE↔집공유기 직결 성사율 측정 |
 | M3 | 이름 해석(`맥북.net.example.com` 또는 /etc/hosts 갱신), `server status` 대시보드 | |
 | M4 | 릴리스: CI + 태그 릴리스 + Homebrew — krill의 워크플로 재활용 | |
@@ -2508,6 +2512,78 @@ Origin CA를 설치해야 한다. 기본 경로는 공개 신뢰 인증서(Let's
 Cloudflare 경로(A 레코드 자동화, DNS-01, origin cert)가 1차 시민이고
 모든 마일스톤의 실기기 검증은 이 환경에서 한다.
 
+### 11.1 M1.5 — 상주 허브의 플랫폼 확장 (설계)
+
+**동기.** M1까지의 허브는 리눅스 서버(systemd·커널 wg·`/var/lib`)를
+전제했다. 그런데 이 도구의 잠재 사용자가 실제로 가진 상주 기기는
+대부분 **집의 윈도우 PC**(또는 맥미니)다 — 소유자 본인의 환경도
+그렇다(맥북·폰은 유목, 윈도우 PC만 상주). 공유기 포트포워딩으로 공인
+도달점을 만들 수 있다면, 그 PC가 VPS의 자리를 그대로 대신할 수 있다.
+"인프라는 이미 네 것"(§2)의 가장 흔한 형태가 바로 이것이므로, 허브의
+플랫폼 확장은 기능 추가가 아니라 **전제의 완성**이다.
+
+**범위.** Windows와 macOS를 허브로서 1급 지원한다(클라이언트로서의
+지원은 같은 메커니즘 위에서 자연히 따라온다). 프로토콜·상태 스키마·
+ACME·Cloudflare 코드는 전부 크로스플랫폼이라 무변경 — 바뀌는 것은
+**wg 제어, 상주, 경로·권한, 포워딩·방화벽 안내**의 네 접점뿐이다.
+
+**결정 1 — 접점은 플랫폼 씸으로 묶는다.** 네 접점을 바이너리 크레이트의
+플랫폼 모듈(`platform/linux.rs`·`windows.rs`·`macos.rs`)로 모으고,
+명령·설정 텍스트 **조립은 전부 순수 함수**로 유지해 유닛 테스트한다
+(기존 systemd.rs/launchd.rs 패턴의 일반화). anago-core는 손대지 않는다.
+
+**결정 2 — wg 제어.**
+- 리눅스: `wg`/`wg-quick` (현행).
+- **Windows: 공식 WireGuard 클라이언트에 위임한다** (원칙 1). wg-quick이
+  없는 대신 `wireguard.exe /installtunnelservice <conf 경로>`가 터널을
+  **윈도우 서비스로** 만들어 상주·재부팅 유지까지 해결한다. 갱신은
+  `wg.exe syncconf`(wg(8)와 동일 인터페이스), 제거는
+  `/uninstalltunnelservice`. 설치 확인·안내(winget/공식 다운로드)는
+  join/init이 해준다 — 리눅스에서 wireguard-tools를 안내하는 것과 동형.
+- macOS: brew wireguard-tools(wireguard-go) + `wg-quick` — 클라 경로에서
+  이미 쓰던 것을 허브에도 그대로.
+
+**결정 3 — 컨트롤 플레인 상주.**
+- 리눅스: systemd 유닛 (현행).
+- **Windows: 진짜 윈도우 서비스로 간다** (시작프로그램 아님 — 로그인
+  전 기동·재부팅 생존·SCM 관리가 서비스의 몫이다). `windows-service`
+  크레이트(cfg(windows) 한정, 바이너리 크레이트에만 — 원칙 4)로
+  `anago server run --service`가 SCM 진입점이 되고, `server init`이
+  서비스 생성(`sc.exe` 조립·위임)·자동 시작 설정·기동까지 한다.
+- **macOS: launchd 데몬으로 승격한다** — `/Library/LaunchDaemons/
+  com.github.elpalaiso.anago.plist` 생성 + `launchctl bootstrap system`.
+  sync 타이머(M1)에서 검증된 launchd 조립 코드를 재사용한다. 이로써
+  맥미니 허브가 리눅스와 동급이 된다.
+
+**결정 4 — 경로·권한.**
+- 경로 씸(M0의 순수 함수)에 플랫폼 base를 추가한다: 서버 상태는
+  Windows `%ProgramData%\anago`, 클라는 `%APPDATA%\anago`. wg 설정은
+  WireGuard 클라이언트의 규약 위치(`%ProgramData%\WireGuard`가 아니라
+  anago 상태 디렉터리에 두고 터널 서비스에 경로로 전달).
+- 유닉스 0600/0700의 Windows 대응은 **관리자 전용 ACL**이다. v1.5는
+  최선노력으로 간다: 상태 디렉터리를 관리자 권한으로 생성하고, 정밀
+  ACL 축소는 문서화 + 백로그(§13). 파일 잠금은 flock 대신
+  크로스플랫폼 파일 락(바이너리 몫)으로 교체한다.
+
+**결정 5 — 포워딩·방화벽 안내.**
+- Windows: 피어 중계에 `Set-NetIPInterface -Forwarding Enabled`가
+  필요하다 — init이 상태를 확인하고 명령을 안내한다(조립은 순수 함수).
+  Defender 방화벽 인바운드(UDP :51820, TCP :443)는 `netsh advfirewall`
+  명령을 조립해 안내·위임한다.
+- macOS: `sysctl -w net.inet.ip.forwarding=1` — 맥은 sysctl.conf가
+  없으므로 **launchd 데몬이 기동 시 재설정**하는 것으로 재부팅을 넘는다.
+- 공유기(이중 NAT 포함) 포트포워딩은 코드가 대신할 수 없다 — M0의
+  체크리스트 안내를 "가정용 공유기·이중 NAT" 시나리오로 확장한다
+  (상위 공유기 DMZ → 하위 공유기 포워딩 → 허브, 소유자 실측 경로).
+
+**결정 6 — CI와 검증.** 빌드·테스트 매트릭스에 windows·macos를
+추가한다(krill release.yml 패턴). HUMAN-VERIFY.md에 "윈도우 허브" 절을
+신설한다 — 검증 환경은 소유자의 상주 PC + 이중 NAT 공유기 + 유목
+맥북 + 폰, 즉 이 도구의 실제 사용 환경 그 자체다.
+
+**비목표(M1.5에서 안 하는 것).** Windows를 클라 전용으로 쓰는 GUI,
+서브넷 라우팅(LAN 기기 노출), 자동 공유기 설정(UPnP — 보안상 안내만).
+
 ## 12. 개발 방식 — krill로 만든다 (dogfood)
 
 이 프로젝트는 **krill의 협업 모드로 개발한다**: 마일스톤을 `krill plan`
@@ -2527,8 +2603,11 @@ Cloudflare 경로(A 레코드 자동화, DNS-01, origin cert)가 1차 시민이�
 ## 13. 리스크와 열린 질문
 
 - **wg-quick 의존의 플랫폼 편차**: 맥은 wireguard-tools(brew), 리눅스는
-  배포판 패키지. 설치 확인·안내를 join이 해준다. Windows는 v1 비대상
-  (WSL2 안내).
+  배포판 패키지. 설치 확인·안내를 join이 해준다. ~~Windows는 v1 비대상
+  (WSL2 안내).~~ **결정 뒤집음(M1.5, §11.1)**: 상주 기기의 현실이
+  윈도우 PC라서(소유자 실환경 포함) 허브·클라 모두 1급으로 승격한다.
+  Windows는 wg-quick이 없으므로 공식 WireGuard 클라이언트의 터널
+  서비스로 대체한다.
 - **VPS 방화벽/보안그룹**: :443(API)·:51820/udp(wg)·(HTTP-01이면 :80)을
   열어야 한다. init이 감지는 못 하니 체크리스트로 안내하고, 연결 실패
   시 진단 메시지(`anago server status`가 포트 리스닝 확인)를 준다.
