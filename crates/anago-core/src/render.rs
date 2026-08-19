@@ -414,9 +414,15 @@ pub fn export_warning(form: ExportForm, name: &DeviceName, out_path: Option<&str
              \x20 scrollback on disk.\n",
         );
     }
+    // Not "this device cannot manage it": whether *this* machine can
+    // depends on whether it has joined, which this function is not
+    // told. What is certain is the phone's own side — §8 throws its
+    // token away, so it has no way to call the API at all — and that
+    // removing it is otherwise ordinary: the API authenticates the
+    // caller, not the subject, so the hub or any joined device does it.
     out.push_str(&format!(
-        "  This device cannot manage {name} afterwards — remove it from the hub\n\
-         \x20 with `anago rm {name}`.\n"
+        "  {name} cannot remove itself afterwards — it keeps no token. Use\n\
+         \x20 `anago rm {name}` on the hub, or on any device that has joined.\n"
     ));
     out
 }
@@ -834,9 +840,15 @@ mod tests {
     #[test]
     fn the_warning_says_how_to_undo_the_export() {
         // The phone gets no device token (§8), so it can never remove
-        // itself — the only way back is from the hub.
+        // *itself*. Removing it is otherwise ordinary — the API
+        // authenticates the caller and not the subject — so the way
+        // back is the hub **or** any device that has joined. Naming
+        // only the hub would send somebody to the server for something
+        // the machine in front of them can do.
         let text = export_warning(ExportForm::Qr, &phone(), None);
         assert!(text.contains("anago rm 폰"), "{text}");
+        assert!(text.contains("cannot remove itself"), "{text}");
+        assert!(text.contains("any device that has joined"), "{text}");
     }
 
     #[test]

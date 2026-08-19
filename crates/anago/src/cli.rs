@@ -920,7 +920,8 @@ a token without it passes every other check before it fails.
 
 --acme-staging orders from Let's Encrypt's staging CA. Nothing trusts
 those certificates, so `anago join` will refuse them — it is for
-checking the wiring without spending a rate limit.
+checking the wiring without spending the production limits. Staging has
+limits of its own; they are far larger, not absent.
 ",
             env = cfapi::TOKEN_ENV
         ),

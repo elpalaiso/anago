@@ -789,10 +789,17 @@ pub fn export_note(name: &DeviceName, handed: &Handed) -> String {
         ])),
     }
     note.push('\n');
+    // What the phone cannot do is remove *itself*: §8 throws its token
+    // away, so it has no way to call the API. Removing it is ordinary
+    // — `anago rm` on the hub, or on any device that did keep a
+    // token, since the API authenticates the caller and not the
+    // subject. Naming only the hub would send somebody to the server
+    // for something they could do from the laptop in front of them.
     note.push_str(&indented(&[
-        &format!("The hub knows this phone as {name}. It cannot remove"),
-        "itself — it has no anago and no token — so",
-        &format!("`anago rm {name}` on the hub is how it goes away."),
+        &format!("The hub knows this phone as {name}, like any other device."),
+        "What it cannot do is remove itself — it has no anago and no",
+        &format!("token — so somebody else does: `anago rm {name}` on the"),
+        "hub, or on any device that has joined.",
     ]));
     // A code that is too wide is refused before it is drawn
     // (`JoinError::TooNarrow`). A code that is drawn and still will not
@@ -1773,6 +1780,15 @@ mod tests {
         for note in [piped, filed, drawn] {
             assert!(note.contains("The hub knows this phone as 폰"), "{note}");
             assert!(note.contains("`anago rm 폰`"), "{note}");
+            // What the phone cannot do is remove *itself* — it kept no
+            // token (§8). Removing it is ordinary, and the API
+            // authenticates the caller rather than the subject, so any
+            // joined device can. Naming only the hub would send
+            // somebody to the server for something the laptop in front
+            // of them does.
+            let said = flowed(&note);
+            assert!(said.contains("cannot do is remove itself"), "{note}");
+            assert!(said.contains("or on any device that has joined"), "{note}");
             // Laid out by hand, so no blank line carries invisible
             // spaces and no line trails off with them either.
             for line in note.lines() {
