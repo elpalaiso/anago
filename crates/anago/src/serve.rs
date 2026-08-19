@@ -243,7 +243,8 @@ async fn renew_once(
     let witness = state.tls.clone();
     let at = now();
 
-    let renewed = acme::renew(&state, paths, at)
+    // No token in hand: a renewal reads the one the state points at.
+    let renewed = acme::renew(&state, paths, None, at)
         .await
         .map_err(acme::RenewalFailure::from)?;
 

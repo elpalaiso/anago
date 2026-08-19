@@ -49,28 +49,35 @@ impl ServerPaths {
     /// certificate a matter of pointing the state elsewhere.
     // Both land in the issuance slice, which writes the account key
     // and the certificate under this directory.
-    #[allow(dead_code)]
     pub fn tls_dir(&self) -> PathBuf {
         self.root.join("tls")
     }
 
     /// The certificate anago issued (§9).
-    #[allow(dead_code)]
     pub fn certificate(&self) -> PathBuf {
         self.tls_dir().join("fullchain.pem")
     }
 
     /// Its private key.
-    #[allow(dead_code)]
     pub fn private_key(&self) -> PathBuf {
         self.tls_dir().join("privkey.pem")
     }
 
     /// The ACME account credentials — the account key, and the URL that
     /// key is known to the CA by (§9.1).
-    #[allow(dead_code)]
     pub fn account_key(&self) -> PathBuf {
         self.tls_dir().join("account.key")
+    }
+
+    /// Where the Cloudflare API token is kept, and only when DNS-01
+    /// renewal will need it again (§9.1).
+    ///
+    /// Beside the state file rather than inside it: a state file leaks
+    /// through paths a token should not follow — a backup, a dump
+    /// pasted into an issue — and a token that can rewrite the zone is
+    /// the widest-reaching secret anago handles (§13).
+    pub fn cf_token(&self) -> PathBuf {
+        self.root.join("cf-token")
     }
 
     /// The flock target that serializes **issuance** — the renewal
@@ -82,7 +89,6 @@ impl ServerPaths {
     /// attempt and protects what an issuance owns — the account file,
     /// the certificate pair, and the CA's opinion of how often it is
     /// being asked.
-    #[allow(dead_code)]
     pub fn issue_lock(&self) -> PathBuf {
         self.root.join("issue.lock")
     }

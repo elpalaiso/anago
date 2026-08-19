@@ -8,38 +8,31 @@
 //! `code`, `join`, `ls`, `rm`.
 
 mod activate;
-// Which way the hub gets its certificate. `server init` routes the
-// flags and `serve` renews; the issuance itself is wired in as the
-// commands that order one land.
+// Which way the hub gets its certificate: `server init` orders the
+// first one and `serve` renews it. A few pieces wait for
+// `server renew`, which lands next.
 #[allow(dead_code)]
 mod acme;
 mod api;
 mod args;
 // Cloudflare: where the token comes from, which zone the domain lives
-// in, and the hub's A record. `server init` takes the token flags; the
-// zone and record calls are wired in a later slice, so part of the
-// module is still ahead of its caller.
+// in, and the hub's A record. `server init` uses all of it; token
+// verification waits for the command that rotates one.
 #[allow(dead_code)]
 mod cfapi;
 mod cli;
 mod client;
 mod code;
 mod diagnostics;
-// Watching for a DNS-01 record to be served. Used by the ACME slice
-// that lands next, alongside `cfapi`'s challenge record.
-#[allow(dead_code)]
+// Watching for a DNS-01 record to be served, alongside `cfapi`'s
+// challenge record.
 mod dnsprobe;
+mod fsutil;
 mod init;
 mod join;
 mod ls;
-mod rm;
-// Path rules and file handling are complete and unit-tested; the
-// slices that read and write those files (server init, join) land next,
-// so both modules are briefly ahead of their callers.
-mod fsutil;
-// Client-side path resolution and a few server paths are used by the
-// join and serving slices that land next.
 mod paths;
+mod rm;
 mod secret;
 mod serve;
 mod store;

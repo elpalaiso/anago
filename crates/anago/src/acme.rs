@@ -1508,6 +1508,7 @@ pub struct Renewed {
 pub async fn renew(
     state: &ServerState,
     paths: &ServerPaths,
+    cloudflare: Option<(Token, Zone)>,
     now: i64,
 ) -> Result<Renewed, AcmeError> {
     let acme = state.tls.renewable().ok_or_else(|| AcmeError::NotOurs {
@@ -1532,7 +1533,15 @@ pub async fn renew(
     let issued = match acme.challenge {
         Challenge::Http01 => issue_http01(&signed.account, &state.domain, CHALLENGE_PORT).await?,
         Challenge::Dns01 => {
-            let (token, zone) = cloudflare_for(state)?;
+            // `server init` has the token and the zone in hand already
+            // — it just wrote the A record with them — and the token is
+            // not on disk yet, because it is published with the state
+            // file and not before it. A renewal has neither and looks
+            // both up.
+            let (token, zone) = match cloudflare {
+                Some(ready) => ready,
+                None => cloudflare_for(state)?,
+            };
             zone_id = Some(zone.id.clone());
             issue_dns01(&signed.account, &state.domain, &zone, &token, now).await?
         }
