@@ -29,6 +29,9 @@ pub const DEFAULT_API_PORT: u16 = 443;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     ServerInit(ServerInit),
+    /// `anago server renew` (§8): a certificate again, settings
+    /// changed, or just the A record.
+    ServerRenew(ServerRenew),
     /// The resident process (§8). systemd runs this; a person only
     /// types it after `server init --no-systemd`.
     ServerRun,
@@ -75,6 +78,34 @@ pub struct ServerInit {
     pub api_port: u16,
     /// False when `--no-systemd` asked for a foreground run.
     pub systemd: bool,
+}
+
+/// `anago server renew` (§8).
+///
+/// Every field is "what was asked for", never "what the hub should end
+/// up with": a flag left out means *leave that alone*, which is why
+/// they are all optional and why the CA is a tri-state rather than a
+/// `bool`. Reading an absent `--acme-staging` as "production" would
+/// move a hub to a different CA on an ordinary renewal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerRenew {
+    /// Re-issue even though the certificate is not due.
+    pub force: bool,
+    /// Push the A record and stop.
+    pub dns_only: bool,
+    /// `--acme-staging` / `--acme-production`, or neither.
+    pub ca: Option<Ca>,
+    pub acme_email: Option<String>,
+    pub acme_challenge: Option<Challenge>,
+    pub cf_token: Option<Token>,
+    pub cf_token_file: Option<String>,
+}
+
+/// Which CA the hub should order from after this run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ca {
+    Staging,
+    Production,
 }
 
 /// `anago join <domain> <code>`.
@@ -168,6 +199,7 @@ fn server(argv: &[String]) -> Result<Command, CliError> {
         None => Err(CliError::MissingSubcommand("server")),
         Some((head, rest)) => match head.as_str() {
             "init" => server_init(rest),
+            "renew" => server_renew(rest),
             "run" => no_args("server run", rest).map(|_| Command::ServerRun),
             "status" => Err(CliError::NotYet {
                 what: "anago server status",
@@ -300,6 +332,80 @@ fn check_combination(init: &ServerInit) -> Result<(), CliError> {
         Err(PlanError::Dns01WithoutToken) => Ok(()),
         Err(e) => Err(CliError::Plan(e)),
     }
+}
+
+fn server_renew(argv: &[String]) -> Result<Command, CliError> {
+    let spec = [
+        Flag::boolean("force"),
+        Flag::boolean("dns"),
+        Flag::boolean("acme-staging"),
+        Flag::boolean("acme-production"),
+        Flag::value("acme-email"),
+        Flag::value("acme-challenge"),
+        Flag::value("cf-token"),
+        Flag::value("cf-token-file"),
+    ];
+    let parsed = ParsedArgs::parse(argv, &spec)?;
+    reject_extra_positionals(&parsed, "server renew")?;
+
+    // Both, or neither. `init` has no pair because production is the
+    // default there and `--acme-staging` is a plain opt-in; here the
+    // flag has to overwrite a value the hub already has, so the other
+    // direction needs a way to be said (§8).
+    let ca = match (
+        parsed.is_set("acme-staging"),
+        parsed.is_set("acme-production"),
+    ) {
+        (true, true) => {
+            return Err(CliError::Contradiction(
+                "--acme-staging",
+                "--acme-production",
+            ))
+        }
+        (true, false) => Some(Ca::Staging),
+        (false, true) => Some(Ca::Production),
+        (false, false) => None,
+    };
+
+    let renew = ServerRenew {
+        force: parsed.is_set("force"),
+        dns_only: parsed.is_set("dns"),
+        ca,
+        acme_email: parsed.value("acme-email").map(str::to_string),
+        acme_challenge: challenge(&parsed)?,
+        cf_token: token(&parsed)?,
+        cf_token_file: parsed.value("cf-token-file").map(str::to_string),
+    };
+
+    // The token flags are one question asked twice, wherever they
+    // appear — the rule and its wording belong to `cfapi::choose`.
+    cfapi::choose(
+        renew.cf_token_file.as_deref(),
+        renew.cf_token.as_ref().map(Token::expose),
+        None,
+    )
+    .map_err(CliError::Token)?;
+
+    // `--dns` means *only* DNS. Mixed with a re-issue or a settings
+    // change, a failure leaves it unclear which half took (§8). The
+    // token flags are the exception: pushing a record needs a token,
+    // and the hub may not have one recorded.
+    if renew.dns_only {
+        let mixed: Vec<&'static str> = [
+            (renew.force, "--force"),
+            (renew.ca.is_some(), "--acme-staging/--acme-production"),
+            (renew.acme_email.is_some(), "--acme-email"),
+            (renew.acme_challenge.is_some(), "--acme-challenge"),
+        ]
+        .into_iter()
+        .filter_map(|(given, flag)| given.then_some(flag))
+        .collect();
+        if let Some(other) = mixed.first() {
+            return Err(CliError::Contradiction("--dns", other));
+        }
+    }
+
+    Ok(Command::ServerRenew(renew))
 }
 
 fn join(argv: &[String]) -> Result<Command, CliError> {
@@ -445,6 +551,8 @@ pub enum CliError {
         what: &'static str,
         message: String,
     },
+    /// Two flags that cannot both be meant.
+    Contradiction(&'static str, &'static str),
     /// Flags that do not together describe a hub anago can set up
     /// ([`acme::plan`]).
     Plan(PlanError),
@@ -481,6 +589,10 @@ impl fmt::Display for CliError {
             CliError::BadValue { flag, message } => write!(f, "--{flag}: {message}"),
             // Both already name the flags they are about, so adding a
             // prefix here would say one of them twice.
+            CliError::Contradiction(one, other) => write!(
+                f,
+                "{one} and {other} cannot both be given; pass one and run it again"
+            ),
             CliError::Plan(e) => write!(f, "{e}"),
             CliError::Token(e) => write!(f, "{e}"),
             CliError::BadArgument { what, message } => write!(f, "{what}: {message}"),
@@ -540,6 +652,36 @@ checking the wiring without spending a rate limit.
 ",
             env = cfapi::TOKEN_ENV
         ),
+        Some("renew") => format!(
+            "\
+usage: anago server renew [--force] [--dns]
+                         [--acme-staging | --acme-production]
+                         [--acme-email <address>]
+                         [--acme-challenge http-01|dns-01]
+                         [--cf-token <token> | --cf-token-file <path>]
+
+Run on the hub. Orders the certificate again, changes how it will be
+ordered next time, or pushes the A record — never all three, and never
+anything to do with WireGuard: no tunnel drops for any of this.
+
+With no flags it decides for itself. If the certificate is not due yet
+it says when it will be and does nothing, so it is safe in cron.
+--force orders one anyway, which spends one of the CA's few per week
+for this name.
+
+A flag that changes *which* certificate you would get — moving between
+{staging} and the real CA, or taking over a hub set up with
+--tls-cert/--tls-key — orders one straight away; --force is not needed
+and would not mean anything. A flag that does not (--acme-email,
+--acme-challenge, the token) is written down and applies from the next
+renewal.
+
+--dns pushes the A record at this machine's current address and stops.
+That is for a server whose public IP changed; nothing else here does
+it, and `server init` refuses to run twice.
+",
+            staging = "staging"
+        ),
         Some("join") => format!(
             "\
 usage: anago join <domain> <code> [--name <name>] [--api-port <port>]
@@ -583,6 +725,7 @@ anago {version} — self-hosted WireGuard private network
 
 usage:
   anago server init --domain <d>    set this machine up as the hub
+  anago server renew                order the certificate again, or change how
   anago server run                  run the hub (systemd does this for you)
   anago code                        issue a join code (on the server)
   anago join <domain> <code>        register this device
@@ -1165,6 +1308,176 @@ mod tests {
         assert_eq!(exit_code(&parse_args(&args).unwrap_err()), 2);
     }
 
+    fn renew(args: &[&str]) -> Result<ServerRenew, CliError> {
+        let mut argv = vec!["server", "renew"];
+        argv.extend_from_slice(args);
+        match parse_args(&argv)? {
+            Command::ServerRenew(renew) => Ok(renew),
+            other => panic!("expected server renew, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn server_renew_takes_nothing_at_all() {
+        // The command's whole point as a cron job: with no flags it is
+        // a check that decides for itself (§8).
+        let asked = renew(&[]).unwrap();
+        assert!(!asked.force);
+        assert!(!asked.dns_only);
+        assert_eq!(asked.ca, None);
+    }
+
+    #[test]
+    fn the_ca_is_three_states_and_not_a_flag() {
+        // An absent `--acme-staging` must not read as "production":
+        // that would move a staging hub to another CA on an ordinary
+        // renewal. Hence the pair, which `server init` does not need
+        // because production is the default there (§8).
+        assert_eq!(renew(&[]).unwrap().ca, None);
+        assert_eq!(renew(&["--acme-staging"]).unwrap().ca, Some(Ca::Staging));
+        assert_eq!(
+            renew(&["--acme-production"]).unwrap().ca,
+            Some(Ca::Production)
+        );
+
+        let e = renew(&["--acme-staging", "--acme-production"]).unwrap_err();
+        assert_eq!(
+            e,
+            CliError::Contradiction("--acme-staging", "--acme-production")
+        );
+        assert!(e.to_string().contains("cannot both be given"), "{e}");
+    }
+
+    #[test]
+    fn dns_means_only_dns() {
+        // Mixed with a re-issue or a settings change, a failure leaves
+        // it unclear which half took (§8).
+        assert!(renew(&["--dns"]).unwrap().dns_only);
+        for other in [
+            "--force",
+            "--acme-staging",
+            "--acme-production",
+            "--acme-email=jo@example.com",
+            "--acme-challenge=dns-01",
+        ] {
+            let e = renew(&["--dns", other]).unwrap_err();
+            assert!(
+                matches!(e, CliError::Contradiction("--dns", _)),
+                "{other}: {e:?}"
+            );
+        }
+
+        // The token flags are the exception: pushing a record needs a
+        // token, and the hub may have none recorded.
+        let asked = renew(&["--dns", "--cf-token-file", "/root/cf-token"]).unwrap();
+        assert!(asked.dns_only);
+        assert_eq!(asked.cf_token_file.as_deref(), Some("/root/cf-token"));
+    }
+
+    #[test]
+    fn server_renew_settles_the_token_flags_the_same_way_everywhere() {
+        let e = renew(&[
+            "--cf-token",
+            "cf-secret-value",
+            "--cf-token-file",
+            "/root/cf",
+        ])
+        .unwrap_err();
+        assert_eq!(e, CliError::Token(CfError::BothFlags));
+        assert!(e.to_string().contains("the safer of the two"), "{e}");
+
+        // And a truncated paste is caught where it was typed.
+        assert_eq!(
+            renew(&["--cf-token", "half a token"]),
+            Err(CliError::Token(CfError::Malformed(Source::Flag)))
+        );
+    }
+
+    #[test]
+    fn every_setting_flag_reaches_the_field_it_belongs_to() {
+        // `renew::plan` decides what to do by comparing these against
+        // the hub's recorded values (§8), so a flag that lands in the
+        // wrong field is a certificate ordered — or not — for the
+        // wrong reason.
+        let asked = renew(&[
+            "--acme-email",
+            "jo@example.com",
+            "--acme-challenge",
+            "dns-01",
+            "--cf-token-file",
+            "/root/cf-token",
+            "--acme-staging",
+            "--force",
+        ])
+        .unwrap();
+        assert_eq!(asked.acme_email.as_deref(), Some("jo@example.com"));
+        assert_eq!(asked.acme_challenge, Some(Challenge::Dns01));
+        assert_eq!(asked.cf_token_file.as_deref(), Some("/root/cf-token"));
+        assert_eq!(asked.ca, Some(Ca::Staging));
+        assert!(asked.force);
+        assert!(!asked.dns_only);
+
+        // And an empty command line leaves every one of them alone —
+        // which is what makes a bare `server renew` a check rather
+        // than an edit.
+        let bare = renew(&[]).unwrap();
+        assert_eq!(bare.acme_email, None);
+        assert_eq!(bare.acme_challenge, None);
+        assert_eq!(bare.cf_token, None);
+        assert_eq!(bare.cf_token_file, None);
+        assert_eq!(bare.ca, None);
+        assert!(!bare.force);
+    }
+
+    #[test]
+    fn server_renew_refuses_what_it_does_not_take() {
+        assert_eq!(
+            parse_args(&["server", "renew", "--domain", "net.example.com"]),
+            Err(CliError::Arg(ArgError::Unknown("--domain".to_string())))
+        );
+        assert_eq!(
+            parse_args(&["server", "renew", "net.example.com"]),
+            Err(CliError::TooManyArguments("server renew"))
+        );
+        // The same challenge spelling as everywhere else.
+        assert!(matches!(
+            renew(&["--acme-challenge", "dns"]),
+            Err(CliError::BadValue {
+                flag: "acme-challenge",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn the_help_for_server_renew_names_every_flag_it_accepts() {
+        let text = help(Some("renew"));
+        for flag in [
+            "--force",
+            "--dns",
+            "--acme-staging",
+            "--acme-production",
+            "--acme-email",
+            "--acme-challenge",
+            "--cf-token",
+            "--cf-token-file",
+        ] {
+            assert!(
+                text.contains(flag),
+                "the help for server renew omits {flag}"
+            );
+            assert_ne!(
+                parse_args(&["server", "renew", flag]),
+                Err(CliError::Arg(ArgError::Unknown(flag.to_string()))),
+                "{flag} is in the help but not in the spec"
+            );
+        }
+        // And the two things a person has to be told rather than find
+        // out: it is safe in cron, and it never touches the tunnel.
+        assert!(text.contains("safe in cron"), "{text}");
+        assert!(text.contains("no tunnel drops"), "{text}");
+    }
+
     #[test]
     fn unknown_commands_are_named_not_guessed() {
         assert_eq!(
@@ -1290,14 +1603,14 @@ mod tests {
     #[test]
     fn help_text_covers_every_m0_command() {
         let general = help(None);
-        for command in ["server init", "code", "join", "ls", "rm"] {
+        for command in ["server init", "server renew", "code", "join", "ls", "rm"] {
             assert!(general.contains(command), "general help omits {command}");
         }
         // And says where the rest went.
         assert!(general.contains("M1"), "{general}");
         assert!(general.contains("M3"), "{general}");
 
-        for topic in ["server", "join", "code", "ls", "rm"] {
+        for topic in ["server", "renew", "join", "code", "ls", "rm"] {
             let text = help(Some(topic));
             assert!(text.starts_with("usage: anago "), "{topic}: {text}");
         }

@@ -1565,6 +1565,28 @@ pub async fn renew(
     })
 }
 
+/// [`renew`] for the two commands that are not already inside a
+/// runtime — `server init` and `server renew`.
+///
+/// The hub's own timer runs beside the listener and awaits `renew`
+/// directly; a command-line run has no runtime of its own, and one
+/// current-thread runtime for the length of one issuance is the whole
+/// of what it needs.
+///
+/// **Human verification needed**: this talks to a real CA.
+pub fn renew_blocking(
+    state: &ServerState,
+    paths: &ServerPaths,
+    cloudflare: Option<(Token, Zone)>,
+    now: i64,
+) -> Result<Renewed, AcmeError> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| AcmeError::Client(e.to_string()))?
+        .block_on(renew(state, paths, cloudflare, now))
+}
+
 /// The token and zone a DNS-01 renewal needs.
 ///
 /// The zone is looked up rather than taken from `cloudflare.zone_id`

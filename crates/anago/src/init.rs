@@ -813,17 +813,7 @@ fn obtain(
     now: i64,
 ) -> Result<acme::Renewed, InitError> {
     let ready = token.zip(zone);
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| InitError::Io {
-            what: "start the async runtime",
-            kind: e.kind(),
-            source: e.to_string(),
-        })?;
-    runtime
-        .block_on(acme::renew(state, paths, ready, now))
-        .map_err(InitError::Acme)
+    acme::renew_blocking(state, paths, ready, now).map_err(InitError::Acme)
 }
 
 /// A failure after the certificate is in hand.

@@ -32,6 +32,7 @@ mod init;
 mod join;
 mod ls;
 mod paths;
+mod renew;
 mod rm;
 mod secret;
 mod serve;
@@ -69,6 +70,7 @@ fn main() {
         Command::Version => println!("anago {}", env!("CARGO_PKG_VERSION")),
         Command::Help(topic) => print!("{}", cli::help(topic.as_deref())),
         Command::ServerInit(args) => server_init(&args),
+        Command::ServerRenew(args) => server_renew(&args),
         Command::ServerRun => server_run(),
         Command::Code => match code::run(std::path::Path::new(paths::DEFAULT_SERVER_ROOT), now()) {
             Ok(text) => print!("{text}"),
@@ -98,6 +100,28 @@ fn server_init(args: &cli::ServerInit) -> ! {
             // `init::run` already ends with how this hub starts —
             // under systemd, or by hand. Nothing to add here.
             print!("{}", done.instructions);
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("anago: {e}");
+            std::process::exit(EXIT_FAILED);
+        }
+    }
+}
+
+/// `anago server renew` — a certificate again, a setting changed, or
+/// the A record pushed. Never touches `wg` (§8).
+fn server_renew(args: &cli::ServerRenew) -> ! {
+    let root = std::path::Path::new(paths::DEFAULT_SERVER_ROOT);
+    let store = store::Store::new(root);
+    let server_paths = paths::ServerPaths::new(root);
+    let env = std::env::var(cfapi::TOKEN_ENV).ok();
+    match renew::run(&store, &server_paths, args, env.as_deref(), now()) {
+        Ok(done) => {
+            for warning in &done.warnings {
+                eprintln!("anago: warning: {warning}");
+            }
+            print!("{}", done.output);
             std::process::exit(0);
         }
         Err(e) => {

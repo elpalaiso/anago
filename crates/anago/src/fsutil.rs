@@ -31,6 +31,16 @@ pub const PRIVATE_DIR_MODE: u32 = 0o700;
 /// one filesystem — a temp under `/tmp` would silently degrade to a
 /// copy across a mount boundary.
 pub fn write_private(path: &Path, contents: &str) -> io::Result<()> {
+    write_private_owned(path, contents.as_bytes(), None)
+}
+
+/// [`write_private`] for contents that are not text.
+///
+/// The one caller is the rollback that puts a certificate or an account
+/// key back as it was: it holds the bytes it read, and re-encoding them
+/// through a `str` would refuse a file that is not UTF-8 — at the
+/// moment its job is to restore it untouched.
+pub fn write_private_bytes(path: &Path, contents: &[u8]) -> io::Result<()> {
     write_private_owned(path, contents, None)
 }
 
@@ -42,13 +52,13 @@ pub fn write_private(path: &Path, contents: &str) -> io::Result<()> {
 /// name owned by root.
 pub fn write_private_owned(
     path: &Path,
-    contents: &str,
+    contents: &[u8],
     owner: Option<(u32, u32)>,
 ) -> io::Result<()> {
     let tmp = temp_sibling(path)?;
 
     let mut file = create_private_new(&tmp)?;
-    file.write_all(contents.as_bytes())?;
+    file.write_all(contents)?;
     if let Some((uid, gid)) = owner {
         give_fd_to(&file, uid, gid)?;
     }
