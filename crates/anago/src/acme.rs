@@ -28,7 +28,8 @@ use axum::routing::get;
 use axum::Router;
 use instant_acme::RetryPolicy;
 
-use crate::cfapi::Source;
+use crate::cfapi::{self, CfError, Source, Token, Zone};
+use crate::dnsprobe;
 use crate::fsutil;
 
 /// What `server init` was told.
@@ -979,6 +980,10 @@ pub struct Issued {
     /// PEM. Private, because it is the only copy and a `Debug` that
     /// printed it would end up in a log (§7).
     private_key: String,
+    /// Things that went well enough to carry on with and still need
+    /// saying — a DNS-01 wait that could not see anything, say. Printed
+    /// beside the success, not instead of it.
+    pub warnings: Vec<String>,
 }
 
 impl Issued {
@@ -1068,7 +1073,7 @@ pub async fn issue_http01(
     // it to look. The authorizations were fetched above, so telling it
     // makes no extra requests for them.
     let checked = match tell_the_ca(&mut order, domain).await {
-        Ok(()) => wait_for_ready(&mut order, domain, &paths).await,
+        Ok(()) => wait_for_ready(&mut order, domain, Challenge::Http01, &paths).await,
         Err(e) => Err(e),
     };
 
@@ -1112,23 +1117,22 @@ async fn tell_the_ca(order: &mut instant_acme::Order, domain: &str) -> Result<()
 async fn wait_for_ready(
     order: &mut instant_acme::Order,
     domain: &str,
-    paths: &[String],
+    challenge: Challenge,
+    looked_at: &[String],
 ) -> Result<(), AcmeError> {
-    let policy = retry_policy();
+    let failed = |detail: String| AcmeError::Validation {
+        domain: domain.to_string(),
+        challenge,
+        looked_at: looked_at.to_vec(),
+        detail,
+    };
+
     let status = order
-        .poll_ready(&policy)
+        .poll_ready(&retry_policy())
         .await
-        .map_err(|e| AcmeError::Validation {
-            domain: domain.to_string(),
-            urls: paths.to_vec(),
-            detail: e.to_string(),
-        })?;
+        .map_err(|e| failed(e.to_string()))?;
     if status != instant_acme::OrderStatus::Ready {
-        return Err(AcmeError::Validation {
-            domain: domain.to_string(),
-            urls: paths.to_vec(),
-            detail: format!("the CA left the order {status:?}"),
-        });
+        return Err(failed(format!("the CA left the order {status:?}")));
     }
     Ok(())
 }
@@ -1151,7 +1155,184 @@ async fn finish(order: &mut instant_acme::Order, domain: &str) -> Result<Issued,
     Ok(Issued {
         certificate,
         private_key,
+        warnings: Vec::new(),
     })
+}
+
+// ------------------------------------------------------- DNS-01
+
+/// What to tell someone whose DNS-01 attempt failed.
+///
+/// **anago does not answer a DNS-01 failure by trying HTTP-01.** This
+/// is the one place that decision is written down, and it is not a
+/// convenience question: the two challenges have different blast radii
+/// (§13), and someone who chose DNS-01 may have chosen it precisely so
+/// that port 80 stays shut — on a host where opening it is a change to
+/// a firewall, a security group, or somebody else's web server. Falling
+/// back would undo that choice silently, and the run would report
+/// success.
+///
+/// The A record is the opposite case and falls back happily
+/// (`cfapi::fallback_notice`): there Cloudflare is doing a job a person
+/// can do in a browser in ten seconds, and M0's instructions are still
+/// printed underneath. Here the token is not a convenience, it is the
+/// whole mechanism.
+///
+/// So the failure stops the run, and the alternative is offered as
+/// something for a person to choose.
+pub fn no_automatic_switch() -> String {
+    format!(
+        "anago did not switch to another challenge on its own: http-01 needs port \
+         {CHALLENGE_PORT} open to the internet, and that is not a change to make on \
+         somebody's behalf. Fix the token or the zone and run this again, or ask for \
+         it with --acme-challenge http-01"
+    )
+}
+
+/// Orders a certificate for `domain`, proving control by writing a TXT
+/// record — no port 80 anywhere.
+///
+/// The shape is the same as [`issue_http01`], with the challenge record
+/// in place of the listener and one step more: **waiting for the record
+/// to be served** before telling the CA to look (`dnsprobe`). A CA that
+/// looks too early sees nothing and spends one of the failed-validation
+/// attempts a rate limit counts (§13).
+///
+/// Cleanup is not conditional. Each published record is held by a guard
+/// that removes it on the way out, whichever way out that is — an error,
+/// an early return, a panic (§9.1).
+///
+/// **Human verification needed**: this orders a real certificate and
+/// needs a real Cloudflare zone.
+pub async fn issue_dns01(
+    account: &instant_acme::Account,
+    domain: &str,
+    zone: &Zone,
+    token: &Token,
+    now: i64,
+) -> Result<Issued, AcmeError> {
+    let identifiers = [instant_acme::Identifier::Dns(domain.to_string())];
+    let mut order = account
+        .new_order(&instant_acme::NewOrder::new(&identifiers))
+        .await
+        .map_err(|e| AcmeError::Order {
+            domain: domain.to_string(),
+            detail: e.to_string(),
+        })?;
+
+    // First pass: the values the CA will look for. For one hub that is
+    // one value, but the loop is the general shape — several TXT values
+    // at one name is a state DNS-01 allows for.
+    let mut values = Vec::new();
+    let mut authorizations = order.authorizations();
+    while let Some(authorization) = authorizations.next().await {
+        let mut authorization = authorization.map_err(|e| AcmeError::Order {
+            domain: domain.to_string(),
+            detail: e.to_string(),
+        })?;
+        if authorization.status == instant_acme::AuthorizationStatus::Valid {
+            continue;
+        }
+        let challenge = authorization
+            .challenge(instant_acme::ChallengeType::Dns01)
+            .ok_or_else(|| AcmeError::NoChallenge {
+                domain: domain.to_string(),
+                challenge: Challenge::Dns01,
+            })?;
+        values.push(challenge.key_authorization().dns_value());
+    }
+
+    if values.is_empty() {
+        // Every authorization was already valid: nothing to publish,
+        // nothing to clean up.
+        return finish(&mut order, domain).await;
+    }
+
+    // The guards live until this function returns, so every path out of
+    // it — including the `?`s below — takes the records with it.
+    let mut published = Vec::new();
+    for value in &values {
+        published.push(
+            cfapi::Challenge::publish(token, &zone.id, domain, value, now)
+                .map_err(|e| dns01_error(domain, e))?,
+        );
+    }
+    let name = published[0].name().to_string();
+
+    let mut warnings = Vec::new();
+    for value in &values {
+        let outcome = look_for(&zone.name_servers, &name, value).await?;
+        warnings.extend(outcome.warning());
+    }
+
+    tell_the_ca_dns01(&mut order, domain).await?;
+    let record = vec![format!("the TXT record at {name}")];
+    wait_for_ready(&mut order, domain, Challenge::Dns01, &record).await?;
+
+    // The CA has looked; the records have done their job. Removing them
+    // here — rather than letting the guards do it on the way out —
+    // means the report says whether it worked, and the zone is tidy
+    // before the certificate arrives.
+    for challenge in published {
+        challenge.remove().map_err(|e| dns01_error(domain, e))?;
+    }
+
+    let mut issued = finish(&mut order, domain).await?;
+    issued.warnings = warnings;
+    Ok(issued)
+}
+
+/// Waits for one value to be served, off the async runtime.
+///
+/// `dnsprobe` is ordinary blocking code — a UDP socket and a sleep —
+/// and running it directly here would stall the runtime thread it
+/// happens to be on for up to a minute.
+async fn look_for(
+    nameservers: &[String],
+    name: &str,
+    value: &str,
+) -> Result<dnsprobe::Outcome, AcmeError> {
+    let nameservers = nameservers.to_vec();
+    let watched = name.to_string();
+    let value = value.to_string();
+    tokio::task::spawn_blocking(move || dnsprobe::wait(&nameservers, &watched, &value))
+        .await
+        .map_err(|e| AcmeError::Propagation {
+            detail: format!("the wait for {name} did not finish: {e}"),
+        })?
+        .map_err(|e| AcmeError::Propagation {
+            detail: e.to_string(),
+        })
+}
+
+/// Marks every pending DNS-01 challenge ready.
+async fn tell_the_ca_dns01(order: &mut instant_acme::Order, domain: &str) -> Result<(), AcmeError> {
+    let mut authorizations = order.authorizations();
+    while let Some(authorization) = authorizations.next().await {
+        let mut authorization = authorization.map_err(|e| AcmeError::Order {
+            domain: domain.to_string(),
+            detail: e.to_string(),
+        })?;
+        if authorization.status == instant_acme::AuthorizationStatus::Valid {
+            continue;
+        }
+        let Some(mut challenge) = authorization.challenge(instant_acme::ChallengeType::Dns01)
+        else {
+            continue;
+        };
+        challenge.set_ready().await.map_err(|e| AcmeError::Order {
+            domain: domain.to_string(),
+            detail: e.to_string(),
+        })?;
+    }
+    Ok(())
+}
+
+fn dns01_error(domain: &str, e: CfError) -> AcmeError {
+    AcmeError::Dns01 {
+        domain: domain.to_string(),
+        detail: e.to_string(),
+    }
 }
 
 /// Writes the certificate and its key under `/var/lib/anago/tls/`
@@ -1246,10 +1427,26 @@ pub enum AcmeError {
     NoAddressFamily {
         port: u16,
     },
+    /// The challenge record could not be written or removed.
+    Dns01 {
+        domain: String,
+        detail: String,
+    },
+    /// The record was written and the nameservers never served it.
+    /// The detail is `dnsprobe`'s, which already names the record.
+    Propagation {
+        detail: String,
+    },
     /// The CA looked and was not satisfied.
     Validation {
         domain: String,
-        urls: Vec<String>,
+        /// Which challenge was being proven. The two fail for entirely
+        /// different reasons and are fixed in entirely different
+        /// places, so they are never described in the same words.
+        challenge: Challenge,
+        /// What the CA looked at: the URLs it fetches for HTTP-01, the
+        /// record name it resolves for DNS-01.
+        looked_at: Vec<String>,
         detail: String,
     },
     /// The order was authorized and the certificate still did not
@@ -1347,6 +1544,14 @@ impl fmt::Display for AcmeError {
                 "port {port} could not be opened on IPv4 or IPv6 — this host appears to \
                  have neither. A hub needs one of them to be reachable at all"
             ),
+            AcmeError::Dns01 { domain, detail } => write!(
+                f,
+                "the DNS-01 challenge record for {domain} could not be managed: {detail}\n{}",
+                no_automatic_switch()
+            ),
+            AcmeError::Propagation { detail } => {
+                write!(f, "{detail}\n{}", no_automatic_switch())
+            }
             AcmeError::Order { domain, detail } => write!(
                 f,
                 "the certificate order for {domain} did not go through: {detail}"
@@ -1362,7 +1567,8 @@ impl fmt::Display for AcmeError {
             ),
             AcmeError::Validation {
                 domain,
-                urls,
+                challenge: Challenge::Http01,
+                looked_at,
                 detail,
             } => write!(
                 f,
@@ -1370,7 +1576,23 @@ impl fmt::Display for AcmeError {
                  so the thing to check is that port 80 is open all the way in — the cloud \
                  security group as well as the host firewall — and that the name resolves \
                  to this server",
-                urls.join(", ")
+                looked_at.join(", ")
+            ),
+            AcmeError::Validation {
+                domain,
+                challenge: Challenge::Dns01,
+                looked_at,
+                detail,
+            } => write!(
+                f,
+                "the CA could not verify {domain}: {detail}. It resolves {} itself, from \
+                 its own side of the internet, so what to look at is DNS and not this \
+                 machine: whether the zone anago wrote into is the one actually answering \
+                 for that name (a delegated subzone answers for itself), whether something \
+                 stale is still at it, and whether the token may edit the zone that \
+                 matters.\n{}",
+                looked_at.join(", "),
+                no_automatic_switch()
             ),
             AcmeError::Finalize { domain, detail } => write!(
                 f,
@@ -1663,6 +1885,14 @@ mod tests {
 
     fn default_path() -> PathBuf {
         PathBuf::from(ACCOUNT_KEY)
+    }
+
+    fn issued(certificate: &str, private_key: &str) -> Issued {
+        Issued {
+            certificate: certificate.to_string(),
+            private_key: private_key.to_string(),
+            warnings: Vec::new(),
+        }
     }
 
     #[test]
@@ -2341,12 +2571,13 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_validation_says_which_url_the_ca_asked_for() {
+    fn a_failed_http_01_validation_says_which_url_the_ca_asked_for() {
         // The single most useful thing to print: a person can paste it
         // into curl from another machine and see the same failure.
         let error = AcmeError::Validation {
             domain: "net.example.com".to_string(),
-            urls: vec![format!(
+            challenge: Challenge::Http01,
+            looked_at: vec![format!(
                 "http://net.example.com/.well-known/acme-challenge/{TOKEN}"
             )],
             detail: "the CA left the order Invalid".to_string(),
@@ -2356,18 +2587,60 @@ mod tests {
         assert!(message.contains("http://net.example.com/"), "{message}");
         // Where the port has to be open: not just on the host.
         assert!(message.contains("security group"), "{message}");
+        // And no offer to switch: HTTP-01 is already the port-opening
+        // one, so there is nothing to be careful about.
+        assert!(!message.contains("--acme-challenge"), "{message}");
+    }
+
+    #[test]
+    fn a_failed_dns_01_validation_never_tells_anyone_to_open_a_port() {
+        // The failure this prevents is advice that is wrong twice: the
+        // person chose DNS-01 to keep :80 shut, and opening it would
+        // not fix a DNS problem anyway. The CA resolves the name from
+        // its own side; nothing about this machine's firewall is
+        // involved.
+        let error = AcmeError::Validation {
+            domain: "net.example.com".to_string(),
+            challenge: Challenge::Dns01,
+            looked_at: vec!["the TXT record at _acme-challenge.net.example.com".to_string()],
+            detail: "the CA left the order Invalid".to_string(),
+        };
+        let message = error.to_string();
+        let (diagnosis, offer) = message.split_once('\n').expect("two parts");
+
+        // The diagnosis says nothing about ports or firewalls.
+        assert!(
+            diagnosis.contains("_acme-challenge.net.example.com"),
+            "{diagnosis}"
+        );
+        for port_advice in ["port", "firewall", "security group"] {
+            assert!(
+                !diagnosis.contains(port_advice),
+                "DNS-01 was diagnosed as a port problem: {diagnosis}"
+            );
+        }
+        // What it does point at: which zone actually answers, what is
+        // stale, and whether the token may edit it.
+        assert!(diagnosis.contains("delegated subzone"), "{diagnosis}");
+        assert!(diagnosis.contains("stale"), "{diagnosis}");
+        assert!(diagnosis.contains("may edit"), "{diagnosis}");
+
+        // Port 80 appears once, in the offer, as what http-01 would
+        // cost — the person's choice to make, not a fix being
+        // recommended for this failure.
+        assert!(offer.contains("--acme-challenge http-01"), "{offer}");
+        assert!(offer.contains("did not switch"), "{offer}");
+        assert_eq!(message.matches("port 80").count(), 1, "{message}");
     }
 
     #[test]
     fn the_certificate_and_its_key_land_private() {
         let dir = TempDir::new();
         let paths = crate::paths::ServerPaths::new(dir.path.clone());
-        let issued = Issued {
-            certificate: "-----BEGIN CERTIFICATE-----\nchain\n-----END CERTIFICATE-----\n"
-                .to_string(),
-            private_key: "-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----\n"
-                .to_string(),
-        };
+        let issued = issued(
+            "-----BEGIN CERTIFICATE-----\nchain\n-----END CERTIFICATE-----\n",
+            "-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----\n",
+        );
         save(&paths.certificate(), &paths.private_key(), &issued).expect("saved");
 
         use std::os::unix::fs::PermissionsExt;
@@ -2404,10 +2677,7 @@ mod tests {
         // not start, reported as an error that says nothing happened.
         let dir = TempDir::new();
         let paths = crate::paths::ServerPaths::new(dir.path.clone());
-        let working = Issued {
-            certificate: "old chain".to_string(),
-            private_key: "old key".to_string(),
-        };
+        let working = issued("old chain", "old key");
         save(&paths.certificate(), &paths.private_key(), &working).expect("the first pair");
 
         // A directory where the certificate should go: the rename
@@ -2415,10 +2685,7 @@ mod tests {
         std::fs::remove_file(paths.certificate()).unwrap();
         std::fs::create_dir(paths.certificate()).unwrap();
 
-        let replacement = Issued {
-            certificate: "new chain".to_string(),
-            private_key: "new key".to_string(),
-        };
+        let replacement = issued("new chain", "new key");
         let error = save(&paths.certificate(), &paths.private_key(), &replacement)
             .expect_err("the certificate cannot be written");
         assert!(matches!(error, AcmeError::Write { .. }), "{error:?}");
@@ -2445,10 +2712,7 @@ mod tests {
         // cannot land, and it is the second of the two.
         std::fs::create_dir(paths.certificate()).unwrap();
 
-        let first = Issued {
-            certificate: "chain".to_string(),
-            private_key: "key".to_string(),
-        };
+        let first = issued("chain", "key");
         assert!(save(&paths.certificate(), &paths.private_key(), &first).is_err());
         assert!(
             !paths.private_key().exists(),
@@ -2466,10 +2730,7 @@ mod tests {
 
         let dir = TempDir::new();
         let paths = crate::paths::ServerPaths::new(dir.path.clone());
-        let working = Issued {
-            certificate: "old chain".to_string(),
-            private_key: "old key".to_string(),
-        };
+        let working = issued("old chain", "old key");
         save(&paths.certificate(), &paths.private_key(), &working).expect("the first pair");
 
         // Unreadable — as a file whose mode says so. Root ignores that,
@@ -2481,10 +2742,7 @@ mod tests {
             return;
         }
 
-        let replacement = Issued {
-            certificate: "new chain".to_string(),
-            private_key: "new key".to_string(),
-        };
+        let replacement = issued("new chain", "new key");
         assert!(save(&paths.certificate(), &paths.private_key(), &replacement).is_err());
         assert_eq!(
             std::fs::read_to_string(paths.certificate()).unwrap(),
@@ -2505,17 +2763,11 @@ mod tests {
         // anything is published.
         let dir = TempDir::new();
         let paths = crate::paths::ServerPaths::new(dir.path.clone());
-        let working = Issued {
-            certificate: "old chain".to_string(),
-            private_key: "old key".to_string(),
-        };
+        let working = issued("old chain", "old key");
         save(&paths.certificate(), &paths.private_key(), &working).expect("the first pair");
 
         let nowhere = dir.path.join("gone").join("fullchain.pem");
-        let replacement = Issued {
-            certificate: "new chain".to_string(),
-            private_key: "new key".to_string(),
-        };
+        let replacement = issued("new chain", "new key");
         assert!(save(&nowhere, &paths.private_key(), &replacement).is_err());
         assert_eq!(
             std::fs::read_to_string(paths.private_key()).unwrap(),
@@ -2529,13 +2781,80 @@ mod tests {
 
     #[test]
     fn an_issued_certificate_never_prints_its_key() {
-        let issued = Issued {
-            certificate: "chain".to_string(),
-            private_key: "-----BEGIN PRIVATE KEY-----secret-----".to_string(),
-        };
+        let issued = issued("chain", "-----BEGIN PRIVATE KEY-----secret-----");
         let shown = format!("{issued:?}");
         assert!(!shown.contains("secret"), "{shown}");
         assert!(shown.contains("redacted"), "{shown}");
+    }
+
+    // ------------------------------------------------------ DNS-01
+
+    #[test]
+    fn a_dns_01_failure_does_not_quietly_open_port_80() {
+        // The two challenges have different blast radii (§13), and
+        // somebody who chose DNS-01 may have chosen it precisely so
+        // that port 80 stays shut — on a host where opening it means
+        // touching a firewall, a security group, or somebody else's web
+        // server. Switching for them would undo that silently and then
+        // report success.
+        let refused = AcmeError::Dns01 {
+            domain: "net.example.com".to_string(),
+            detail: "the token is not allowed to edit this zone".to_string(),
+        };
+        let message = refused.to_string();
+        assert!(message.contains("did not switch"), "{message}");
+        assert!(message.contains("--acme-challenge http-01"), "{message}");
+        // Named as a choice for a person, with what it costs attached.
+        assert!(message.contains("port 80 open"), "{message}");
+        // And the reason it failed travels with it.
+        assert!(message.contains("not allowed to edit"), "{message}");
+
+        let never_served = AcmeError::Propagation {
+            detail: "the nameservers were still not serving it".to_string(),
+        };
+        assert!(never_served.to_string().contains("did not switch"));
+    }
+
+    #[test]
+    fn the_a_record_falls_back_where_the_challenge_does_not() {
+        // Not a contradiction, a difference in what the token is doing:
+        // for the A record it does a job a person can do in a browser
+        // in ten seconds, and M0's instructions are printed underneath
+        // (§6.1). For the challenge it is the whole mechanism.
+        let same_failure = CfError::Forbidden("no".to_string());
+        assert!(cfapi::fallback_notice(&same_failure).contains("Nothing else is affected"));
+        assert!(!no_automatic_switch().contains("Nothing else is affected"));
+    }
+
+    #[test]
+    fn a_dns_01_wait_that_saw_nothing_is_reported_beside_the_success() {
+        // Blind is not failure — the certificate is real — but it is
+        // the difference between "verified it was served" and "hoped",
+        // and only the person can judge that.
+        let blind = dnsprobe::Outcome::Blind {
+            waited: Duration::from_secs(10),
+        };
+        let mut certificate = issued("chain", "key");
+        certificate.warnings.extend(blind.warning());
+        assert_eq!(certificate.warnings.len(), 1);
+        assert!(certificate.warnings[0].contains("could not check DNS"));
+
+        // A wait that saw the record says nothing extra.
+        let mut quiet = issued("chain", "key");
+        quiet.warnings.extend(
+            dnsprobe::Outcome::Served {
+                waited: Duration::from_secs(4),
+            }
+            .warning(),
+        );
+        assert!(quiet.warnings.is_empty());
+    }
+
+    #[test]
+    fn a_certificate_says_nothing_extra_by_default() {
+        // HTTP-01 has nothing to warn about: the listener either
+        // answered or the order failed.
+        assert!(issued("chain", "key").warnings.is_empty());
     }
 
     #[test]
