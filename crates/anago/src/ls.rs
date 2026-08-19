@@ -217,10 +217,11 @@ pub fn explain(status: u16, body: &str, device_file: &Path, wg_config: &Path) ->
     let advice = match failure.code {
         Some(ErrorCode::Unauthorized) => format!(
             " — this device's token is no longer accepted, which is what `anago rm` on the \
-             hub does. To join again: `sudo wg-quick down {wg}`, delete {wg} and {device}, \
-             then `anago join <domain> <code>` with a fresh code from `anago code`",
-            wg = wg_config.display(),
-            device = device_file.display()
+             hub does. To use it again: {}",
+            render::rejoin_steps(
+                &wg_config.display().to_string(),
+                &device_file.display().to_string()
+            )
         ),
         _ => String::new(),
     };

@@ -100,11 +100,37 @@ pub fn ending_of(outcome: &Sync) -> Ending {
 /// Quiet keeps only what a person has to act on. That is what makes the
 /// timer's unit file readable: it is silent for the ordinary case by
 /// construction rather than by sniffing for a tty (§8).
-pub fn report(outcome: &Sync, domain: &str, quiet: bool) -> String {
+///
+/// A detachment carries the way back with it, **on the same line**.
+/// "This device was removed" on its own is a dead end read every five
+/// minutes, and a remedy on a second line is one a journal shows
+/// somewhere else entirely (§6.3).
+pub fn report(outcome: &Sync, hub: &Hub, quiet: bool) -> String {
     if quiet && ending_of(outcome) != Ending::Stop {
         return String::new();
     }
-    render::sync_summary(outcome, domain)
+    let out = render::sync_summary(outcome, &hub.domain);
+    let Sync::Detached(_) = outcome else {
+        return out;
+    };
+    // **One line, reason and remedy together.** A journal entry is a
+    // line; splitting this in two means `journalctl` shows the half
+    // that says something is wrong beside a hundred other entries, and
+    // the half that says what to do about it somewhere else (§6.3).
+    format!(
+        "{}. To use this device again: {}\n",
+        out.trim_end(),
+        render::rejoin_steps(&hub.wg_config, &hub.device_file)
+    )
+}
+
+/// The three strings every report needs: which hub, and the two files
+/// on this machine a person may have to clear away.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hub {
+    pub domain: String,
+    pub wg_config: String,
+    pub device_file: String,
 }
 
 /// Runs the command.
@@ -159,7 +185,29 @@ fn attempt(config_path: Option<&Path>, wg_config: &Path, quiet: bool) -> Result<
     // already happening is doing this run's work (§6.3).
     let _syncing = home.lock()?;
 
-    let response = ask_hub(&config)?;
+    let hub = Hub {
+        domain: config.domain.clone(),
+        wg_config: wg_config.display().to_string(),
+        device_file: home.path().display().to_string(),
+    };
+
+    // A 401 is an ending, not a transport failure: the token died the
+    // moment the hub removed this device (§7.1). Turning it into an
+    // outcome here rather than an error is what puts it through the
+    // same report — so "you were removed" arrives with the cleanup
+    // beside it, exactly like the roster saying the same thing.
+    let response = match ask_hub(&config) {
+        Ok(response) => response,
+        Err(SyncError::Detached(detachment)) => {
+            let outcome = Sync::Detached(detachment);
+            return Ok(Synced {
+                ending: ending_of(&outcome),
+                report: report(&outcome, &hub, quiet),
+            });
+        }
+        Err(e) => return Err(e),
+    };
+
     let reported = reported_of(&response)?;
     let outcome = anago_core::sync::decide(&local, reported.as_ref(), &roster_of(&response)?);
 
@@ -171,7 +219,7 @@ fn attempt(config_path: Option<&Path>, wg_config: &Path, quiet: bool) -> Result<
 
     Ok(Synced {
         ending: ending_of(&outcome),
-        report: report(&outcome, &config.domain, quiet),
+        report: report(&outcome, &hub, quiet),
     })
 }
 
@@ -730,6 +778,16 @@ mod tests {
         }
     }
 
+    /// The three strings a report needs, as a run on this machine
+    /// would have them.
+    fn hub_paths() -> Hub {
+        Hub {
+            domain: "net.example.com".to_string(),
+            wg_config: "/etc/wireguard/anago.conf".to_string(),
+            device_file: "/home/jo/.config/anago/device.json".to_string(),
+        }
+    }
+
     fn decide(config: &DeviceConfig, response: &PeersResponse) -> Sync {
         anago_core::sync::decide(
             &local_of(config).unwrap(),
@@ -750,10 +808,10 @@ mod tests {
 
         // A person who typed it gets a line; a timer gets silence.
         assert_eq!(
-            report(&outcome, "net.example.com", false),
+            report(&outcome, &hub_paths(), false),
             "net.example.com: in sync\n"
         );
-        assert_eq!(report(&outcome, "net.example.com", true), "");
+        assert_eq!(report(&outcome, &hub_paths(), true), "");
     }
 
     #[test]
@@ -782,10 +840,10 @@ mod tests {
 
         // And it does not claim to be in sync, because nothing was
         // checked.
-        let line = report(&outcome, "net.example.com", false);
+        let line = report(&outcome, &hub_paths(), false);
         assert!(line.contains("still registered"), "{line}");
         assert!(!line.contains("in sync"), "{line}");
-        assert_eq!(report(&outcome, "net.example.com", true), "");
+        assert_eq!(report(&outcome, &hub_paths(), true), "");
     }
 
     #[test]
@@ -868,9 +926,142 @@ mod tests {
             assert_eq!(ending_of(&outcome), Ending::Stop);
             // Said even under --quiet: this is the line the timer
             // exists to surface.
-            assert!(!report(&outcome, "net.example.com", true).is_empty());
+            assert!(!report(&outcome, &hub_paths(), true).is_empty());
         }
         assert_eq!(Ending::Stop.exit_code(), 1);
+    }
+
+    #[test]
+    fn a_removed_device_is_told_where_the_two_files_are() {
+        // §6.3: sync does not repair a 401 and does not take the
+        // tunnel down for one. What it owes the person is the way back
+        // — and "delete the device file" is a noun, not something
+        // anybody can act on. The paths are this machine's.
+        for detachment in [
+            Detachment::Unauthorized,
+            Detachment::Removed,
+            Detachment::Reassigned {
+                theirs: "10.100.0.7".parse().unwrap(),
+            },
+            Detachment::SubnetChanged {
+                theirs: anago_core::subnet::Subnet::parse("10.200.0.0/24").unwrap(),
+            },
+        ] {
+            let outcome = Sync::Detached(detachment.clone());
+            let line = report(&outcome, &hub_paths(), false);
+            assert!(line.contains("net.example.com:"), "{line}");
+            assert!(
+                line.contains("sudo wg-quick down /etc/wireguard/anago.conf"),
+                "{detachment:?}: {line}"
+            );
+            assert!(
+                line.contains("/home/jo/.config/anago/device.json"),
+                "{detachment:?}: {line}"
+            );
+            assert!(line.contains("anago join"), "{detachment:?}: {line}");
+            assert!(line.contains("`anago code`"), "{detachment:?}: {line}");
+
+            // Said under `--quiet` too: this is the one line the timer
+            // exists to surface, and swallowing it is how a device
+            // sits dead for a week.
+            assert_eq!(report(&outcome, &hub_paths(), true), line);
+        }
+    }
+
+    #[test]
+    fn every_report_and_every_complaint_is_one_line() {
+        // The whole convention rests on this: a timer's journal shows
+        // entries, and an ending that spans two of them is one a
+        // person reads half of (§6.3).
+        for outcome in [
+            Sync::Unchanged,
+            Sync::Unverifiable,
+            Sync::Rewrite(Changes {
+                server_public_key: true,
+                server_endpoint: true,
+                server_address: true,
+            }),
+            Sync::Detached(Detachment::Unauthorized),
+            Sync::Detached(Detachment::Reassigned {
+                theirs: "10.100.0.7".parse().unwrap(),
+            }),
+        ] {
+            let line = report(&outcome, &hub_paths(), false);
+            assert_eq!(line.lines().count(), 1, "{outcome:?}: {line}");
+        }
+
+        for e in [
+            SyncError::Unreachable("connection refused".to_string()),
+            SyncError::Busy,
+            SyncError::Untrusted("UnknownIssuer".to_string()),
+            SyncError::Detached(Detachment::Removed),
+            SyncError::NoDeviceFile {
+                path: "/home/jo/.config/anago/device.json".to_string(),
+                detail: "No such file or directory".to_string(),
+            },
+            SyncError::DeviceFile("no version".to_string()),
+            SyncError::BadResponse("subnet: bad".to_string()),
+            SyncError::Refused("the hub is starting up".to_string()),
+            SyncError::NoPrivateKey {
+                path: "/etc/wireguard/anago.conf".to_string(),
+                detail: "no usable PrivateKey line".to_string(),
+            },
+            SyncError::Write {
+                path: "/etc/wireguard/anago.conf".to_string(),
+                detail: "No space left on device".to_string(),
+            },
+            SyncError::Apply {
+                detail: "wg: Unable to modify interface".to_string(),
+            },
+        ] {
+            let line = complaint(&e, false);
+            assert_eq!(line.lines().count(), 1, "{e:?}: {line}");
+        }
+    }
+
+    #[test]
+    fn nothing_that_is_fine_carries_a_cleanup() {
+        // The cleanup is for the endings that need one. Printing it
+        // beside "in sync" would teach a person to skip the whole
+        // line.
+        for outcome in [
+            Sync::Unchanged,
+            Sync::Unverifiable,
+            Sync::Rewrite(Changes {
+                server_endpoint: true,
+                ..Changes::default()
+            }),
+        ] {
+            let line = report(&outcome, &hub_paths(), false);
+            assert!(!line.contains("wg-quick down"), "{line}");
+            assert!(!line.contains("device.json"), "{line}");
+        }
+    }
+
+    #[test]
+    fn a_401_is_an_ending_and_not_a_transport_failure() {
+        // The token died the moment the hub ran `anago rm` (§7.1), so
+        // this is the roster saying the same thing by another route —
+        // and it has to arrive with the same cleanup, not as a bare
+        // "the hub refused".
+        let removed = SyncError::Detached(Detachment::Unauthorized);
+        assert_eq!(removed.ending(), Ending::Stop);
+        // Carried as an error only between the call and the decision;
+        // what a person sees is the outcome, with the paths.
+        let line = report(
+            &Sync::Detached(Detachment::Unauthorized),
+            &hub_paths(),
+            true,
+        );
+        assert_eq!(line.lines().count(), 1, "{line}");
+        assert!(line.contains("removed with `anago rm`"), "{line}");
+        assert!(line.contains("To use this device again"), "{line}");
+
+        // And it is not confused with the hub refusing for some other
+        // reason, which says so and carries no cleanup.
+        let other = SyncError::Refused("the hub is starting up".to_string());
+        assert_eq!(other.ending(), Ending::Stop);
+        assert!(!complaint(&other, false).contains("wg-quick down"));
     }
 
     #[test]

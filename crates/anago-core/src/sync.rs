@@ -189,25 +189,19 @@ impl fmt::Display for Changes {
 impl fmt::Display for Detachment {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Detachment::Unauthorized => f.write_str(
-                "the hub rejected this device's token: it was removed with `anago rm`. \
-                 Bring the tunnel down, delete the device file and the wg config, then \
-                 join again with a fresh code",
-            ),
-            Detachment::Removed => f.write_str(
-                "the hub no longer lists this device. Bring the tunnel down, delete the \
-                 device file and the wg config, then join again with a fresh code",
-            ),
+            Detachment::Unauthorized => {
+                f.write_str("the hub rejected this device's token: it was removed with `anago rm`")
+            }
+            Detachment::Removed => f.write_str("the hub no longer lists this device"),
             Detachment::Reassigned { theirs } => write!(
                 f,
                 "the hub lists this device at {theirs}, which is not the address it was \
-                 given. anago will not move it on its own — join again to get an address \
-                 the hub agrees with"
+                 given, and anago will not move it on its own"
             ),
             Detachment::SubnetChanged { theirs } => write!(
                 f,
-                "the hub is serving {theirs}, a different network than this device joined. \
-                 The hub was rebuilt; join it again"
+                "the hub is serving {theirs}, a different network than this device \
+                 joined — the hub was rebuilt"
             ),
         }
     }
@@ -459,17 +453,27 @@ mod tests {
     }
 
     #[test]
-    fn every_detachment_tells_the_person_what_to_do() {
-        for detachment in [
-            Detachment::Unauthorized,
-            Detachment::Removed,
-            Detachment::Reassigned {
-                theirs: ip("10.100.0.7"),
-            },
-            Detachment::SubnetChanged { theirs: subnet() },
+    fn every_detachment_says_what_the_hub_did() {
+        // The *reason*, in this device's terms — the cleanup that
+        // follows names two files this module does not know, and is
+        // `render::rejoin_steps`' job.
+        for (detachment, expected) in [
+            (Detachment::Unauthorized, "rejected this device's token"),
+            (Detachment::Removed, "no longer lists this device"),
+            (
+                Detachment::Reassigned {
+                    theirs: ip("10.100.0.7"),
+                },
+                "10.100.0.7",
+            ),
+            (Detachment::SubnetChanged { theirs: subnet() }, "rebuilt"),
         ] {
             let message = detachment.to_string();
-            assert!(message.contains("join"), "{message}");
+            assert!(message.contains(expected), "{message}");
+            // No half-instruction: the concrete steps live in one
+            // place, and a vague "delete the device file" beside them
+            // is a second, worse copy.
+            assert!(!message.contains("delete"), "{message}");
         }
     }
 }

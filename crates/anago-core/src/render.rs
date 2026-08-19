@@ -156,9 +156,10 @@ fn format_ago(seconds: i64) -> String {
 /// outcomes that need no attention; the wording here is for a person
 /// who typed the command.
 ///
-/// A detachment defers to [`crate::sync::Detachment`]'s own words: the
-/// cleanup a person has to perform belongs beside the reason for it,
-/// not in a formatting module.
+/// A detachment defers to [`crate::sync::Detachment`]'s own words for
+/// *why*. The cleanup that follows is [`rejoin_steps`], added by the
+/// caller — it names the two files on this machine, and this module
+/// does not know them.
 pub fn sync_summary(outcome: &Sync, domain: &str) -> String {
     match outcome {
         Sync::Unchanged => format!("{domain}: in sync\n"),
@@ -312,6 +313,28 @@ pub fn staging_warning() -> String {
       anago server renew --acme-production
 "
     .to_string()
+}
+
+/// The way back when the hub no longer knows this device (§6.3).
+///
+/// **Named paths, not "the device file".** A person cannot act on a
+/// noun; they can paste a path. And the whole procedure, not just the
+/// deletion: a join with the wg config still in place is refused before
+/// it reaches the network, and the tunnel is probably still up.
+///
+/// One function because three commands say this — `sync` when the hub
+/// rejects the token or drops the name, and `ls` and `rm` when a call
+/// comes back 401. Three spellings of one procedure is how one of them
+/// ends up missing a step.
+///
+/// `join`'s "this device has already joined" is deliberately **not**
+/// this. Nothing was removed there, so the way out ends in `anago rm`
+/// on the hub rather than in a fresh code.
+pub fn rejoin_steps(wg_config: &str, device_file: &str) -> String {
+    format!(
+        "`sudo wg-quick down {wg_config}`, delete {wg_config} and {device_file}, \
+         then `anago join <domain> <code>` with a fresh code from `anago code`"
+    )
 }
 
 /// `server renew` when nothing needed doing (§8): the command is
@@ -578,11 +601,34 @@ mod tests {
     }
 
     #[test]
-    fn a_detached_sync_carries_the_cleanup_it_was_given() {
+    fn a_detached_sync_says_why_and_the_caller_says_how() {
         use crate::sync::Detachment;
         let line = sync_summary(&Sync::Detached(Detachment::Removed), "net.example.com");
         assert!(line.starts_with("net.example.com: "), "{line}");
-        assert!(line.contains("join again"), "{line}");
+        assert!(line.contains("no longer lists this device"), "{line}");
+
+        // The how names two files on the machine, which this module
+        // does not know — so it comes from one function the four
+        // commands that need it all call.
+        let steps = rejoin_steps(
+            "/etc/wireguard/anago.conf",
+            "/home/jo/.config/anago/device.json",
+        );
+        assert!(
+            steps.contains("sudo wg-quick down /etc/wireguard/anago.conf"),
+            "{steps}"
+        );
+        assert!(
+            steps.contains("/home/jo/.config/anago/device.json"),
+            "{steps}"
+        );
+        assert!(steps.contains("anago join"), "{steps}");
+        // A fresh code, because the old one was single-use and this
+        // device's token is dead either way (§7).
+        assert!(steps.contains("`anago code`"), "{steps}");
+        // The whole procedure: a join with the wg config still there
+        // is refused before it reaches the network.
+        assert!(steps.contains("delete"), "{steps}");
     }
 
     // -------------------------------------------------------- M1 ACME
