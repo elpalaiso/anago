@@ -235,15 +235,11 @@ fn manage_timer(
 
 /// `anago join <domain> <code>`.
 fn join_device(args: &cli::Join) -> ! {
-    // Stop before anything local happens. `--export` registers a
-    // *phone* and writes nothing here (§8), so falling through would
-    // put that phone's key in /etc/wireguard and its `device.json` in
-    // this user's config directory — the opposite of what was asked.
-    if args.export.is_some() {
-        eprintln!("anago: exporting a phone's config is not wired up yet — the flags are");
-        eprintln!("       understood, but rendering the config and drawing the QR land");
-        eprintln!("       next. Nothing was registered, so the join code is still good.");
-        std::process::exit(EXIT_FAILED);
+    // Before anything local. `--export` registers a *phone* and writes
+    // nothing here (§8), so it must not go past this point — not even
+    // to resolve a config directory it will never use.
+    if let Some(export) = args.export.clone() {
+        export_phone(args, export);
     }
 
     let client_paths = match paths::client_config_dir_from_env() {
@@ -314,6 +310,56 @@ fn join_device(args: &cli::Join) -> ! {
             }
             eprint!("{report}");
             std::process::exit(EXIT_FAILED);
+        }
+        Err(e) => {
+            eprintln!("anago: {e}");
+            std::process::exit(EXIT_FAILED);
+        }
+    }
+}
+
+/// `anago join --export` — registers a phone and hands over its config
+/// (§8, §7.3).
+///
+/// Nothing on this machine changes, so nothing here resolves a path
+/// under §9 or asks for root.
+fn export_phone(args: &cli::Join, export: cli::Export) -> ! {
+    let Some(name) = args.name.clone() else {
+        // The parser refuses `--export` without `--name`, because the
+        // hostname default names this machine (§8). Only reachable if
+        // that rule is ever taken out.
+        eprintln!("anago: --export needs --name");
+        std::process::exit(EXIT_USAGE);
+    };
+    let out = match export {
+        cli::Export::Conf { out } => out,
+        cli::Export::Qr => {
+            eprintln!("anago: drawing the config as a QR code is not wired up yet — the");
+            eprintln!("       flags are understood, but the encoder lands next. Nothing was");
+            eprintln!("       registered, so the join code is still good. `--export conf`");
+            eprintln!("       hands over the same config as text.");
+            std::process::exit(EXIT_FAILED);
+        }
+    };
+
+    match join::export_conf(
+        &args.domain,
+        &args.code,
+        &name,
+        args.api_port,
+        out.as_deref(),
+    ) {
+        Ok(exported) => {
+            // The config itself has already gone to stdout or to the
+            // file; everything else goes to stderr, so a pipe carries
+            // the config alone (§7.3).
+            eprintln!(
+                "Registered {name} — the phone is {address} on {subnet}.",
+                address = exported.config.address,
+                subnet = exported.config.subnet
+            );
+            eprint!("{}", join::export_note(&name, exported.out.as_deref()));
+            std::process::exit(0);
         }
         Err(e) => {
             eprintln!("anago: {e}");

@@ -64,7 +64,7 @@ pub fn write_private_bytes(path: &Path, contents: &[u8]) -> io::Result<()> {
 /// ones with nothing in between.
 pub fn write_system(path: &Path, contents: &str) -> io::Result<()> {
     let tmp = temp_sibling(path)?;
-    let mut file = create_new_with(&tmp, SYSTEM_FILE_MODE)?;
+    let mut file = replace_with(&tmp, SYSTEM_FILE_MODE)?;
     let wrote = file
         .write_all(contents.as_bytes())
         .and_then(|()| file.sync_all());
@@ -300,6 +300,23 @@ fn sibling(path: &Path, suffix: &str) -> io::Result<PathBuf> {
 /// exclusively means the content never exists under a looser mode, and
 /// `O_NOFOLLOW` means a symlink left in its place is not followed.
 fn create_private_new(path: &Path) -> io::Result<File> {
+    replace_with(path, PRIVATE_FILE_MODE)
+}
+
+/// Creates `path` at 0600, and **fails if anything is already there**.
+///
+/// The rule §7.3 puts on `join --export conf --out`: anago never writes
+/// over a file somebody already has. `O_EXCL` makes that a property of
+/// the create rather than a check followed by a write, which a person
+/// with write access to that directory could win. `O_NOFOLLOW` refuses
+/// a symlink at the name, so the mode below lands on the file that was
+/// named and not on whatever it pointed at.
+///
+/// The descriptor is returned rather than the path being reopened, so
+/// what gets written is the file this call made — and so the contents
+/// can arrive later than the claim, which is what lets a `--out` be
+/// taken before the join code is spent.
+pub fn open_new_private(path: &Path) -> io::Result<File> {
     create_new_with(path, PRIVATE_FILE_MODE)
 }
 
@@ -315,11 +332,6 @@ fn create_private_new(path: &Path) -> io::Result<File> {
 /// `fchmod` on the descriptor rather than `chmod` on the name, for the
 /// same reason [`give_fd_to`] uses `fchown`.
 fn create_new_with(path: &Path, mode: u32) -> io::Result<File> {
-    match fs::remove_file(path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
     let file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -328,6 +340,21 @@ fn create_new_with(path: &Path, mode: u32) -> io::Result<File> {
         .open(path)?;
     let permissions = file.set_permissions(fs::Permissions::from_mode(mode));
     or_remove(file, path, permissions)
+}
+
+/// [`create_new_with`], after clearing anything left at that name.
+///
+/// For the temp siblings the writers here rename into place: one left
+/// by a killed run must not block the next one, and nothing else ever
+/// uses those names. The exclusive create is still what makes the file,
+/// so two runs racing at the same sibling still cannot share it.
+fn replace_with(path: &Path, mode: u32) -> io::Result<File> {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    create_new_with(path, mode)
 }
 
 /// Keeps a just-created file, or takes it away again and reports why.

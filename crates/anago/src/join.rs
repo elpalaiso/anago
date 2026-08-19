@@ -10,7 +10,8 @@
 //! to say about each way the hub can refuse.
 
 use std::fmt;
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use anago_core::code::JoinCode;
 use anago_core::json::{self, Value};
@@ -374,6 +375,306 @@ pub fn run(
     }
 }
 
+/// What `--export conf` registered, and where its config went.
+///
+/// No token. §8 throws the one the hub sent away: the official
+/// WireGuard app never calls anago's control API, so a token that
+/// reached the phone would be a credential with nothing to use it on.
+/// The consequence is that the phone cannot `ls`, `rm` or `sync` itself
+/// — it is removed from the hub with `anago rm <name>` (§8).
+#[derive(Debug)]
+pub struct Exported {
+    pub config: DeviceConfig,
+    /// The file the config went into, or `None` when it went to
+    /// standard output.
+    pub out: Option<PathBuf>,
+}
+
+/// Registers a **phone** and hands over its config (§8, §7.3).
+///
+/// **Nothing local happens.** No wg config, no `device.json`, no join
+/// lock, and so none of §6.2's already-joined refusal either — this
+/// machine is not the one joining. That is a property of the signature
+/// rather than a rule to remember: there is no `ClientPaths` and no wg
+/// path here to write to. Duplicate names are still refused, by the
+/// hub (§8.1).
+///
+/// It needs no root for the same reason. The one thing it shares with a
+/// local join is `wg genkey`/`wg pubkey`.
+///
+/// **The order is the same as a local join's, for the same reason.**
+/// Everything that can refuse happens before the code is spent: the
+/// tools, and the `--out` file, which is created empty and exclusively
+/// (§7.3 — anago never writes over a file that is already there). A
+/// file already at that name is then an error somebody can fix without
+/// burning a single-use code.
+///
+/// And every failure *after* the hub answers goes out through the same
+/// door a local join uses: [`post_registration`] undoes the
+/// registration, so a phone that never received its config is not left
+/// occupying a name and an address on the hub.
+///
+/// **Human verification needed**: runs `wg genkey` and talks to a real
+/// hub.
+pub fn export_conf(
+    domain: &str,
+    code: &JoinCode,
+    name: &DeviceName,
+    api_port: u16,
+    out: Option<&Path>,
+) -> Result<Exported, JoinError> {
+    // `wg` alone: this makes a keypair and brings no interface up, so
+    // asking for `wg-quick` would refuse a machine that can do all of
+    // it, in a sentence about a program it never runs.
+    wg::check_keygen_from_env().map_err(JoinError::Wg)?;
+    let mut claimed = match out {
+        Some(path) => Some(Claimed::take(path)?),
+        None => None,
+    };
+
+    let (private_key, public_key) = wg::generate_keypair().map_err(JoinError::Wg)?;
+    let body = request_body(code, name, &public_key);
+    let response = client::send(&Request {
+        method: Method::Post,
+        host: domain,
+        port: api_port,
+        path: PATH_JOIN,
+        body: Some(client::Body::json(&body)),
+        authorization: None,
+    })
+    .map_err(JoinError::Client)?;
+
+    if !response.is_success() {
+        // Nothing was registered, so nothing needs undoing — and the
+        // claimed file goes away with the guard.
+        return Err(JoinError::Refused(explain(response.status, &response.body)));
+    }
+
+    match hand_over(
+        &response.body,
+        domain,
+        api_port,
+        private_key,
+        claimed.as_mut(),
+    ) {
+        Ok(config) => {
+            if let Some(claimed) = claimed.as_mut() {
+                claimed.keep();
+            }
+            Ok(Exported {
+                config,
+                out: out.map(Path::to_path_buf),
+            })
+        }
+        Err(e) => Err(post_registration(&response.body, domain, api_port, &e)),
+    }
+}
+
+/// Renders the phone's config and hands it over — the export's half of
+/// [`finish`].
+///
+/// The rendered text goes straight from here to its destination and is
+/// never returned. A [`SecretText`] that travelled back up the call
+/// stack would only widen the set of places a private key can be
+/// printed from by accident (§7.3).
+fn hand_over(
+    body: &str,
+    domain: &str,
+    api_port: u16,
+    private_key: PrivateKey,
+    claimed: Option<&mut Claimed>,
+) -> Result<DeviceConfig, JoinError> {
+    let (config, profile) = accepted(body, domain, api_port, private_key)?;
+    let text = wgconf::export_profile(&profile);
+    match claimed {
+        Some(claimed) => claimed.fill(&text)?,
+        None => {
+            let mut stdout = std::io::stdout().lock();
+            stdout
+                .write_all(text.expose().as_bytes())
+                .and_then(|()| stdout.flush())
+                .map_err(|e| JoinError::Unsent(e.to_string()))?;
+        }
+    }
+    Ok(config)
+}
+
+/// A `--out` file, created before the join and deleted unless it is
+/// filled.
+///
+/// The descriptor is held from the create to the write, so what gets
+/// written is the file this run made — not whatever has since arrived
+/// at that name. A `--out` is a path a person typed, in a directory
+/// anago knows nothing about and may not own (§13): `/tmp` is the
+/// ordinary case, and anybody can rename a file out of `/tmp` and put
+/// their own there.
+///
+/// **Holding the descriptor is not enough on its own.** It settles
+/// which file gets written; it says nothing about which file has that
+/// *name* by the time the hub has answered. Both endings need the
+/// answer, and they need it for opposite reasons:
+///
+/// - Success would otherwise report a path that no longer holds the
+///   config — "written to phone.conf" about somebody else's file.
+/// - Cleanup would otherwise `remove_file` whatever is at the name
+///   now, which is the one thing §7.3 promises never happens: anago
+///   does not delete a file it did not create.
+///
+/// So both ask [`Claimed::is_ours`] first, and neither touches the name
+/// when the answer is no.
+#[derive(Debug)]
+struct Claimed {
+    path: PathBuf,
+    file: std::fs::File,
+    kept: bool,
+}
+
+impl Claimed {
+    fn take(path: &Path) -> Result<Claimed, JoinError> {
+        let file = fsutil::open_new_private(path).map_err(|e| JoinError::Save {
+            what: "the config file",
+            target: Target::user_file(path),
+            kind: e.kind(),
+            source: e.to_string(),
+        })?;
+        Ok(Claimed {
+            path: path.to_path_buf(),
+            file,
+            kept: false,
+        })
+    }
+
+    fn fill(&mut self, text: &wgconf::SecretText) -> Result<(), JoinError> {
+        self.file
+            .write_all(text.expose().as_bytes())
+            .and_then(|()| self.file.sync_all())
+            .map_err(|e| JoinError::Save {
+                what: "the config file",
+                target: Target::user_file(&self.path),
+                kind: e.kind(),
+                source: e.to_string(),
+            })?;
+        // Asked after the write, because it is the write that has to
+        // have landed somewhere reachable. The config is in the file
+        // this run created either way; the question is whether anyone
+        // can still find it by the name they gave.
+        if !self.is_ours() {
+            return Err(JoinError::Taken(self.path.clone()));
+        }
+        Ok(())
+    }
+
+    /// Whether `path` still names the file this run created.
+    ///
+    /// `fstat` on the held descriptor against `lstat` on the name:
+    /// same device, same inode. `lstat` rather than `stat`, so a
+    /// symlink dropped at the name is a mismatch rather than a
+    /// follow-through to whatever it points at.
+    ///
+    /// Anything unreadable is a "no". The two callers both want the
+    /// careful answer — one would report a path it cannot vouch for,
+    /// the other would delete something.
+    ///
+    /// It cannot make the check atomic with what follows it: POSIX has
+    /// no unlink-this-descriptor. What it does is shrink the window
+    /// from the whole network call, which is seconds long and easy to
+    /// win, to the gap between two syscalls.
+    fn is_ours(&self) -> bool {
+        use std::os::unix::fs::MetadataExt;
+
+        let (Ok(held), Ok(named)) = (self.file.metadata(), std::fs::symlink_metadata(&self.path))
+        else {
+            return false;
+        };
+        held.dev() == named.dev() && held.ino() == named.ino()
+    }
+
+    fn keep(&mut self) {
+        self.kept = true;
+    }
+}
+
+impl Drop for Claimed {
+    fn drop(&mut self) {
+        if self.kept {
+            return;
+        }
+        // Only ever the file this run created: `open_new_private`
+        // refused to open an existing one, and this refuses to delete
+        // a name that has stopped meaning it. What was written into
+        // the orphaned inode goes away when the descriptor closes —
+        // unless somebody renamed it somewhere, and a name nobody here
+        // knows is not one to go deleting.
+        if self.is_ours() {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// What to say once a phone's config has left this machine (§7.3).
+///
+/// Always, and without looking at where standard output goes. Whether
+/// it is a terminal or a pipe changes what a person should do about it,
+/// but detecting that would mean two behaviours to reason about and one
+/// of them wrong whenever the guess missed. The same sentence every
+/// time is the one that can be relied on.
+pub fn export_note(name: &DeviceName, out: Option<&Path>) -> String {
+    let mut note = String::from("This is the phone's private key, in plain text.\n\n");
+    match out {
+        Some(path) => note.push_str(&indented(&[
+            &format!(
+                "It is in {} (0600). Move it to the phone, then",
+                path.display()
+            ),
+            &format!(
+                "delete it: `rm {}`. Backups and cloud-synced",
+                path.display()
+            ),
+            "folders are the real risk — a .conf left in",
+            "~/Documents copies itself somewhere quietly.",
+        ])),
+        None => note.push_str(&indented(&[
+            "Move it to the phone, then clear this terminal's",
+            "scrollback — `clear` does not do that, and some",
+            "terminals keep scrollback on disk. Over SSH it is in",
+            "the scrollback at both ends.",
+            "",
+            "For a file, use --out rather than `>`: a shell redirect",
+            "takes its mode from your umask, which is usually 0644.",
+            "anago's own file is 0600, and never replaces one that",
+            "is already there.",
+        ])),
+    }
+    note.push('\n');
+    note.push_str(&indented(&[
+        &format!("The hub knows this phone as {name}. It cannot remove"),
+        "itself — it has no anago and no token — so",
+        &format!("`anago rm {name}` on the hub is how it goes away."),
+    ]));
+    note
+}
+
+/// Lays a block of detail out under a heading, the way every other note
+/// here does.
+///
+/// Built line by line rather than as one literal with continuations:
+/// the indentation is part of what this prints, and a literal that
+/// carries it in backslash-continued source is one a reformat can
+/// quietly rewrite.
+fn indented(lines: &[&str]) -> String {
+    lines
+        .iter()
+        .map(|line| {
+            if line.is_empty() {
+                // No trailing spaces on a blank line.
+                "\n".to_string()
+            } else {
+                format!("     {line}\n")
+            }
+        })
+        .collect()
+}
+
 /// Where a finished join writes, and on whose behalf.
 struct Destination<'a> {
     client_dir: &'a fsutil::DirHandle,
@@ -391,18 +692,30 @@ fn finish(
     private_key: PrivateKey,
     to: &Destination,
 ) -> Result<DeviceConfig, JoinError> {
+    let (config, profile) = accepted(body, domain, api_port, private_key)?;
+    publish(&config, &profile, to)?;
+    Ok(config)
+}
+
+/// The hub's answer, decoded and checked, with this device's key in it.
+///
+/// One place for it, because both endings need exactly the same thing
+/// first: nothing from the hub reaches a config file — root-owned here,
+/// a phone's there — unparsed.
+fn accepted(
+    body: &str,
+    domain: &str,
+    api_port: u16,
+    private_key: PrivateKey,
+) -> Result<(DeviceConfig, ClientProfile), JoinError> {
     let value = json::parse(body).map_err(|e| JoinError::BadResponse(e.to_string()))?;
     let answer =
         JoinResponse::from_json(&value).map_err(|e| JoinError::BadResponse(e.to_string()))?;
 
     let config = DeviceConfig::from_response(domain, api_port, answer);
-    // Validated before a byte is written: nothing from the hub reaches
-    // a root-owned file unparsed.
     config.validate()?;
     let profile = config.profile(private_key)?;
-
-    publish(&config, &profile, to)?;
-    Ok(config)
+    Ok((config, profile))
 }
 
 /// Turns a failure that happened after registration into an error that
@@ -878,6 +1191,13 @@ pub enum JoinError {
     /// The hub registered this device and the local files could not be
     /// saved — the one failure that leaves the two sides disagreeing.
     SavedNothing { source: String, recovery: String },
+    /// A rendered config could not be written to standard output — a
+    /// closed pipe, most often. Its own variant because there is no
+    /// file and no owner to blame, only a destination that went away.
+    Unsent(String),
+    /// The `--out` name stopped meaning the file anago created, while
+    /// the hub was being asked.
+    Taken(PathBuf),
     /// An existing `device.json` could not be read — raised by
     /// [`DeviceConfig::parse`], and so reached through `ls`/`rm` as
     /// well as through a re-`join`.
@@ -946,6 +1266,18 @@ impl fmt::Display for JoinError {
                 "the hub registered this device but nothing could be saved locally \
                  ({source}) — {recovery}"
             ),
+            JoinError::Unsent(detail) => write!(
+                f,
+                "the config could not be written to standard output: {detail} — so \
+                 nothing reached the phone"
+            ),
+            JoinError::Taken(path) => write!(
+                f,
+                "{} was renamed, removed or replaced while the hub was being asked, so \
+                 the config went into a file that no longer has that name — whatever \
+                 is there now was left alone, and is not it",
+                path.display()
+            ),
             JoinError::DeviceFile(detail) => write!(f, "device file: {detail}"),
         }
     }
@@ -999,6 +1331,231 @@ mod tests {
         let mut broken = config();
         broken.server_address = "10.100.0.999".to_string();
         assert_eq!(broken.server_ip(), None);
+    }
+
+    #[test]
+    fn an_exported_config_is_the_same_profile_without_the_comments() {
+        // §8: identical fields in identical order, because a phone
+        // needs exactly what a laptop needs. What it drops is the
+        // "generated file" comment, which would be a lie — anago never
+        // sees this file again.
+        let profile = profile_of(&config());
+        let phone = wgconf::export_profile(&profile);
+        let laptop = wgconf::client_config(&profile);
+        assert!(phone.expose().contains("[Interface]"), "{}", phone.expose());
+        assert!(phone.expose().contains("[Peer]"), "{}", phone.expose());
+        for line in phone.expose().lines() {
+            assert!(!line.starts_with('#'), "{line}");
+            assert!(
+                laptop.expose().contains(line),
+                "{line} is not in the laptop's config"
+            );
+        }
+        // The rendered text is the one thing that carries the key out.
+        assert!(phone.expose().contains("PrivateKey"), "{}", phone.expose());
+        // And it says so nowhere else: both wrappers redact.
+        assert_eq!(format!("{phone:?}"), "SecretText(redacted)");
+        assert_eq!(format!("{phone}"), "SecretText(redacted)");
+    }
+
+    #[test]
+    fn an_out_file_is_taken_before_the_code_is_spent() {
+        // A local join claims its two files before asking the hub for
+        // anything, so a permission problem is a retry rather than a
+        // dead end. An export has one file and the same rule.
+        let dir = TempDirs::new();
+        let path = dir.root.join("phone.conf");
+
+        let mut claimed = Claimed::take(&path).unwrap();
+        assert!(path.exists(), "claimed up front");
+        assert_eq!(mode_of(&path), 0o600, "§7.3: anago's own file is 0600");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+
+        claimed
+            .fill(&wgconf::export_profile(&profile_of(&config())))
+            .unwrap();
+        claimed.keep();
+        drop(claimed);
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("PrivateKey"), "{written}");
+        assert_eq!(mode_of(&path), 0o600, "and still is after the write");
+    }
+
+    #[test]
+    fn an_export_that_does_not_finish_leaves_no_file() {
+        // The same shape as the local join's reservation: the claim
+        // deletes itself unless the export gets all the way through, so
+        // a hub call that fails does not leave an empty `phone.conf`
+        // for somebody to send to a phone.
+        let dir = TempDirs::new();
+        let path = dir.root.join("phone.conf");
+        drop(Claimed::take(&path).unwrap());
+        assert!(!path.exists(), "{}", path.display());
+    }
+
+    #[test]
+    fn an_export_never_writes_over_a_file_that_is_already_there() {
+        // §7.3, and the reason it is `O_EXCL` rather than a check: a
+        // person's existing profile is not something to overwrite by
+        // accident, and between looking and writing somebody could put
+        // one there.
+        let dir = TempDirs::new();
+        let path = dir.root.join("phone.conf");
+        std::fs::write(&path, "somebody else's config\n").unwrap();
+
+        let e = Claimed::take(&path).unwrap_err();
+        assert!(matches!(
+            e,
+            JoinError::Save {
+                kind: std::io::ErrorKind::AlreadyExists,
+                ..
+            }
+        ));
+        // Untouched, including by the failed claim's own cleanup.
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "somebody else's config\n"
+        );
+    }
+
+    #[test]
+    fn a_name_that_stopped_meaning_our_file_is_not_written_off_as_success() {
+        // Between the claim and the answer, anybody with write access
+        // to that directory — `/tmp` is the ordinary case — can rename
+        // the file away and put their own at the name. The config went
+        // into the file this run made, which nobody can reach by the
+        // name they typed, so reporting "written to phone.conf" would
+        // be a sentence about somebody else's file.
+        let dir = TempDirs::new();
+        let path = dir.root.join("phone.conf");
+
+        let mut claimed = Claimed::take(&path).unwrap();
+        std::fs::rename(&path, dir.root.join("stolen.conf")).unwrap();
+        std::fs::write(&path, "somebody else's config\n").unwrap();
+
+        let e = claimed
+            .fill(&wgconf::export_profile(&profile_of(&config())))
+            .unwrap_err();
+        assert_eq!(e, JoinError::Taken(path.clone()));
+        assert!(e.to_string().contains("left alone"), "{e}");
+
+        // Dropped without `keep`, and it still leaves the replacement
+        // exactly as it found it — §7.3 promises anago deletes no file
+        // it did not create.
+        drop(claimed);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "somebody else's config\n"
+        );
+    }
+
+    #[test]
+    fn a_cleanup_deletes_only_the_file_it_made() {
+        let dir = TempDirs::new();
+        let path = dir.root.join("phone.conf");
+
+        // Replaced outright, without the claim ever being filled.
+        let claimed = Claimed::take(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, "not ours\n").unwrap();
+        drop(claimed);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not ours\n");
+        std::fs::remove_file(&path).unwrap();
+
+        // A symlink dropped at the name is a mismatch too, not a
+        // follow-through to whatever it points at.
+        let target = dir.root.join("elsewhere.conf");
+        std::fs::write(&target, "elsewhere\n").unwrap();
+        let claimed = Claimed::take(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        drop(claimed);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "elsewhere\n");
+        assert!(
+            path.symlink_metadata().is_ok(),
+            "the symlink is still there"
+        );
+
+        // And the ordinary ending still cleans up after itself.
+        std::fs::remove_file(&path).unwrap();
+        drop(Claimed::take(&path).unwrap());
+        assert!(!path.exists(), "{}", path.display());
+    }
+
+    #[test]
+    fn a_stolen_out_file_undoes_the_registration() {
+        // The phone never got its config, so a name and an address on
+        // the hub belong to nothing. Same door as every other failure
+        // after the hub answers.
+        let e = JoinError::Taken(PathBuf::from("/tmp/phone.conf"));
+        let after = post_registration(&body_with_credentials(), "net.example.com", 443, &e);
+        assert!(matches!(after, JoinError::SavedNothing { .. }), "{after:?}");
+        assert!(after.to_string().contains("/tmp/phone.conf"), "{after}");
+    }
+
+    #[test]
+    fn the_note_says_what_leaked_and_what_to_do_about_it() {
+        let name = DeviceName::parse("폰").unwrap();
+
+        let piped = export_note(&name, None);
+        assert!(piped.contains("private key, in plain text"), "{piped}");
+        assert!(piped.contains("scrollback"), "{piped}");
+        // §7.3: always, without looking at where stdout goes. A shell
+        // redirect takes its mode from the umask; anago's own file does
+        // not.
+        assert!(piped.contains("--out rather than `>`"), "{piped}");
+        assert!(piped.contains("0644"), "{piped}");
+
+        let filed = export_note(&name, Some(Path::new("/home/jo/phone.conf")));
+        assert!(filed.contains("/home/jo/phone.conf (0600)"), "{filed}");
+        assert!(filed.contains("`rm /home/jo/phone.conf`"), "{filed}");
+        // The risk that is specific to a file rather than a screen.
+        assert!(filed.contains("cloud-synced"), "{filed}");
+        assert!(!filed.contains("scrollback"), "{filed}");
+
+        // §8: the token is thrown away, so the phone cannot remove
+        // itself and somebody has to be told where that happens.
+        for note in [piped, filed] {
+            assert!(note.contains("The hub knows this phone as 폰"), "{note}");
+            assert!(note.contains("`anago rm 폰`"), "{note}");
+            // Laid out by hand, so no blank line carries invisible
+            // spaces and no line trails off with them either.
+            for line in note.lines() {
+                assert_eq!(line, line.trim_end(), "{line:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_config_that_never_reached_the_phone_says_so() {
+        // A closed pipe — `anago join … --export conf | head -1`. The
+        // registration stands, so this goes out through the same door
+        // every post-registration failure does.
+        let e = JoinError::Unsent("Broken pipe (os error 32)".to_string());
+        assert!(e.to_string().contains("nothing reached the phone"), "{e}");
+
+        let after = post_registration(&body_with_credentials(), "net.example.com", 443, &e);
+        assert!(matches!(after, JoinError::SavedNothing { .. }), "{after:?}");
+        assert!(
+            after.to_string().contains("nothing reached the phone"),
+            "the cause survives: {after}"
+        );
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    fn body_with_credentials() -> String {
+        format!(
+            "{{\"name\": \"폰\", \"token\": {:?}, \"address\": \"10.100.0.3\"}}",
+            "ab".repeat(32)
+        )
     }
 
     #[test]
