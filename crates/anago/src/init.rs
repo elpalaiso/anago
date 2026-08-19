@@ -1283,6 +1283,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // asserts '/'-joined path strings
     fn ordering_a_certificate_puts_it_where_9_fixes() {
         // Known before it exists, which is what lets the state be
         // built — and the CA called against it — before the
@@ -1432,6 +1433,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // asserts '/'-joined path strings
     fn a_dns01_hub_can_still_renew_when_the_a_record_was_not_written() {
         // Regression: a token with no detectable public address left
         // the A record for the operator — and the state then dropped
