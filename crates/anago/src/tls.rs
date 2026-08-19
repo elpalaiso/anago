@@ -29,6 +29,11 @@ pub struct LoadedTls {
     /// it back, so the only way to answer that question later is to
     /// have kept it.
     pub chain: Chain,
+    /// When the certificate runs out, read from the certificate
+    /// itself (§9.1). `None` when it could not be read, which is a
+    /// display and a schedule going on an assumption rather than a
+    /// reason to refuse the file.
+    pub not_after: Option<i64>,
     /// Non-fatal complaints — a key file others can read, say. The
     /// certificate is still usable, so this is a warning and not a
     /// refusal: the file may belong to a certbot or Cloudflare layout
@@ -67,6 +72,7 @@ pub fn load(cert_path: &Path, key_path: &Path) -> Result<LoadedTls, TlsError> {
         warnings.push(warning);
     }
     Ok(LoadedTls {
+        not_after: chain.expiry(),
         config,
         chain,
         warnings,
@@ -283,6 +289,28 @@ impl Listening {
 /// the same reason — it is what goes on the wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chain(Vec<CertificateDer<'static>>);
+
+impl Chain {
+    /// When the leaf runs out (§9.1).
+    ///
+    /// The leaf and not the whole chain: the intermediates outlive it
+    /// and expire on somebody else's schedule, so the earliest date in
+    /// the file is not the one that matters to this hub.
+    pub fn expiry(&self) -> Option<i64> {
+        anago_core::x509::not_after(self.0.first()?.as_ref())
+    }
+}
+
+/// When the certificate in a PEM file runs out.
+///
+/// For the caller that has the bytes rather than a loaded
+/// configuration — an issuance, which has just been handed the chain
+/// by the CA.
+pub fn expiry(pem: &[u8]) -> Option<i64> {
+    parse_certs(pem)
+        .ok()
+        .and_then(|certs| Chain(certs).expiry())
+}
 
 /// What the periodic look at the certificate files should do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -766,6 +794,38 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_expiry_comes_out_of_the_certificate_itself() {
+        // The renewal schedule is two thirds of the *actual* lifetime
+        // (§9.1), so this is an input and not a display detail — and
+        // Let's Encrypt is in the middle of moving from 90 days to 45.
+        // CERT_A carries `notAfter` 2126-07-26T01:03:31Z, in the
+        // GeneralizedTime form anything past 2049 has to use.
+        let a = chain(CERT_A);
+        assert_eq!(a.expiry(), Some(4_940_701_411));
+        assert_eq!(expiry(CERT_A.as_bytes()), Some(4_940_701_411));
+
+        // The leaf, not the whole chain: an intermediate outlives it
+        // and expires on somebody else's schedule.
+        let with_intermediate =
+            Chain(parse_certs(format!("{CERT_A}{CERT_B}").as_bytes()).expect("two certificates"));
+        assert_eq!(with_intermediate.expiry(), a.expiry());
+
+        // And the fixture pair, which is what `load` sees.
+        let dir = TempDir::new();
+        let cert = dir.write("cert.pem", CERT, 0o644);
+        let key = dir.write("key.pem", KEY_PKCS8, 0o600);
+        assert!(
+            load(&cert, &key).unwrap().not_after.is_some(),
+            "a real certificate's expiry could not be read"
+        );
+
+        // Nothing readable is `None` rather than a refusal: the file
+        // still serves, the schedule falls back, and the output says
+        // it could not read the date.
+        assert_eq!(expiry(b"not pem"), None);
     }
 
     #[test]

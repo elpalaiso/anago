@@ -16,6 +16,7 @@ pub mod subnet;
 pub mod sync;
 pub mod token;
 pub mod wgconf;
+pub mod x509;
 
 #[cfg(test)]
 mod tests {

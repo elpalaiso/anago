@@ -392,7 +392,7 @@ pub fn export_warning(form: ExportForm, name: &DeviceName, out_path: Option<&str
 ///
 /// A deadline already past reads as `now` rather than as a negative
 /// duration — that is what it means to the person reading it.
-fn format_in(seconds: i64) -> String {
+pub fn format_in(seconds: i64) -> String {
     match seconds {
         i64::MIN..=0 => "now".to_string(),
         1..=59 => format!("in {seconds}s"),

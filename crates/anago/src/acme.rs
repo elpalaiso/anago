@@ -1557,9 +1557,10 @@ pub async fn renew(
         key_path: paths.private_key().display().to_string(),
         zone_id,
         account_url: signed.url,
-        // Reading the expiry out of the certificate lands with the rest
-        // of the DER work; until then the conservative fallback stands.
-        not_after: None,
+        // Read from the certificate the CA just handed over, so the
+        // renewal is scheduled at two thirds of the lifetime it
+        // actually has rather than at §9.1's pessimistic assumption.
+        not_after: crate::tls::expiry(issued.certificate.as_bytes()),
         warnings: issued.warnings,
     })
 }

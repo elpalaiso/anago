@@ -18,6 +18,7 @@ use std::net::{Ipv4Addr, UdpSocket};
 use std::path::{Path, PathBuf};
 
 use anago_core::code::{IssuedCode, JoinCode, DEFAULT_TTL_SECS};
+use anago_core::render;
 use anago_core::state::{Acme, Challenge, Cloudflare, PrivateKey, ServerKeys, ServerState, Tls};
 use anago_core::wgconf;
 
@@ -90,14 +91,20 @@ pub fn build_state(
     }
 }
 
-/// What to print when the state file is written: what the operator must
-/// still do, and how to add the first device.
+/// What to print when the hub is up: what anago did, and what is still
+/// the operator's to do.
 ///
-/// **The DNS step appears only when it is still theirs to do.** M0
-/// always printed it because M0 could never write the record; M1 writes
-/// it whenever there is a token, and telling somebody to add a record
-/// anago has just added is how a person ends up with two A records on
-/// one name — the round-robin §9.1 refuses to touch.
+/// **The two are kept apart on purpose.** M1 automates two of the
+/// things M0 asked for by hand, and a list that mixes "this is done"
+/// with "you must do this" is a list nobody reads to the end. So one
+/// section reports — the A record, the certificate and when it runs
+/// out — and the other asks, numbered, with nothing in it that has
+/// already happened.
+///
+/// The reporting section disappears entirely when there is nothing in
+/// it. A hub set up the M0 way — a certificate of the operator's, no
+/// Cloudflare token — gets M0's output, because that is still exactly
+/// what happened.
 ///
 /// `public_ip` is best-effort. When the lookup failed, the A record
 /// line keeps a placeholder instead of inventing an address — a wrong
@@ -107,45 +114,86 @@ pub fn instructions(
     dns: &Dns,
     public_ip: Option<Ipv4Addr>,
     ttl_secs: i64,
+    now: i64,
 ) -> String {
     let domain = &state.domain;
-    let code = state
-        .codes
-        .last()
-        .map(|issued| issued.code.to_string())
-        .unwrap_or_default();
-    let minutes = ttl_secs / 60;
+    let mut out = format!("anago is set up for {domain}.\n");
+    out.push_str(&done_for_you(state, dns, now));
+    out.push_str(&still_yours(state, dns, public_ip, now));
+    out.push_str(&join_line(state, ttl_secs));
+    out
+}
 
-    let mut out = String::new();
-    let mut step = Steps::new();
-    match &dns.record {
-        ARecord::Written(applied) => {
-            out.push_str(&format!("anago is set up for {domain}.\n\n"));
-            out.push_str(&format!("DNS — {applied}\n\n"));
+/// What anago did, and nothing else.
+fn done_for_you(state: &ServerState, dns: &Dns, now: i64) -> String {
+    let mut items = Vec::new();
+    if let ARecord::Written(applied) = &dns.record {
+        // `Applied` already reads as a sentence about what happened
+        // ("created the A record…"), so a heading in front of it
+        // would only repeat the word after the dash.
+        items.push(format!("{applied}\n"));
+    }
+    if let Some(acme) = state.tls.renewable() {
+        // The wording, the two dates and the staging warning are
+        // core's (§8), so `server init` and `server renew` cannot
+        // drift into saying the same thing differently.
+        items.push(render::certificate_ready(
+            &state.domain,
+            acme.challenge,
+            state.tls.not_after,
+            acme.renew_after,
+            now,
+            acme.directory == acme::STAGING,
+            false,
+        ));
+    }
+    if items.is_empty() {
+        return "\n".to_string();
+    }
+
+    let mut out = String::from("\nanago did these for you:\n\n");
+    for item in items {
+        for line in item.lines() {
+            out.push_str(&format!("  {line}\n"));
         }
-        ARecord::ByHand(_) => {
-            out.push_str(&format!(
-                "anago is set up for {domain}. Two things are still yours to do:\n\n"
-            ));
-            out.push_str(&format!(
-                "{}. DNS — point the domain at this machine:\n\n",
-                step.next()
-            ));
-            out.push_str(&format!(
-                "     {domain}.  A  {}\n\n",
-                address_line(public_ip)
-            ));
-            if public_ip.is_none() {
-                out.push_str(
-                    "   (anago could not work out this machine's public address; use the one\n\
-                     \x20   your provider shows.)\n\n",
-                );
-            } else {
-                out.push_str(
-                    "   (that is the address this machine sends traffic from; if the server is\n\
-                     \x20   behind NAT, use the public address your provider shows instead.)\n\n",
-                );
-            }
+    }
+    out.push('\n');
+    out
+}
+
+/// What the operator still has to do, numbered from one.
+fn still_yours(state: &ServerState, dns: &Dns, public_ip: Option<Ipv4Addr>, now: i64) -> String {
+    let mut step = Steps::new();
+    let mut out = String::from("Still yours to do:\n\n");
+
+    if dns.is_by_hand() {
+        out.push_str(&format!(
+            "{}. DNS — point the domain at this machine:\n\n",
+            step.next()
+        ));
+        out.push_str(&format!(
+            "     {}.  A  {}\n\n",
+            state.domain,
+            address_line(public_ip)
+        ));
+        if public_ip.is_none() {
+            out.push_str(
+                "   (anago could not work out this machine's public address; use the one\n\
+                 \x20   your provider shows.)\n\n",
+            );
+        } else {
+            out.push_str(
+                "   (that is the address this machine sends traffic from; if the server is\n\
+                 \x20   behind NAT, use the public address your provider shows instead.)\n\n",
+            );
+        }
+        if dns.zone_id.is_none() {
+            // No token, so anago does not know the provider — but the
+            // trap below is not Cloudflare's alone.
+            out.push_str(
+                "   (if your DNS provider puts a proxy or CDN in front of the record, leave\n\
+                 \x20   it off: WireGuard's UDP port does not survive one.)\n\n",
+            );
         }
     }
 
@@ -159,24 +207,68 @@ pub fn instructions(
     ));
     out.push_str(&format!("     {}/udp WireGuard\n", state.listen_port));
     if wants_port_80(state) {
-        // HTTP-01 renews by answering on :80 every couple of months.
+        // HTTP-01 answers the challenge on :80 again at every renewal.
         // A firewall that let the first issuance through and was then
         // tightened is a hub that stops renewing months later (§9.1).
-        out.push_str("     80/tcp    certificate renewal (HTTP-01)\n");
+        out.push_str("     80/tcp    certificate renewal, now and at every renewal\n");
     }
     out.push('\n');
 
-    if let Some(warning) = staging_warning(state) {
-        out.push_str(&warning);
+    if dns.zone_id.is_some() {
+        // §13's worst trap, and it gets worse the more anago
+        // automates: a proxied record still passes HTTP-01 and its TXT
+        // records are not proxied at all, so the certificate arrives,
+        // HTTPS works, every line above is green — and the tunnel is
+        // dead. Nothing anago can see says so, which is exactly why it
+        // has to be asked of a person.
+        out.push_str(&format!(
+            "{}. Cloudflare — check the A record is DNS only:\n\n",
+            step.next()
+        ));
+        out.push_str(
+            "     The cloud beside it must be grey, not orange. A proxied record still\n\
+             \x20    gets a certificate and still serves HTTPS, so nothing above would have\n\
+             \x20    failed — but WireGuard's UDP port is not forwarded through the proxy,\n\
+             \x20    and devices would join and then reach nothing.\n\n",
+        );
     }
 
-    out.push_str("Then add a device — run this on it:\n\n");
-    out.push_str(&format!("     anago join {domain} {code}\n\n"));
-    out.push_str(&format!(
-        "That code is single use and expires in {minutes} minutes; \
-         `anago code` issues another.\n"
-    ));
+    if state.tls.renewable().is_none() {
+        // A manual certificate has an owner and it is not anago
+        // (§9.1). Saying when it runs out is the whole of what anago
+        // can do about it.
+        out.push_str(&format!(
+            "{}. Certificate — keep it up to date yourself:\n\n",
+            step.next()
+        ));
+        out.push_str(&format!(
+            "     anago serves {} and never rewrites it. {}\n\n",
+            state.tls.cert_path,
+            match state.tls.not_after {
+                Some(not_after) => format!(
+                    "It expires {}.",
+                    render::format_in(not_after.saturating_sub(now))
+                ),
+                None => "Its expiry could not be read.".to_string(),
+            }
+        ));
+    }
     out
+}
+
+/// The line to paste on the first device.
+fn join_line(state: &ServerState, ttl_secs: i64) -> String {
+    let code = state
+        .codes
+        .last()
+        .map(|issued| issued.code.to_string())
+        .unwrap_or_default();
+    format!(
+        "Then add a device — run this on it:\n\n     anago join {} {code}\n\n\
+         That code is single use and expires in {} minutes; `anago code` issues another.\n",
+        state.domain,
+        ttl_secs / 60
+    )
 }
 
 /// Numbers the steps that are actually printed, so a list that loses
@@ -210,23 +302,6 @@ pub fn wants_port_80(state: &ServerState) -> bool {
         state.tls.renewable().map(|acme| acme.challenge),
         Some(Challenge::Http01)
     )
-}
-
-/// The line a staging certificate has to come with (§8).
-///
-/// Nothing trusts Let's Encrypt's staging CA, so `anago join` will
-/// refuse the hub with an unknown-issuer error. A person who typed
-/// `--acme-staging` to check the wiring needs to know that the failure
-/// they are about to see is the expected one.
-pub fn staging_warning(state: &ServerState) -> Option<String> {
-    let acme = state.tls.renewable()?;
-    (acme.directory == acme::STAGING).then(|| {
-        "This certificate came from Let's Encrypt's STAGING CA, which nothing trusts.\n\
-         `anago join` will refuse it with an unknown-issuer error — that is the\n\
-         expected result, and it means the wiring works. Move to the real CA with:\n\n     \
-         anago server renew --acme-production\n\n"
-            .to_string()
-    })
 }
 
 /// This machine's outbound address, when that address is one the world
@@ -442,6 +517,12 @@ impl Dns {
             zone_id: None,
             record: ARecord::ByHand(ByHand::NoToken),
         }
+    }
+
+    /// Whether the operator still has to add the record — which is
+    /// what decides whether the output asks them to.
+    pub fn is_by_hand(&self) -> bool {
+        matches!(self.record, ARecord::ByHand(_))
     }
 
     /// What goes in the state file.
@@ -662,6 +743,12 @@ pub fn run(
         )
         .map_err(|e| finished_but_unpublished(InitError::Tls(e), &state))?,
     };
+    // §9.1 fills `not_after` for a manual certificate too: anago does
+    // not renew it, but it can say when it runs out — which is the
+    // whole of what the output can do about a file it does not own.
+    // For an ACME hub this is the same certificate `record` already
+    // read, now confirmed from the file that will actually be served.
+    state.tls.not_after = loaded.not_after;
     warnings.extend(loaded.warnings);
 
     // --- The point of no return: after this, the machine is a hub.
@@ -704,7 +791,7 @@ pub fn run(
 
     Ok(Initialized {
         instructions: assemble(
-            &instructions(&state, &setup.dns, address, DEFAULT_TTL_SECS),
+            &instructions(&state, &setup.dns, address, DEFAULT_TTL_SECS, now),
             &start,
         ),
         warnings,
@@ -1357,9 +1444,9 @@ mod tests {
         assert_eq!(cloudflare.record_id, None);
 
         // The operator is still told to add the record.
-        let text = instructions(&state, &no_address(), None, DEFAULT_TTL_SECS);
-        assert!(text.contains("1. DNS"), "{text}");
-        assert!(text.contains("could not work out"), "{text}");
+        let out = instructions(&state, &no_address(), None, DEFAULT_TTL_SECS, NOW);
+        assert!(out.contains("1. DNS"), "{out}");
+        assert!(out.contains("could not work out"), "{out}");
     }
 
     #[test]
@@ -1405,62 +1492,158 @@ mod tests {
         assert_eq!(ServerState::parse(&state.to_json_string()).unwrap(), state);
     }
 
+    /// The renderer under test, with the two clock values fixed so
+    /// every relative date below is a constant.
+    fn text(state: &ServerState, dns: &Dns, public_ip: Option<Ipv4Addr>) -> String {
+        instructions(state, dns, public_ip, DEFAULT_TTL_SECS, NOW)
+    }
+
+    /// An ACME hub as it stands when `run` prints: the certificate has
+    /// arrived, so the state carries its expiry and the schedule that
+    /// follows from it (§9.1).
+    fn issued(asked: &ServerInit, dns: &Dns, lifetime_days: i64) -> ServerState {
+        let decision = decide(asked, None).unwrap();
+        let mut state = state_of(asked, &decision, dns);
+        let not_after = NOW + lifetime_days * 86_400;
+        state.tls.not_after = Some(not_after);
+        state
+            .tls
+            .renewable_mut()
+            .expect("this hub renews its own")
+            .issued(NOW, Some(not_after));
+        state
+    }
+
     #[test]
     fn the_instructions_carry_the_dns_record_to_add() {
         let state = state_from(&args());
-        let text = instructions(
-            &state,
-            &by_hand(),
-            Some("203.0.113.7".parse().unwrap()),
-            DEFAULT_TTL_SECS,
-        );
-        assert!(text.contains("net.example.com.  A  203.0.113.7"), "{text}");
-        assert!(
-            text.contains("behind NAT"),
-            "the address is a guess: {text}"
-        );
+        let out = text(&state, &by_hand(), Some("203.0.113.7".parse().unwrap()));
+        assert!(out.contains("net.example.com.  A  203.0.113.7"), "{out}");
+        assert!(out.contains("behind NAT"), "the address is a guess: {out}");
     }
 
     #[test]
     fn a_failed_lookup_leaves_a_blank_rather_than_a_wrong_address() {
         let state = state_from(&args());
-        let text = instructions(&state, &by_hand(), None, DEFAULT_TTL_SECS);
-        assert!(text.contains("A  <this server's public IP>"), "{text}");
-        assert!(text.contains("could not work out"), "{text}");
+        let out = text(&state, &by_hand(), None);
+        assert!(out.contains("A  <this server's public IP>"), "{out}");
+        assert!(out.contains("could not work out"), "{out}");
         // Nothing that looks like an address it made up.
-        assert!(!text.contains("0.0.0.0"), "{text}");
+        assert!(!out.contains("0.0.0.0"), "{out}");
     }
 
     #[test]
-    fn the_instructions_list_both_ports() {
-        let state = state_from(&args());
-        let text = instructions(&state, &by_hand(), None, DEFAULT_TTL_SECS);
-        assert!(text.contains("443/tcp"), "{text}");
-        assert!(text.contains("51820/udp"), "{text}");
-        assert!(text.contains("nothing can reach the hub"), "{text}");
+    fn what_anago_did_and_what_is_left_are_two_lists() {
+        // The point of the rewrite: a list that mixes "this is done"
+        // with "you must do this" is one nobody reads to the end.
+        let asked = ServerInit {
+            cf_token: Some(token()),
+            ..ordering()
+        };
+        let state = issued(&asked, &written(), 90);
+        let out = text(&state, &written(), Some("203.0.113.7".parse().unwrap()));
 
-        // And they follow the flags, not the defaults.
-        let mut args = args();
-        args.api_port = 8443;
-        args.listen_port = 51999;
-        let text = instructions(&state_from(&args), &by_hand(), None, DEFAULT_TTL_SECS);
-        assert!(text.contains("8443/tcp"), "{text}");
-        assert!(text.contains("51999/udp"), "{text}");
+        let did = out.find("anago did these for you").expect("{out}");
+        let left = out.find("Still yours to do").expect("{out}");
+        assert!(did < left, "{out}");
+
+        // Reported, not asked for: the record and the certificate.
+        let done = &out[did..left];
+        assert!(done.contains("created the A record"), "{done}");
+        assert!(done.contains("issued a certificate"), "{done}");
+        assert!(done.contains("dns-01"), "{done}");
+
+        // Asked for, and nothing that already happened: the firewall
+        // and the one thing automation cannot check.
+        let todo = &out[left..];
+        assert!(todo.contains("1. Firewall"), "{todo}");
+        assert!(todo.contains("2. Cloudflare"), "{todo}");
+        assert!(
+            !todo.contains("point the domain at this machine"),
+            "the record anago just wrote is being asked for again: {todo}"
+        );
     }
 
     #[test]
-    fn the_instructions_end_with_a_line_to_paste_on_the_device() {
+    fn the_certificate_line_says_when_it_runs_out_and_when_it_renews() {
+        // §9.1 renews at two thirds of the lifetime, so a 90-day
+        // certificate renews at 60 — and the numbers have to be the
+        // ones the state actually holds, not a fixed "60 days".
+        let state = issued(&ordering(), &by_hand(), 90);
+        let out = text(&state, &by_hand(), None);
+        assert!(out.contains("expires in 90d"), "{out}");
+        assert!(out.contains("renewing in 60d"), "{out}");
+
+        // The lifetimes Let's Encrypt is moving to say the same thing
+        // in different numbers, which is the reason not to hard-code
+        // one.
+        let out = text(&issued(&ordering(), &by_hand(), 45), &by_hand(), None);
+        assert!(out.contains("expires in 45d"), "{out}");
+        assert!(out.contains("renewing in 30d"), "{out}");
+    }
+
+    #[test]
+    fn an_expiry_that_could_not_be_read_is_said_rather_than_invented() {
+        // The certificate still serves and the renewal still runs, on
+        // §9.1's assumed lifetime — and a person is entitled to know
+        // they are on the assumption.
+        let decision = decide(&ordering(), None).unwrap();
+        let mut state = state_of(&ordering(), &decision, &by_hand());
+        state.tls.not_after = None;
+        state.tls.renewable_mut().unwrap().issued(NOW, None);
+        let out = text(&state, &by_hand(), None);
+        assert!(out.contains("expiry could not be read"), "{out}");
+        assert!(out.contains("assumed lifetime"), "{out}");
+        // No invented date. ("expires in 15 minutes" further down is
+        // the join code, which anago does know the life of.)
+        let done = &out[..out.find("Still yours to do").expect("{out}")];
+        assert!(!done.contains("expires"), "{done}");
+    }
+
+    #[test]
+    fn a_manual_certificate_is_the_operators_to_renew_and_says_so() {
+        // anago reads that file and never writes it (§9.1). The most
+        // it can do is say when it runs out — which is exactly the
+        // kind of thing that belongs in the second list, not the
+        // first.
+        let mut state = state_from(&args());
+        state.tls.not_after = Some(NOW + 41 * 86_400);
+        let out = text(&state, &by_hand(), None);
+
+        assert!(
+            !out.contains("anago did these for you"),
+            "an M0 hub had a list of things anago did: {out}"
+        );
+        assert!(
+            out.contains("Certificate — keep it up to date yourself"),
+            "{out}"
+        );
+        assert!(out.contains("/etc/ssl/anago/fullchain.pem"), "{out}");
+        assert!(out.contains("It expires in 41d"), "{out}");
+        assert!(out.contains("never rewrites it"), "{out}");
+
+        // And when the file's date could not be read, it says that
+        // instead of leaving the sentence half-finished.
+        let mut state = state_from(&args());
+        state.tls.not_after = None;
+        assert!(text(&state, &by_hand(), None).contains("expiry could not be read"));
+    }
+
+    #[test]
+    fn an_m0_hub_still_gets_m0s_output() {
+        // A certificate of the operator's and no Cloudflare token:
+        // nothing was automated, so there is nothing to report and the
+        // list of what is left is the one M0 printed.
         let state = state_from(&args());
-        let text = instructions(&state, &by_hand(), None, DEFAULT_TTL_SECS);
+        let out = text(&state, &by_hand(), Some("203.0.113.7".parse().unwrap()));
+        assert!(!out.contains("anago did these for you"), "{out}");
+        assert!(out.contains("1. DNS"), "{out}");
+        assert!(out.contains("2. Firewall"), "{out}");
+        assert!(!out.contains("Cloudflare —"), "{out}");
         assert!(
-            text.contains("anago join net.example.com 7QX4-M2KD"),
-            "{text}"
+            out.contains("anago join net.example.com 7QX4-M2KD"),
+            "{out}"
         );
-        assert!(
-            text.contains("single use and expires in 15 minutes"),
-            "{text}"
-        );
-        assert!(text.contains("`anago code` issues another"), "{text}");
     }
 
     #[test]
@@ -1509,19 +1692,14 @@ mod tests {
         // refuses to touch, and which makes half the answers point
         // somewhere else.
         let state = state_from(&args());
-        let text = instructions(
-            &state,
-            &written(),
-            Some("203.0.113.7".parse().unwrap()),
-            DEFAULT_TTL_SECS,
-        );
-        assert!(!text.contains("point the domain at this machine"), "{text}");
-        assert!(!text.contains("A  203.0.113.7"), "{text}");
+        let out = text(&state, &written(), Some("203.0.113.7".parse().unwrap()));
+        assert!(!out.contains("point the domain at this machine"), "{out}");
+        assert!(!out.contains("A  203.0.113.7"), "{out}");
         // It says what happened instead, and the firewall step is
         // renumbered rather than starting at two.
-        assert!(text.contains("DNS — created"), "{text}");
-        assert!(text.contains("1. Firewall"), "{text}");
-        assert!(text.contains("443/tcp"), "{text}");
+        assert!(out.contains("created the A record"), "{out}");
+        assert!(out.contains("1. Firewall"), "{out}");
+        assert!(out.contains("443/tcp"), "{out}");
     }
 
     #[test]
@@ -1531,16 +1709,59 @@ mod tests {
         // complete.
         let state = state_from(&args());
         for dns in [by_hand(), no_address()] {
-            let text = instructions(
-                &state,
-                &dns,
-                Some("203.0.113.7".parse().unwrap()),
-                DEFAULT_TTL_SECS,
-            );
-            assert!(text.contains("1. DNS"), "{text}");
-            assert!(text.contains("net.example.com.  A  203.0.113.7"), "{text}");
-            assert!(text.contains("2. Firewall"), "{text}");
+            let out = text(&state, &dns, Some("203.0.113.7".parse().unwrap()));
+            assert!(out.contains("1. DNS"), "{out}");
+            assert!(out.contains("net.example.com.  A  203.0.113.7"), "{out}");
+            assert!(out.contains("2. Firewall"), "{out}");
         }
+    }
+
+    #[test]
+    fn the_proxy_is_the_one_thing_automation_cannot_check() {
+        // §13's worst trap, and M1 makes it worse: a proxied record
+        // still passes HTTP-01, its TXT records are not proxied at
+        // all, HTTPS works — and the tunnel is dead. Every line above
+        // it is green, so the only way it gets caught is by asking a
+        // person to look.
+        let asked = ServerInit {
+            cf_token: Some(token()),
+            ..ordering()
+        };
+        let state = issued(&asked, &written(), 90);
+        let out = text(&state, &written(), None);
+        assert!(out.contains("check the A record is DNS only"), "{out}");
+        assert!(out.contains("grey, not orange"), "{out}");
+        assert!(out.contains("gets a certificate"), "{out}");
+        assert!(out.contains("UDP port is not forwarded"), "{out}");
+
+        // It is asked whenever the name is in a zone anago looked up —
+        // including the hub that could not write its record, because
+        // the record it is told to add can be proxied just the same.
+        assert!(text(&state, &no_address(), None).contains("DNS only"));
+
+        // With no token anago does not know the provider, so it warns
+        // in the DNS step instead of naming Cloudflare.
+        let out = text(&state_from(&args()), &by_hand(), None);
+        assert!(!out.contains("Cloudflare —"), "{out}");
+        assert!(out.contains("proxy or CDN in front of the record"), "{out}");
+        assert!(out.contains("UDP port does not survive"), "{out}");
+    }
+
+    #[test]
+    fn the_instructions_list_the_ports_the_hub_actually_needs() {
+        let state = state_from(&args());
+        let out = text(&state, &by_hand(), None);
+        assert!(out.contains("443/tcp"), "{out}");
+        assert!(out.contains("51820/udp"), "{out}");
+        assert!(out.contains("nothing can reach the hub"), "{out}");
+
+        // And they follow the flags, not the defaults.
+        let mut args = args();
+        args.api_port = 8443;
+        args.listen_port = 51999;
+        let out = text(&state_from(&args), &by_hand(), None);
+        assert!(out.contains("8443/tcp"), "{out}");
+        assert!(out.contains("51999/udp"), "{out}");
     }
 
     #[test]
@@ -1549,26 +1770,21 @@ mod tests {
         // months. A firewall opened for the first issuance and then
         // tightened is a hub that stops renewing months later, and the
         // only moment to say so is here.
-        let asked = ordering();
-        let decision = decide(&asked, None).unwrap();
-        let state = state_of(&asked, &decision, &by_hand());
-        let text = instructions(&state, &by_hand(), None, DEFAULT_TTL_SECS);
-        assert!(text.contains("80/tcp"), "{text}");
-        assert!(text.contains("HTTP-01"), "{text}");
+        let state = issued(&ordering(), &by_hand(), 90);
+        let out = text(&state, &by_hand(), None);
+        assert!(out.contains("80/tcp"), "{out}");
+        assert!(out.contains("at every renewal"), "{out}");
 
         // DNS-01 needs no :80 at all, which is the reason to prefer it.
         let asked = ServerInit {
             cf_token: Some(token()),
             ..ordering()
         };
-        let decision = decide(&asked, None).unwrap();
-        let state = state_of(&asked, &decision, &written());
-        let text = instructions(&state, &written(), None, DEFAULT_TTL_SECS);
-        assert!(!text.contains("80/tcp"), "{text}");
+        let state = issued(&asked, &written(), 90);
+        assert!(!text(&state, &written(), None).contains("80/tcp"));
 
         // And a manual hub never mentions it either.
-        let text = instructions(&state_from(&args()), &by_hand(), None, DEFAULT_TTL_SECS);
-        assert!(!text.contains("80/tcp"), "{text}");
+        assert!(!text(&state_from(&args()), &by_hand(), None).contains("80/tcp"));
     }
 
     #[test]
@@ -1581,21 +1797,34 @@ mod tests {
             acme_staging: true,
             ..ordering()
         };
-        let decision = decide(&asked, None).unwrap();
-        let state = state_of(&asked, &decision, &by_hand());
-        let text = instructions(&state, &by_hand(), None, DEFAULT_TTL_SECS);
-        assert!(text.contains("STAGING"), "{text}");
-        assert!(text.contains("unknown-issuer"), "{text}");
-        assert!(text.contains("--acme-production"), "{text}");
+        let state = issued(&asked, &by_hand(), 90);
+        let out = text(&state, &by_hand(), None);
+        assert!(out.contains("staging"), "{out}");
+        assert!(out.contains("UnknownIssuer"), "{out}");
+        assert!(out.contains("--acme-production"), "{out}");
         assert!(
-            text.find("STAGING") < text.find("anago join"),
-            "the warning has to come before the line it is about: {text}"
+            out.find("staging") < out.find("anago join"),
+            "the warning has to come before the line it is about: {out}"
         );
 
         // Production says nothing of the sort.
-        let decision = decide(&ordering(), None).unwrap();
-        let state = state_of(&ordering(), &decision, &by_hand());
-        assert!(!instructions(&state, &by_hand(), None, DEFAULT_TTL_SECS).contains("STAGING"));
+        let state = issued(&ordering(), &by_hand(), 90);
+        assert!(!text(&state, &by_hand(), None).contains("staging"));
+    }
+
+    #[test]
+    fn the_instructions_end_with_a_line_to_paste_on_the_device() {
+        let state = state_from(&args());
+        let out = text(&state, &by_hand(), None);
+        assert!(
+            out.contains("anago join net.example.com 7QX4-M2KD"),
+            "{out}"
+        );
+        assert!(
+            out.contains("single use and expires in 15 minutes"),
+            "{out}"
+        );
+        assert!(out.contains("`anago code` issues another"), "{out}");
     }
 
     #[test]
@@ -1852,7 +2081,7 @@ mod tests {
         // real answer, contradicting the systemd case and denying the
         // command the foreground case had just recommended.
         let state = state_from(&args());
-        let base = instructions(&state, &by_hand(), None, DEFAULT_TTL_SECS);
+        let base = instructions(&state, &by_hand(), None, DEFAULT_TTL_SECS, NOW);
 
         let under_systemd = assemble(
             &base,
