@@ -1958,13 +1958,27 @@ pub fn sleep_for(step: Tick, now: i64) -> Duration {
 /// the hub, and because it is the part that cannot be tested without a
 /// CA.
 ///
+/// `refresh` is the other half of "the state can change underneath a
+/// running hub": it puts a certificate that arrived from somewhere else
+/// in front of the listener. It runs **every tick, whatever the tick
+/// decides** — including on a hub whose certificate anago does not
+/// issue at all ([`Tick::NotOurs`]), because that is precisely the hub
+/// whose certbot renews the file and whose listener would otherwise go
+/// on presenting the old one until somebody restarted the process.
+///
 /// This never returns. It is spawned beside the listener and stops when
 /// the process does.
 ///
 /// **Human verification needed**: the renewal itself needs a real CA.
-pub async fn renewal_loop<Read, Renew, Fut, Now>(read: Read, renew: Renew, now: Now) -> !
+pub async fn renewal_loop<Read, Refresh, Renew, Fut, Now>(
+    read: Read,
+    refresh: Refresh,
+    renew: Renew,
+    now: Now,
+) -> !
 where
     Read: Fn() -> Result<state::Tls, String>,
+    Refresh: Fn(&state::Tls),
     Renew: Fn() -> Fut,
     Fut: std::future::Future<Output = Result<(), RenewalFailure>>,
     Now: Fn() -> i64,
@@ -1991,6 +2005,11 @@ where
                          schedule starts over"
                     ),
                 }
+                // Before the decision, not after it: a certificate
+                // that arrived from elsewhere is the listener's
+                // business whether or not anything is due, and the
+                // ticks that do nothing are the common case.
+                refresh(&tls);
                 (tick(&tls, at, &renewals), Some(tls))
             }
             // **Not** the same as a manual certificate. Reading the
@@ -3907,6 +3926,7 @@ mod tests {
         let task = tokio::spawn(async move {
             renewal_loop(
                 move || Ok(tls.clone()),
+                |_| {},
                 move || {
                     let attempts = loop_attempts.clone();
                     let at = loop_clock();
@@ -3956,6 +3976,7 @@ mod tests {
         let task = tokio::spawn(async move {
             renewal_loop(
                 move || Ok(tls.clone()),
+                |_| {},
                 move || {
                     let called = loop_called.clone();
                     async move {
@@ -3996,6 +4017,7 @@ mod tests {
                     loop_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     Err("state.json: permission denied".to_string())
                 },
+                |_| {},
                 move || {
                     let renews = loop_renews.clone();
                     async move {
@@ -4021,6 +4043,90 @@ mod tests {
             renews.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "a hub whose state cannot be read must not order a certificate anyway"
+        );
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hub_that_renews_nothing_still_looks_at_its_certificate_files() {
+        // The gap this closes: a manual-TLS hub whose certbot renews
+        // the file. `tick` says `NotOurs` and there is nothing to
+        // issue — but the listener is still holding the pair it read
+        // at startup, and without this look it presents the expired
+        // certificate on a machine that renewed on time. The look runs
+        // before the decision, so every tick gets one.
+        let looks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let renews = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tls = state::Tls::manual("/etc/ssl/anago/fullchain.pem", "/etc/ssl/anago/privkey.pem");
+        assert_eq!(tick(&tls, NOW_RENEW, &Renewals::new()), Tick::NotOurs);
+
+        let loop_looks = looks.clone();
+        let loop_renews = renews.clone();
+        let task = tokio::spawn(async move {
+            renewal_loop(
+                move || Ok(tls.clone()),
+                move |seen: &state::Tls| {
+                    assert_eq!(seen.cert_path, "/etc/ssl/anago/fullchain.pem");
+                    loop_looks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                },
+                move || {
+                    let renews = loop_renews.clone();
+                    async move {
+                        renews.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(())
+                    }
+                },
+                || NOW_RENEW,
+            )
+            .await
+        });
+
+        tokio::time::sleep(CHECK_EVERY * 3 + Duration::from_secs(1)).await;
+        let seen = looks.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            seen, 4,
+            "the files were looked at {seen} times in three hours"
+        );
+        assert_eq!(
+            renews.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "anago ordered a certificate for a hub that issues its own"
+        );
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_certificate_is_looked_at_even_while_a_renewal_keeps_failing() {
+        // The failing renewal is the case where a certificate arriving
+        // from elsewhere matters most: somebody watching the hub fail
+        // every hour fixes it by putting a certificate there by hand,
+        // and the hub has to notice. A look that only ran on the ticks
+        // that renew would never come.
+        let looks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tls = acme_tls(NOW_RENEW - 1, NOW_RENEW + 20 * DAY);
+        let loop_looks = looks.clone();
+        let task = tokio::spawn(async move {
+            renewal_loop(
+                move || Ok(tls.clone()),
+                move |_: &state::Tls| {
+                    loop_looks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                },
+                || async {
+                    Err(RenewalFailure {
+                        detail: "the CA said no".to_string(),
+                        kind: FailureKind::Ordinary,
+                        retry_after: None,
+                    })
+                },
+                || NOW_RENEW,
+            )
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_secs(2 * 60 * 60)).await;
+        assert!(
+            looks.load(std::sync::atomic::Ordering::SeqCst) >= 3,
+            "a hub whose renewal keeps failing stopped looking at its files"
         );
         task.abort();
     }

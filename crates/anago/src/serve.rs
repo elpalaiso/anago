@@ -14,7 +14,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anago_core::state::ServerState;
+use anago_core::state::{self, ServerState};
 
 use crate::acme;
 use crate::api::{self, Api};
@@ -88,7 +88,7 @@ pub fn run(root: &Path, wg_dir: &Path) -> Result<(), ServeError> {
         .enable_all()
         .build()
         .map_err(|e| ServeError::Runtime(e.to_string()))?;
-    let handle = tls::reloadable(loaded.config);
+    let listening = Arc::new(tls::Listening::new(loaded));
     runtime
         .block_on(async {
             // The renewal check runs beside the listener for as long as
@@ -98,9 +98,9 @@ pub fn run(root: &Path, wg_dir: &Path) -> Result<(), ServeError> {
             // nothing renews is the failure that turns up months later
             // as an expired certificate. Ending the process hands it to
             // systemd, which restarts on failure (§6.1).
-            let mut renewals = tokio::spawn(renewal_task(root.to_path_buf(), handle.clone()));
+            let mut renewals = tokio::spawn(renewal_task(root.to_path_buf(), listening.clone()));
             let served = tokio::select! {
-                served = tls::serve(addr, handle, api::router(api)) => served,
+                served = tls::serve(addr, listening.config(), api::router(api)) => served,
                 stopped = &mut renewals => Err(renewal_stopped(stopped)),
             };
             renewals.abort();
@@ -139,7 +139,7 @@ pub fn renewal_stopped<Never>(stopped: Result<Never, tokio::task::JoinError>) ->
 /// loop should notice within the hour.
 ///
 /// **Human verification needed**: renewing needs a real CA.
-async fn renewal_task(root: PathBuf, handle: tls::Reloadable) -> ! {
+async fn renewal_task(root: PathBuf, listening: Arc<tls::Listening>) -> ! {
     let store = Store::new(&root);
     // The store owns the state file and its lock; where the issued
     // certificate lives is a separate family of paths (§9), so it is
@@ -154,10 +154,52 @@ async fn renewal_task(root: PathBuf, handle: tls::Reloadable) -> ! {
                 .map(|state| state.tls)
                 .map_err(|e| e.to_string())
         },
-        || renew_once(&store, &paths, &handle),
+        |tls| refresh(&listening, tls),
+        || renew_once(&store, &paths, &listening),
         now,
     )
     .await
+}
+
+/// Keeps the listener presenting what is on disk (DESIGN.md §9.1).
+///
+/// anago's own renewal swaps the pair it has just validated, so this
+/// finds nothing to do after one. It exists for the certificates anago
+/// did **not** issue: a manual hub whose certbot rewrites the file, and
+/// a `server renew` typed by hand — which takes the issuance lock, so
+/// the timer's own attempt returns "busy" and never sees the result.
+/// Both leave a hub serving the old certificate until somebody
+/// restarts the process, which is the failure that shows up as an
+/// expired certificate on a machine that renewed on time.
+///
+/// The decision is [`tls::reload`]'s and is pure; what is left here is
+/// the read, the swap, and the line to print.
+fn refresh(listening: &tls::Listening, settings: &state::Tls) {
+    let found = tls::load(
+        Path::new(&settings.cert_path),
+        Path::new(&settings.key_path),
+    );
+    // Kept before the pair is handed over, because presenting it
+    // consumes it — and a renewed key that came back world-readable is
+    // worth the same line here as at startup.
+    let warnings = found
+        .as_ref()
+        .map(|loaded| loaded.warnings.clone())
+        .unwrap_or_default();
+
+    match listening.take(found) {
+        tls::Reload::Unchanged => {}
+        tls::Reload::Keep(why) => eprintln!("anago: {why}"),
+        tls::Reload::Swap => {
+            for warning in &warnings {
+                eprintln!("anago: warning: {warning}");
+            }
+            println!(
+                "anago: the certificate in {} changed — new connections get it from now on",
+                settings.cert_path
+            );
+        }
+    }
 }
 
 /// One renewal: issue, save, record, and put the new certificate in
@@ -184,7 +226,7 @@ async fn renewal_task(root: PathBuf, handle: tls::Reloadable) -> ! {
 async fn renew_once(
     store: &Store,
     paths: &paths::ServerPaths,
-    handle: &tls::Reloadable,
+    listening: &tls::Listening,
 ) -> Result<(), acme::RenewalFailure> {
     let _issuing = match FileLock::try_acquire(&paths.issue_lock()) {
         Ok(Some(lock)) => lock,
@@ -228,10 +270,14 @@ async fn renew_once(
         .commit()
         .map_err(|e| acme::RenewalFailure::local(e.to_string()))?;
 
-    tls::swap(handle, loaded.config);
     for warning in loaded.warnings.iter().chain(renewed.warnings.iter()) {
         eprintln!("anago: warning: {warning}");
     }
+    // Handle and record together: the next look must find nothing to
+    // do, or it would put this same certificate in front of the
+    // listener a second time and — worse — go on comparing against a
+    // chain that is no longer being served.
+    listening.present(loaded);
     println!("anago: renewed the certificate for {}", state.domain);
     Ok(())
 }
@@ -394,6 +440,97 @@ mod tests {
         // The issuance lock is its own file: the state lock is held for
         // the length of a join, and an issuance takes minutes.
         assert_ne!(paths.issue_lock(), paths.state_lock());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_certificate_written_by_somebody_else_reaches_the_listener() {
+        use crate::tls::pairs::{CERT_A, CERT_B, KEY_A, KEY_B};
+
+        let dir = std::env::temp_dir().join(format!("anago-refresh-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("fullchain.pem");
+        let key = dir.join("privkey.pem");
+        std::fs::write(&cert, CERT_A).unwrap();
+        std::fs::write(&key, KEY_A).unwrap();
+        let settings = state::Tls::manual(cert.to_str().unwrap(), key.to_str().unwrap());
+
+        let listening = tls::Listening::new(tls::load(&cert, &key).expect("the first pair"));
+        let listener = listening.config();
+        let started_with = listener.get_inner();
+
+        // Nothing has changed: the hourly look must not churn the
+        // configuration the listener reads on every handshake.
+        refresh(&listening, &settings);
+        assert!(Arc::ptr_eq(&started_with, &listener.get_inner()));
+
+        // certbot has written the certificate and not yet the key.
+        std::fs::write(&cert, CERT_B).unwrap();
+        refresh(&listening, &settings);
+        assert!(
+            Arc::ptr_eq(&started_with, &listener.get_inner()),
+            "a pair caught half-written was put in front of the listener"
+        );
+
+        // And now the key.
+        std::fs::write(&key, KEY_B).unwrap();
+        refresh(&listening, &settings);
+        let swapped = listener.get_inner();
+        assert!(
+            !Arc::ptr_eq(&started_with, &swapped),
+            "the listener is still holding the certificate it started with"
+        );
+
+        // The look after a swap has nothing to do. Without this the
+        // hub would rebuild and replace the configuration every hour
+        // for the life of the certificate.
+        refresh(&listening, &settings);
+        assert!(Arc::ptr_eq(&swapped, &listener.get_inner()));
+
+        // A certificate that goes missing does not take the working one
+        // down with it.
+        std::fs::remove_file(&cert).unwrap();
+        refresh(&listening, &settings);
+        assert!(Arc::ptr_eq(&swapped, &listener.get_inner()));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_look_after_a_renewal_of_our_own_has_nothing_to_do() {
+        // The last two steps `renew_once` takes, in order: the pair it
+        // validated goes in front of the listener, and then the loop
+        // comes round and looks at the files again. That look has to
+        // say "unchanged" — anything else means the handle and the
+        // chain it is compared against have come apart, and the hub
+        // would install the same certificate twice while losing track
+        // of what it is actually serving.
+        use crate::tls::pairs::{CERT_A, CERT_B, KEY_A, KEY_B};
+
+        let dir = std::env::temp_dir().join(format!("anago-renewed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("fullchain.pem");
+        let key = dir.join("privkey.pem");
+        std::fs::write(&cert, CERT_A).unwrap();
+        std::fs::write(&key, KEY_A).unwrap();
+        let settings = state::Tls::manual(cert.to_str().unwrap(), key.to_str().unwrap());
+
+        let listening = tls::Listening::new(tls::load(&cert, &key).expect("the first pair"));
+        let listener = listening.config();
+
+        // `renew_once` from the point the certificate arrives: the
+        // files are written, loaded and validated, and presented.
+        std::fs::write(&cert, CERT_B).unwrap();
+        std::fs::write(&key, KEY_B).unwrap();
+        listening.present(tls::load(&cert, &key).expect("the renewed pair"));
+        let presented = listener.get_inner();
+
+        refresh(&listening, &settings);
+        assert!(
+            Arc::ptr_eq(&presented, &listener.get_inner()),
+            "the certificate anago had just renewed was installed a second time"
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

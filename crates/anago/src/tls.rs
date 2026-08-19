@@ -12,7 +12,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -23,6 +23,12 @@ use rustls::ServerConfig;
 #[derive(Debug)]
 pub struct LoadedTls {
     pub config: ServerConfig,
+    /// What this configuration presents, kept so a later look at the
+    /// files can tell "the same certificate" from "a new one". A
+    /// `ServerConfig` hands its chain to a resolver and does not give
+    /// it back, so the only way to answer that question later is to
+    /// have kept it.
+    pub chain: Chain,
     /// Non-fatal complaints — a key file others can read, say. The
     /// certificate is still usable, so this is a warning and not a
     /// refusal: the file may belong to a certbot or Cloudflare layout
@@ -49,6 +55,7 @@ pub fn load(cert_path: &Path, key_path: &Path) -> Result<LoadedTls, TlsError> {
         path: key_path.to_path_buf(),
         error,
     })?;
+    let chain = Chain(certs.clone());
     let config = build_from_parts(certs, key).map_err(|error| TlsError::Pair {
         cert_path: cert_path.to_path_buf(),
         key_path: key_path.to_path_buf(),
@@ -59,7 +66,11 @@ pub fn load(cert_path: &Path, key_path: &Path) -> Result<LoadedTls, TlsError> {
     if let Some(warning) = permission_warning(key_path, mode_of(key_path)) {
         warnings.push(warning);
     }
-    Ok(LoadedTls { config, warnings })
+    Ok(LoadedTls {
+        config,
+        chain,
+        warnings,
+    })
 }
 
 /// Builds a server config from PEM bytes. Pure — every failure below is
@@ -190,21 +201,131 @@ pub async fn serve(addr: SocketAddr, tls: Reloadable, app: Router) -> io::Result
 /// for.
 pub type Reloadable = axum_server::tls_rustls::RustlsConfig;
 
-/// A handle the listener will read from.
-pub fn reloadable(config: ServerConfig) -> Reloadable {
-    Reloadable::from_config(Arc::new(config))
+/// What the hub is presenting: the handle the listener reads, and the
+/// chain that went into it.
+///
+/// **One value and not two.** The two have to move together — a handle
+/// swapped without recording what went into it leaves the next look at
+/// the files comparing against a certificate that is no longer being
+/// served, and then the swap that would put the disk back in front of
+/// the listener never happens. Keeping them behind one lock is the only
+/// way to make that state unreachable rather than merely avoided.
+#[derive(Debug)]
+pub struct Listening {
+    handle: Reloadable,
+    /// Behind the same lock as the swap, so no look can land between
+    /// the two halves of one change.
+    serving: Mutex<Chain>,
 }
 
-/// Puts an already-loaded certificate in front of the listener.
+impl Listening {
+    pub fn new(loaded: LoadedTls) -> Listening {
+        Listening {
+            handle: Reloadable::from_config(Arc::new(loaded.config)),
+            serving: Mutex::new(loaded.chain),
+        }
+    }
+
+    /// The handle to hand the listener. Cloning it shares the same live
+    /// configuration rather than copying it, which is what makes
+    /// [`Listening::present`] visible to a listener already running.
+    pub fn config(&self) -> Reloadable {
+        self.handle.clone()
+    }
+
+    /// Puts an already-loaded certificate in front of the listener.
+    ///
+    /// **This cannot fail, and that is the point.** Reading and
+    /// validating the new pair is [`load`]'s job and belongs *before*
+    /// the state file is written; if the swap could fail after that, a
+    /// hub would record a renewal it is not actually serving and then
+    /// sit on the old certificate until it expired — the next check
+    /// would see a fresh `renew_after` and do nothing (§9.1).
+    pub fn present(&self, loaded: LoadedTls) {
+        let mut serving = self.lock();
+        self.handle.reload_from_config(Arc::new(loaded.config));
+        *serving = loaded.chain;
+    }
+
+    /// Compares a read of the files against what is being presented and
+    /// acts on the answer, both under the one lock.
+    ///
+    /// The decision itself is [`reload`] and is pure; this adds the
+    /// swap, so that "decided to swap" and "swapped" cannot come apart.
+    pub fn take(&self, found: Result<LoadedTls, TlsError>) -> Reload {
+        let mut serving = self.lock();
+        match reload(&serving, found.as_ref().map(|loaded| &loaded.chain)) {
+            Reload::Swap => {
+                let loaded = found.expect("Reload::Swap only comes from a pair that loaded");
+                self.handle.reload_from_config(Arc::new(loaded.config));
+                *serving = loaded.chain;
+                Reload::Swap
+            }
+            decided => decided,
+        }
+    }
+
+    /// A poisoned lock means a panic while a swap was half-made; the
+    /// certificate the handle holds is still a whole one either way, so
+    /// going on with it beats taking the hub down.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Chain> {
+        self.serving.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// The certificate chain a listener is presenting — leaf first, exactly
+/// the bytes a client is handed.
 ///
-/// **This cannot fail, and that is the point.** Reading and validating
-/// the new pair is [`load`]'s job and belongs *before* the state file
-/// is written; if the swap could fail after that, a hub would record a
-/// renewal it is not actually serving and then sit on the old
-/// certificate until it expired — the next check would see a fresh
-/// `renew_after` and do nothing (§9.1).
-pub fn swap(handle: &Reloadable, config: ServerConfig) {
-    handle.reload_from_config(Arc::new(config));
+/// The whole chain and not just the leaf: a CA that changes which
+/// intermediate it cross-signs from reissues the same leaf under a
+/// different chain, and a hub that called that "unchanged" would serve
+/// the old intermediates until somebody restarted it. Order counts for
+/// the same reason — it is what goes on the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chain(Vec<CertificateDer<'static>>);
+
+/// What the periodic look at the certificate files should do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reload {
+    /// The files hold what the listener already presents. This is also
+    /// the answer right after anago's own renewal, which presents the
+    /// pair it has just validated rather than waiting for this check.
+    Unchanged,
+    /// A different chain, and it loads: put it in front of the listener.
+    Swap,
+    /// The files are not a usable pair *right now*. The certificate
+    /// already in front of the listener keeps working, so this is a
+    /// complaint and not a stop.
+    Keep(String),
+}
+
+/// Decides whether what is on disk should replace what the listener is
+/// presenting (DESIGN.md §9.1).
+///
+/// Pure, and it takes the outcome of the read rather than doing it, so
+/// every case below is a test rather than a filesystem to arrange.
+///
+/// The comparison is on the chain and not on the files, because what a
+/// client sees is the chain: a hub told to read a different path that
+/// happens to hold the same certificate has nothing to swap, and a
+/// certbot that rewrites the same path every 60 days has everything to.
+///
+/// [`Reload::Keep`] is the case worth being careful about. Tools that
+/// renew certificates do not write both halves at once — certbot writes
+/// `fullchain.pem` and `privkey.pem` as two files — so a check that
+/// lands in that gap sees a certificate that does not match its key.
+/// Tearing down a working listener for that would turn a renewal into
+/// an outage; the old certificate is still valid, so the hub keeps it
+/// and looks again at the next check.
+pub fn reload(serving: &Chain, found: Result<&Chain, &TlsError>) -> Reload {
+    match found {
+        Ok(chain) if chain == serving => Reload::Unchanged,
+        Ok(_) => Reload::Swap,
+        Err(error) => Reload::Keep(format!(
+            "{error} — the hub is still serving the certificate it already has, and \
+             will look again at the next check"
+        )),
+    }
 }
 
 /// Why some PEM bytes are not a usable certificate and key.
@@ -297,17 +418,22 @@ impl fmt::Display for TlsError {
 
 impl std::error::Error for TlsError {}
 
+/// Two throwaway self-signed pairs, so the tests here and in
+/// [`crate::serve`] can swap one real certificate for another rather
+/// than a stub for a stub. Generated for these tests; the keys are
+/// public by construction and belong to nothing.
+#[cfg(test)]
+pub mod pairs {
+    pub const CERT_A: &str = "-----BEGIN CERTIFICATE-----\nMIIBizCCATGgAwIBAgIUXys43iONJV3kteA847Y5xzoj17IwCgYIKoZIzj0EAwIw\nGjEYMBYGA1UEAwwPbmV0LmV4YW1wbGUuY29tMCAXDTI2MDgxOTAxMDMzMVoYDzIx\nMjYwNzI2MDEwMzMxWjAaMRgwFgYDVQQDDA9uZXQuZXhhbXBsZS5jb20wWTATBgcq\nhkjOPQIBBggqhkjOPQMBBwNCAASIPDFfU6+LAbNbhiXtHYBvPGNb5Lp0tn3wCtNs\nCWrwvUKevnHcY3CpHbUPD9kvdFLf4iBc+1X1GrobIk/QuNyyo1MwUTAdBgNVHQ4E\nFgQUsKLJkykZ5Mf5ggjV7x7w60lfNB0wHwYDVR0jBBgwFoAUsKLJkykZ5Mf5ggjV\n7x7w60lfNB0wDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNIADBFAiAv3pv/\nBs1Xj/35QG7dLCSCdtW5I6IDtUczwK65XhZyLAIhAOtE22DgWemYIHCCivp6FbtW\n/g/Xq40tYP8VUqc3Fj3Q\n-----END CERTIFICATE-----\n";
+    pub const KEY_A: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgp10L63N+7ARRCawO\n8pJL1eNELGVFFaLLNTSTOMxnDyehRANCAASIPDFfU6+LAbNbhiXtHYBvPGNb5Lp0\ntn3wCtNsCWrwvUKevnHcY3CpHbUPD9kvdFLf4iBc+1X1GrobIk/QuNyy\n-----END PRIVATE KEY-----\n";
+    pub const CERT_B: &str = "-----BEGIN CERTIFICATE-----\nMIIBizCCATGgAwIBAgIUE6efSE+EQmY2ekTk7j/rS4NRFSwwCgYIKoZIzj0EAwIw\nGjEYMBYGA1UEAwwPaHViLmV4YW1wbGUuY29tMCAXDTI2MDgxOTAxMDMzMVoYDzIx\nMjYwNzI2MDEwMzMxWjAaMRgwFgYDVQQDDA9odWIuZXhhbXBsZS5jb20wWTATBgcq\nhkjOPQIBBggqhkjOPQMBBwNCAATEhl6fe5R+QSX6ZKriCNz2c8SL6Wya5KzML+3r\nFRrvUhoVa5lxmlUrP4orq6b4+kenCMqRoz96ppNvzYxxgq0ro1MwUTAdBgNVHQ4E\nFgQU6+bq37P6bQZEe33mpuCwWKQxGt4wHwYDVR0jBBgwFoAU6+bq37P6bQZEe33m\npuCwWKQxGt4wDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNIADBFAiEA0Ijg\nGiMB5fb4jBmzBBXwqBc5ZiMs133hw97eDNUvRnUCIC98UgP1FrpeMv0eIOnNC+i1\n6Fw/trHxdI/h+9TYS+AQ\n-----END CERTIFICATE-----\n";
+    pub const KEY_B: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgX7aCvnsuEiXKyS/s\ntWHFaxT7bXCgzf2oEe+7ZBlLEDuhRANCAATEhl6fe5R+QSX6ZKriCNz2c8SL6Wya\n5KzML+3rFRrvUhoVa5lxmlUrP4orq6b4+kenCMqRoz96ppNvzYxxgq0r\n-----END PRIVATE KEY-----\n";
+}
+
 #[cfg(test)]
 mod tests {
 
-    /// A throwaway self-signed pair, so that the reload below swaps one
-    /// real certificate for another rather than a stub for a stub.
-    /// Generated for these tests; the key is public by construction and
-    /// belongs to nothing.
-    const CERT_A: &str = "-----BEGIN CERTIFICATE-----\nMIIBizCCATGgAwIBAgIUXys43iONJV3kteA847Y5xzoj17IwCgYIKoZIzj0EAwIw\nGjEYMBYGA1UEAwwPbmV0LmV4YW1wbGUuY29tMCAXDTI2MDgxOTAxMDMzMVoYDzIx\nMjYwNzI2MDEwMzMxWjAaMRgwFgYDVQQDDA9uZXQuZXhhbXBsZS5jb20wWTATBgcq\nhkjOPQIBBggqhkjOPQMBBwNCAASIPDFfU6+LAbNbhiXtHYBvPGNb5Lp0tn3wCtNs\nCWrwvUKevnHcY3CpHbUPD9kvdFLf4iBc+1X1GrobIk/QuNyyo1MwUTAdBgNVHQ4E\nFgQUsKLJkykZ5Mf5ggjV7x7w60lfNB0wHwYDVR0jBBgwFoAUsKLJkykZ5Mf5ggjV\n7x7w60lfNB0wDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNIADBFAiAv3pv/\nBs1Xj/35QG7dLCSCdtW5I6IDtUczwK65XhZyLAIhAOtE22DgWemYIHCCivp6FbtW\n/g/Xq40tYP8VUqc3Fj3Q\n-----END CERTIFICATE-----\n";
-    const KEY_A: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgp10L63N+7ARRCawO\n8pJL1eNELGVFFaLLNTSTOMxnDyehRANCAASIPDFfU6+LAbNbhiXtHYBvPGNb5Lp0\ntn3wCtNsCWrwvUKevnHcY3CpHbUPD9kvdFLf4iBc+1X1GrobIk/QuNyy\n-----END PRIVATE KEY-----\n";
-    const CERT_B: &str = "-----BEGIN CERTIFICATE-----\nMIIBizCCATGgAwIBAgIUE6efSE+EQmY2ekTk7j/rS4NRFSwwCgYIKoZIzj0EAwIw\nGjEYMBYGA1UEAwwPaHViLmV4YW1wbGUuY29tMCAXDTI2MDgxOTAxMDMzMVoYDzIx\nMjYwNzI2MDEwMzMxWjAaMRgwFgYDVQQDDA9odWIuZXhhbXBsZS5jb20wWTATBgcq\nhkjOPQIBBggqhkjOPQMBBwNCAATEhl6fe5R+QSX6ZKriCNz2c8SL6Wya5KzML+3r\nFRrvUhoVa5lxmlUrP4orq6b4+kenCMqRoz96ppNvzYxxgq0ro1MwUTAdBgNVHQ4E\nFgQU6+bq37P6bQZEe33mpuCwWKQxGt4wHwYDVR0jBBgwFoAU6+bq37P6bQZEe33m\npuCwWKQxGt4wDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNIADBFAiEA0Ijg\nGiMB5fb4jBmzBBXwqBc5ZiMs133hw97eDNUvRnUCIC98UgP1FrpeMv0eIOnNC+i1\n6Fw/trHxdI/h+9TYS+AQ\n-----END CERTIFICATE-----\n";
-    const KEY_B: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgX7aCvnsuEiXKyS/s\ntWHFaxT7bXCgzf2oEe+7ZBlLEDuhRANCAATEhl6fe5R+QSX6ZKriCNz2c8SL6Wya\n5KzML+3rFRrvUhoVa5lxmlUrP4orq6b4+kenCMqRoz96ppNvzYxxgq0r\n-----END PRIVATE KEY-----\n";
+    use super::pairs::{CERT_A, CERT_B, KEY_A, KEY_B};
     use super::*;
     use std::fs;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -587,25 +713,28 @@ mod tests {
         std::fs::write(&cert, CERT_A).unwrap();
         std::fs::write(&key, KEY_A).unwrap();
 
-        let loaded = load(&cert, &key).expect("the first pair");
-        let handle = reloadable(loaded.config);
-        let before = handle.get_inner();
+        let listening = Listening::new(load(&cert, &key).expect("the first pair"));
+        // The handle the listener was given at startup, held on to for
+        // the length of the run.
+        let listener = listening.config();
+        let before = listener.get_inner();
 
         // What a renewal does: replace both files, load the new pair,
-        // and only then swap it in.
+        // and only then present it.
         std::fs::write(&cert, CERT_B).unwrap();
         std::fs::write(&key, KEY_B).unwrap();
         let renewed = load(&cert, &key).expect("the renewed pair");
-        swap(&handle, renewed.config);
+        assert_eq!(reload(&listening.lock(), Ok(&renewed.chain)), Reload::Swap);
+        listening.present(renewed);
 
-        let after = handle.get_inner();
+        let after = listener.get_inner();
         assert!(
             !Arc::ptr_eq(&before, &after),
             "the listener is still holding the configuration it started with"
         );
         // And the handle the listener holds is the same one — the swap
         // happens underneath it, not beside it.
-        assert!(Arc::ptr_eq(&after, &handle.get_inner()));
+        assert!(Arc::ptr_eq(&after, &listener.get_inner()));
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -623,8 +752,8 @@ mod tests {
         std::fs::write(&cert, CERT_A).unwrap();
         std::fs::write(&key, KEY_A).unwrap();
 
-        let handle = reloadable(load(&cert, &key).expect("the first pair").config);
-        let before = handle.get_inner();
+        let listener = Listening::new(load(&cert, &key).expect("the first pair")).config();
+        let before = listener.get_inner();
 
         // The certificate of one pair with the key of another. The
         // load fails, so there is nothing to swap — the failure lands
@@ -632,10 +761,173 @@ mod tests {
         std::fs::write(&cert, CERT_B).unwrap();
         assert!(load(&cert, &key).is_err());
         assert!(
-            Arc::ptr_eq(&before, &handle.get_inner()),
+            Arc::ptr_eq(&before, &listener.get_inner()),
             "a mismatched pair was put in front of the listener"
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_certificate_that_has_not_changed_is_not_swapped_in_again() {
+        // The check runs every hour and a certificate lasts ninety
+        // days, so "nothing to do" is the answer almost every time.
+        // It is also the answer right after anago's own renewal, which
+        // has already put the pair it validated in front of the
+        // listener — one swap, not two.
+        let a = chain(CERT_A);
+        assert_eq!(reload(&a, Ok(&a.clone())), Reload::Unchanged);
+        assert_eq!(reload(&a, Ok(&chain(CERT_B))), Reload::Swap);
+    }
+
+    #[test]
+    fn a_new_intermediate_is_a_new_chain_even_under_the_same_leaf() {
+        // Regression: comparing only the leaf would call this
+        // unchanged. A CA that starts cross-signing from a different
+        // intermediate reissues the same leaf under a new chain, and a
+        // hub that kept the old intermediates would hand clients a
+        // chain they cannot build a path from — until somebody
+        // restarted it.
+        let leaf_only = chain(CERT_A);
+        let with_intermediate =
+            Chain(parse_certs(format!("{CERT_A}{CERT_B}").as_bytes()).expect("two certificates"));
+        assert_eq!(reload(&leaf_only, Ok(&with_intermediate)), Reload::Swap);
+        assert_eq!(reload(&with_intermediate, Ok(&leaf_only)), Reload::Swap);
+
+        // And order is part of it: the chain is what goes on the wire,
+        // leaf first.
+        let reversed = Chain({
+            let mut certs = with_intermediate.0.clone();
+            certs.reverse();
+            certs
+        });
+        assert_eq!(reload(&with_intermediate, Ok(&reversed)), Reload::Swap);
+    }
+
+    #[test]
+    fn a_pair_caught_half_written_does_not_take_the_hub_down() {
+        // certbot writes fullchain.pem and privkey.pem as two files. A
+        // check that lands between them sees a certificate that does
+        // not match its key — for a second, once every sixty days.
+        // Refusing to serve over that would turn a renewal into an
+        // outage; the certificate already in front of the listener is
+        // still valid, so it stays.
+        let serving = chain(CERT_A);
+        let mid_write = TlsError::Pair {
+            cert_path: PathBuf::from("/etc/letsencrypt/live/net.example.com/fullchain.pem"),
+            key_path: PathBuf::from("/etc/letsencrypt/live/net.example.com/privkey.pem"),
+            error: PemError::Rejected("key does not match certificate".to_string()),
+        };
+        let Reload::Keep(why) = reload(&serving, Err(&mid_write)) else {
+            panic!("a half-written pair must not disturb the listener");
+        };
+        assert!(why.contains("still serving"), "{why}");
+        assert!(why.contains("look again"), "{why}");
+        // The message keeps the original diagnosis, so a file that is
+        // broken for good rather than for a second can be told apart.
+        assert!(why.contains("fullchain.pem"), "{why}");
+        assert!(why.contains("do they belong together?"), "{why}");
+
+        // A file that was deleted reads the same way: the hub goes on
+        // serving, and says what it could not read.
+        let gone = TlsError::Io {
+            path: PathBuf::from("/etc/ssl/anago/fullchain.pem"),
+            kind: io::ErrorKind::NotFound,
+            hint: io_hint(io::ErrorKind::NotFound),
+        };
+        assert!(matches!(reload(&serving, Err(&gone)), Reload::Keep(_)));
+    }
+
+    #[test]
+    fn a_certificate_replaced_by_another_process_reaches_the_listener() {
+        // The gap this closes: a manual hub whose certbot renews the
+        // file, or a `server renew` typed by hand while the hub runs.
+        // Neither goes through the renewal that presents its own pair,
+        // so without this look the listener presents the old
+        // certificate until somebody restarts the process.
+        let dir = std::env::temp_dir().join(format!("anago-tls-reload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("fullchain.pem");
+        let key = dir.join("privkey.pem");
+        std::fs::write(&cert, CERT_A).unwrap();
+        std::fs::write(&key, KEY_A).unwrap();
+
+        let listening = Listening::new(load(&cert, &key).expect("the first pair"));
+        let listener = listening.config();
+        let started_with = listener.get_inner();
+
+        // Nothing has changed yet.
+        assert_eq!(listening.take(load(&cert, &key)), Reload::Unchanged);
+        assert!(Arc::ptr_eq(&started_with, &listener.get_inner()));
+
+        // Somebody else wrote the certificate half and not yet the key.
+        std::fs::write(&cert, CERT_B).unwrap();
+        assert!(matches!(listening.take(load(&cert, &key)), Reload::Keep(_)));
+        assert!(
+            Arc::ptr_eq(&started_with, &listener.get_inner()),
+            "a mismatched pair was put in front of the listener"
+        );
+
+        // And now the key half.
+        std::fs::write(&key, KEY_B).unwrap();
+        assert_eq!(listening.take(load(&cert, &key)), Reload::Swap);
+        let swapped = listener.get_inner();
+        assert!(!Arc::ptr_eq(&started_with, &swapped));
+
+        // The next look has nothing to do — which is how the hub knows
+        // the renewal actually reached the listener.
+        assert_eq!(listening.take(load(&cert, &key)), Reload::Unchanged);
+        assert!(Arc::ptr_eq(&swapped, &listener.get_inner()));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn presenting_a_certificate_moves_the_handle_and_the_record_together() {
+        // Regression: `present` used to change the handle and leave the
+        // chain it compares against untouched, which is the state
+        // anago's own renewal ends in. Two things went wrong from
+        // there — the very next look called the certificate it had just
+        // installed "different" and installed it again, and a file put
+        // back to the *previous* certificate read as "unchanged", so
+        // the listener went on serving one certificate while the disk
+        // held another with nothing left to notice it.
+        let dir = std::env::temp_dir().join(format!("anago-tls-present-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("fullchain.pem");
+        let key = dir.join("privkey.pem");
+        std::fs::write(&cert, CERT_A).unwrap();
+        std::fs::write(&key, KEY_A).unwrap();
+
+        let listening = Listening::new(load(&cert, &key).expect("the first pair"));
+        let listener = listening.config();
+
+        // What a renewal does: write the pair, load it, present it.
+        std::fs::write(&cert, CERT_B).unwrap();
+        std::fs::write(&key, KEY_B).unwrap();
+        let renewed = load(&cert, &key).expect("the renewed pair");
+        listening.present(renewed);
+        let presented = listener.get_inner();
+
+        // The look that follows a renewal finds it already done.
+        assert_eq!(listening.take(load(&cert, &key)), Reload::Unchanged);
+        assert!(
+            Arc::ptr_eq(&presented, &listener.get_inner()),
+            "the certificate anago had just installed was installed again"
+        );
+
+        // And a rollback on disk is seen for what it is, rather than
+        // read as "the same as what I remember".
+        std::fs::write(&cert, CERT_A).unwrap();
+        std::fs::write(&key, KEY_A).unwrap();
+        assert_eq!(listening.take(load(&cert, &key)), Reload::Swap);
+        assert!(!Arc::ptr_eq(&presented, &listener.get_inner()));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The chain of a one-certificate PEM, for the comparisons above.
+    fn chain(pem: &str) -> Chain {
+        Chain(parse_certs(pem.as_bytes()).expect("a certificate"))
     }
 }
