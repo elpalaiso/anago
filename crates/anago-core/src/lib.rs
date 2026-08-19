@@ -10,6 +10,7 @@ pub mod dnswire;
 pub mod json;
 pub mod name;
 pub mod proto;
+pub mod qr;
 pub mod render;
 pub mod state;
 pub mod subnet;

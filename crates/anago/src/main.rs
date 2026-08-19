@@ -33,6 +33,7 @@ mod join;
 mod launchd;
 mod ls;
 mod paths;
+mod qrcode;
 mod renew;
 mod rm;
 mod secret;
@@ -331,24 +332,18 @@ fn export_phone(args: &cli::Join, export: cli::Export) -> ! {
         eprintln!("anago: --export needs --name");
         std::process::exit(EXIT_USAGE);
     };
-    let out = match export {
-        cli::Export::Conf { out } => out,
-        cli::Export::Qr => {
-            eprintln!("anago: drawing the config as a QR code is not wired up yet — the");
-            eprintln!("       flags are understood, but the encoder lands next. Nothing was");
-            eprintln!("       registered, so the join code is still good. `--export conf`");
-            eprintln!("       hands over the same config as text.");
-            std::process::exit(EXIT_FAILED);
-        }
+    // The width is asked for before the hub is, so a window too narrow
+    // to draw in costs nothing: the join code is still unspent when it
+    // refuses.
+    let to = match &export {
+        cli::Export::Conf { out: Some(path) } => join::Handover::File(path),
+        cli::Export::Conf { out: None } => join::Handover::Text,
+        cli::Export::Qr => join::Handover::Qr {
+            columns: qrcode::columns(),
+        },
     };
 
-    match join::export_conf(
-        &args.domain,
-        &args.code,
-        &name,
-        args.api_port,
-        out.as_deref(),
-    ) {
+    match join::export_conf(&args.domain, &args.code, &name, args.api_port, to) {
         Ok(exported) => {
             // The config itself has already gone to stdout or to the
             // file; everything else goes to stderr, so a pipe carries
@@ -358,7 +353,7 @@ fn export_phone(args: &cli::Join, export: cli::Export) -> ! {
                 address = exported.config.address,
                 subnet = exported.config.subnet
             );
-            eprint!("{}", join::export_note(&name, exported.out.as_deref()));
+            eprint!("{}", join::export_note(&name, &exported.handed));
             std::process::exit(0);
         }
         Err(e) => {

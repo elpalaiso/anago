@@ -385,9 +385,22 @@ pub fn run(
 #[derive(Debug)]
 pub struct Exported {
     pub config: DeviceConfig,
-    /// The file the config went into, or `None` when it went to
-    /// standard output.
-    pub out: Option<PathBuf>,
+    /// Which way the config left, so the note that follows can say the
+    /// right thing about where it is now.
+    pub handed: Handed,
+}
+
+/// Which way a config left this machine.
+///
+/// The same three shapes as [`Handover`], minus what only the run
+/// needed. They are apart because what a person has to do next differs
+/// in each: a file to delete, a scrollback to clear, or a picture on a
+/// screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Handed {
+    Text,
+    File(PathBuf),
+    Qr,
 }
 
 /// Registers a **phone** and hands over its config (§8, §7.3).
@@ -416,18 +429,66 @@ pub struct Exported {
 ///
 /// **Human verification needed**: runs `wg genkey` and talks to a real
 /// hub.
+/// Where an export puts the config it renders.
+///
+/// The rendered text never comes back to the caller. A [`SecretText`]
+/// travelling up the call stack would only widen the set of places a
+/// private key can be printed from by accident (§7.3), so the thing
+/// that will consume it is handed *in*.
+pub enum Handover<'a> {
+    /// `--export conf` with no `--out`: the config text, on stdout.
+    Text,
+    /// `--export conf --out <p>`: the config text, in a file at 0600.
+    File(&'a Path),
+    /// `--export qr`: drawn on the terminal, in `columns` of it. Never
+    /// a file — anago writes no image files (§10.2), and a QR is only
+    /// ever looked at.
+    Qr { columns: usize },
+}
+
+impl Handover<'_> {
+    /// The file this will take before the code is spent, if any.
+    fn claims(&self) -> Option<&Path> {
+        match self {
+            Handover::File(path) => Some(path),
+            Handover::Text | Handover::Qr { .. } => None,
+        }
+    }
+
+    fn handed(&self) -> Handed {
+        match self {
+            Handover::Text => Handed::Text,
+            Handover::File(path) => Handed::File(path.to_path_buf()),
+            Handover::Qr { .. } => Handed::Qr,
+        }
+    }
+}
+
 pub fn export_conf(
     domain: &str,
     code: &JoinCode,
     name: &DeviceName,
     api_port: u16,
-    out: Option<&Path>,
+    to: Handover<'_>,
 ) -> Result<Exported, JoinError> {
     // `wg` alone: this makes a keypair and brings no interface up, so
     // asking for `wg-quick` would refuse a machine that can do all of
     // it, in a sentence about a program it never runs.
     wg::check_keygen_from_env().map_err(JoinError::Wg)?;
-    let mut claimed = match out {
+    // Still before the code is spent: a window that could not hold the
+    // smallest QR there is cannot hold whatever the hub answers with
+    // either. The exact size needs the answer, so the rest of that
+    // check waits — but this half costs nothing and saves a code.
+    if let Handover::Qr { columns } = to {
+        let floor = anago_core::qr::columns(anago_core::qr::SMALLEST, anago_core::qr::Blocks::Half);
+        if columns < floor {
+            return Err(JoinError::TooNarrow {
+                needed: floor,
+                available: columns,
+            });
+        }
+    }
+    let mut claimed = match to.claims() {
         Some(path) => Some(Claimed::take(path)?),
         None => None,
     };
@@ -455,6 +516,7 @@ pub fn export_conf(
         domain,
         api_port,
         private_key,
+        &to,
         claimed.as_mut(),
     ) {
         Ok(config) => {
@@ -463,7 +525,7 @@ pub fn export_conf(
             }
             Ok(Exported {
                 config,
-                out: out.map(Path::to_path_buf),
+                handed: to.handed(),
             })
         }
         Err(e) => Err(post_registration(&response.body, domain, api_port, &e)),
@@ -482,21 +544,56 @@ fn hand_over(
     domain: &str,
     api_port: u16,
     private_key: PrivateKey,
+    to: &Handover<'_>,
     claimed: Option<&mut Claimed>,
 ) -> Result<DeviceConfig, JoinError> {
     let (config, profile) = accepted(body, domain, api_port, private_key)?;
     let text = wgconf::export_profile(&profile);
-    match claimed {
-        Some(claimed) => claimed.fill(&text)?,
-        None => {
-            let mut stdout = std::io::stdout().lock();
-            stdout
-                .write_all(text.expose().as_bytes())
-                .and_then(|()| stdout.flush())
-                .map_err(|e| JoinError::Unsent(e.to_string()))?;
+    match to {
+        Handover::File(_) => match claimed {
+            Some(claimed) => claimed.fill(&text)?,
+            // Only reachable if `claims` and this ever disagreed about
+            // which endings take a file.
+            None => return Err(JoinError::Unsent("no file was claimed".to_string())),
+        },
+        Handover::Text => to_stdout(text.expose())?,
+        Handover::Qr { columns } => {
+            let drawn = drawn_code(&text, *columns)?;
+            to_stdout(&drawn)?;
         }
     }
     Ok(config)
+}
+
+/// The config as a QR code, ready to print.
+///
+/// The encoder is the binary's (§10.2); everything from the module grid
+/// on is [`anago_core::qr`], where it is unit-tested. A window too
+/// narrow is an error rather than a smaller code: a QR wider than the
+/// terminal wraps, and a wrapped one still looks like a QR.
+fn drawn_code(text: &wgconf::SecretText, columns: usize) -> Result<String, JoinError> {
+    let modules = crate::qrcode::encode(text).ok_or_else(|| {
+        // A wg config is a few hundred bytes and the largest version
+        // holds thousands, so this is unreachable short of a hub
+        // answering with something enormous.
+        JoinError::BadResponse("the config is too long to put in a QR code".to_string())
+    })?;
+    match anago_core::qr::draw(&modules, columns) {
+        anago_core::qr::Drawing::Code(text) => Ok(text),
+        anago_core::qr::Drawing::TooNarrow { needed, available } => {
+            Err(JoinError::TooNarrow { needed, available })
+        }
+    }
+}
+
+/// Writes the body out, and turns a closed pipe into an error the undo
+/// path understands.
+fn to_stdout(text: &str) -> Result<(), JoinError> {
+    let mut stdout = std::io::stdout().lock();
+    stdout
+        .write_all(text.as_bytes())
+        .and_then(|()| stdout.flush())
+        .map_err(|e| JoinError::Unsent(e.to_string()))
 }
 
 /// A `--out` file, created before the join and deleted unless it is
@@ -618,10 +715,10 @@ impl Drop for Claimed {
 /// but detecting that would mean two behaviours to reason about and one
 /// of them wrong whenever the guess missed. The same sentence every
 /// time is the one that can be relied on.
-pub fn export_note(name: &DeviceName, out: Option<&Path>) -> String {
+pub fn export_note(name: &DeviceName, handed: &Handed) -> String {
     let mut note = String::from("This is the phone's private key, in plain text.\n\n");
-    match out {
-        Some(path) => note.push_str(&indented(&[
+    match handed {
+        Handed::File(path) => note.push_str(&indented(&[
             &format!(
                 "It is in {} (0600). Move it to the phone, then",
                 path.display()
@@ -633,7 +730,7 @@ pub fn export_note(name: &DeviceName, out: Option<&Path>) -> String {
             "folders are the real risk — a .conf left in",
             "~/Documents copies itself somewhere quietly.",
         ])),
-        None => note.push_str(&indented(&[
+        Handed::Text => note.push_str(&indented(&[
             "Move it to the phone, then clear this terminal's",
             "scrollback — `clear` does not do that, and some",
             "terminals keep scrollback on disk. Over SSH it is in",
@@ -643,6 +740,18 @@ pub fn export_note(name: &DeviceName, out: Option<&Path>) -> String {
             "takes its mode from your umask, which is usually 0644.",
             "anago's own file is 0600, and never replaces one that",
             "is already there.",
+        ])),
+        // The same key, as a picture. `--out` is not the advice here:
+        // `--export qr` takes none, because anago writes no image
+        // files (§10.2).
+        Handed::Qr => note.push_str(&indented(&[
+            "Scan it, then clear this terminal's scrollback — `clear`",
+            "does not do that, and some terminals keep scrollback on",
+            "disk. A photograph of the screen keeps it too, and a QR",
+            "is the shape people photograph.",
+            "",
+            "For a file instead, `--export conf --out <path>` writes",
+            "one at 0600.",
         ])),
     }
     note.push('\n');
@@ -1198,6 +1307,8 @@ pub enum JoinError {
     /// The `--out` name stopped meaning the file anago created, while
     /// the hub was being asked.
     Taken(PathBuf),
+    /// The terminal is too narrow to draw the code in.
+    TooNarrow { needed: usize, available: usize },
     /// An existing `device.json` could not be read — raised by
     /// [`DeviceConfig::parse`], and so reached through `ls`/`rm` as
     /// well as through a re-`join`.
@@ -1277,6 +1388,13 @@ impl fmt::Display for JoinError {
                  the config went into a file that no longer has that name — whatever \
                  is there now was left alone, and is not it",
                 path.display()
+            ),
+            JoinError::TooNarrow { needed, available } => write!(
+                f,
+                "this terminal is {available} columns and the code needs {needed} — a \
+                 QR wider than the window wraps, and a wrapped one still looks like a \
+                 QR code. Widen the window and run this again, or use `--export conf` \
+                 to hand the same config over as text"
             ),
             JoinError::DeviceFile(detail) => write!(f, "device file: {detail}"),
         }
@@ -1497,7 +1615,7 @@ mod tests {
     fn the_note_says_what_leaked_and_what_to_do_about_it() {
         let name = DeviceName::parse("폰").unwrap();
 
-        let piped = export_note(&name, None);
+        let piped = export_note(&name, &Handed::Text);
         assert!(piped.contains("private key, in plain text"), "{piped}");
         assert!(piped.contains("scrollback"), "{piped}");
         // §7.3: always, without looking at where stdout goes. A shell
@@ -1506,7 +1624,7 @@ mod tests {
         assert!(piped.contains("--out rather than `>`"), "{piped}");
         assert!(piped.contains("0644"), "{piped}");
 
-        let filed = export_note(&name, Some(Path::new("/home/jo/phone.conf")));
+        let filed = export_note(&name, &Handed::File(PathBuf::from("/home/jo/phone.conf")));
         assert!(filed.contains("/home/jo/phone.conf (0600)"), "{filed}");
         assert!(filed.contains("`rm /home/jo/phone.conf`"), "{filed}");
         // The risk that is specific to a file rather than a screen.
@@ -1515,7 +1633,15 @@ mod tests {
 
         // §8: the token is thrown away, so the phone cannot remove
         // itself and somebody has to be told where that happens.
-        for note in [piped, filed] {
+        // A QR takes no `--out` at all (§10.2), so sending somebody to
+        // one would be advice for a flag this path refuses.
+        let drawn = export_note(&name, &Handed::Qr);
+        assert!(drawn.contains("Scan it"), "{drawn}");
+        assert!(drawn.contains("photograph"), "{drawn}");
+        assert!(!drawn.contains("--out rather than"), "{drawn}");
+        assert!(drawn.contains("--export conf --out <path>"), "{drawn}");
+
+        for note in [piped, filed, drawn] {
             assert!(note.contains("The hub knows this phone as 폰"), "{note}");
             assert!(note.contains("`anago rm 폰`"), "{note}");
             // Laid out by hand, so no blank line carries invisible
@@ -1524,6 +1650,35 @@ mod tests {
                 assert_eq!(line, line.trim_end(), "{line:?}");
             }
         }
+    }
+
+    #[test]
+    fn a_window_that_could_never_hold_a_code_refuses_before_the_code_is_spent() {
+        // The exact size needs the hub's answer, so most of that check
+        // has to wait. This half does not: a window too narrow for the
+        // smallest QR there is could not hold whatever comes back
+        // either, and a join code is single use.
+        let floor = anago_core::qr::columns(anago_core::qr::SMALLEST, anago_core::qr::Blocks::Half);
+        assert_eq!(floor, 29, "version 1 plus its quiet zone, compact");
+
+        let e = JoinError::TooNarrow {
+            needed: 65,
+            available: 40,
+        };
+        assert!(e.to_string().contains("40 columns"), "{e}");
+        assert!(e.to_string().contains("needs 65"), "{e}");
+        // Both ways out: the one they can act on now, and the one that
+        // does not depend on the window at all.
+        assert!(e.to_string().contains("Widen the window"), "{e}");
+        assert!(e.to_string().contains("--export conf"), "{e}");
+        assert_eq!(e.to_string().lines().count(), 1, "{e}");
+
+        // Found after the answer, it goes out through the same door
+        // every post-registration failure does — the phone got nothing,
+        // so the hub must not keep a name and an address for it.
+        let after = post_registration(&body_with_credentials(), "net.example.com", 443, &e);
+        assert!(matches!(after, JoinError::SavedNothing { .. }), "{after:?}");
+        assert!(after.to_string().contains("Widen the window"), "{after}");
     }
 
     #[test]
