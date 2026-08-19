@@ -184,7 +184,7 @@ fn ask_hub(
         port: config.api_port(),
         path: PATH_PEERS,
         body: None,
-        token: Some(&token),
+        authorization: Some(&client::HeaderValue::device_token(&token)),
     })
     .map_err(LsError::Client)?;
 
@@ -217,10 +217,11 @@ pub fn explain(status: u16, body: &str, device_file: &Path, wg_config: &Path) ->
     let advice = match failure.code {
         Some(ErrorCode::Unauthorized) => format!(
             " — this device's token is no longer accepted, which is what `anago rm` on the \
-             hub does. To join again: `sudo wg-quick down {wg}`, delete {wg} and {device}, \
-             then `anago join <domain> <code>` with a fresh code from `anago code`",
-            wg = wg_config.display(),
-            device = device_file.display()
+             hub does. To use it again: {}",
+            render::rejoin_steps(
+                &wg_config.display().to_string(),
+                &device_file.display().to_string()
+            )
         ),
         _ => String::new(),
     };
@@ -271,7 +272,7 @@ mod tests {
 
     use anago_core::name::DeviceName;
     use anago_core::proto::PeerInfo;
-    use anago_core::state::{Peer, PrivateKey, ServerKeys};
+    use anago_core::state::{Peer, PrivateKey, ServerKeys, Tls};
     use anago_core::subnet::Subnet;
     use anago_core::token::TokenHash;
 
@@ -297,8 +298,8 @@ mod tests {
             subnet: Subnet::parse("10.100.0.0/24").unwrap(),
             listen_port: 51820,
             api_port: 443,
-            tls_cert_path: "/etc/ssl/anago/fullchain.pem".to_string(),
-            tls_key_path: "/etc/ssl/anago/privkey.pem".to_string(),
+            tls: Tls::manual("/etc/ssl/anago/fullchain.pem", "/etc/ssl/anago/privkey.pem"),
+            cloudflare: None,
             server: ServerKeys {
                 private_key: PrivateKey::new("c2VydmVyIHByaXZhdGU="),
                 public_key: "c2VydmVyIHB1YmxpYw==".to_string(),
@@ -387,6 +388,7 @@ mod tests {
                     address: "10.100.0.3".to_string(),
                 },
             ],
+            hub: None,
         };
         let rows = rows_from_response(&response).unwrap();
         assert_eq!(rows.len(), 2);
@@ -410,6 +412,7 @@ mod tests {
                 public_key: key.to_string(),
                 address: address.to_string(),
             }],
+            hub: None,
         };
 
         let e = rows_from_response(&peer("macbook", KEY_ONE, "not an address")).unwrap_err();

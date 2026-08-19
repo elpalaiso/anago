@@ -10,12 +10,18 @@
 //! `anago sync` deserves "M1, and here is why you do not need it yet"
 //! rather than "unknown command".
 
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
 use anago_core::code::JoinCode;
 use anago_core::name::DeviceName;
+use anago_core::state::Challenge;
 use anago_core::subnet::Subnet;
 use std::fmt;
 
+use crate::acme::{self, PlanError};
 use crate::args::{ArgError, Flag, ParsedArgs};
+use crate::cfapi::{self, CfError, Source, Token};
 
 /// Defaults from §5 and §8, applied when the flag is absent.
 pub const DEFAULT_SUBNET: &str = "10.100.0.0/24";
@@ -26,9 +32,15 @@ pub const DEFAULT_API_PORT: u16 = 443;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     ServerInit(ServerInit),
+    /// `anago server renew` (§8): a certificate again, settings
+    /// changed, or just the A record.
+    ServerRenew(ServerRenew),
     /// The resident process (§8). systemd runs this; a person only
     /// types it after `server init --no-systemd`.
     ServerRun,
+    /// `anago sync` (§8): on a device, pull the peer list — or install
+    /// the timer that does.
+    Sync(Sync),
     Code,
     Join(Join),
     Ls,
@@ -39,12 +51,34 @@ pub enum Command {
     Version,
 }
 
-/// `anago server init` (§8, M0: manual DNS, existing certificate).
+/// `anago server init` (§8).
+///
+/// The certificate flags are optional in M1 and that is the whole
+/// fork: given, this is M0's manual path and ACME never runs; left out,
+/// anago orders and renews the certificate itself. Routing keeps them
+/// as they were typed rather than resolving the fork, because the
+/// answer also depends on the environment — see [`check_combination`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerInit {
     pub domain: String,
-    pub tls_cert: String,
-    pub tls_key: String,
+    /// `--tls-cert`/`--tls-key`. Both or neither.
+    pub tls_cert: Option<String>,
+    pub tls_key: Option<String>,
+    /// `--acme-email` — the address the CA warns before an expiry, and
+    /// the only alarm that reaches a person when renewal has quietly
+    /// stopped working (§8).
+    pub acme_email: Option<String>,
+    /// `--acme-staging`: order from Let's Encrypt's staging CA, whose
+    /// certificates are not publicly trusted.
+    pub acme_staging: bool,
+    /// `--acme-challenge`. `None` means "decide from whether there is
+    /// a token", which routing cannot know.
+    pub acme_challenge: Option<Challenge>,
+    /// `--cf-token`. Parsed here so a truncated paste is caught before
+    /// anything is generated, and redacted in `Debug` (§13).
+    pub cf_token: Option<Token>,
+    /// `--cf-token-file`, the form that keeps the secret out of argv.
+    pub cf_token_file: Option<String>,
     pub subnet: Subnet,
     pub listen_port: u16,
     pub api_port: u16,
@@ -52,16 +86,102 @@ pub struct ServerInit {
     pub systemd: bool,
 }
 
+/// `anago server renew` (§8).
+///
+/// Every field is "what was asked for", never "what the hub should end
+/// up with": a flag left out means *leave that alone*, which is why
+/// they are all optional and why the CA is a tri-state rather than a
+/// `bool`. Reading an absent `--acme-staging` as "production" would
+/// move a hub to a different CA on an ordinary renewal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerRenew {
+    /// Re-issue even though the certificate is not due.
+    pub force: bool,
+    /// Push the A record and stop.
+    pub dns_only: bool,
+    /// `--acme-staging` / `--acme-production`, or neither.
+    pub ca: Option<Ca>,
+    pub acme_email: Option<String>,
+    pub acme_challenge: Option<Challenge>,
+    pub cf_token: Option<Token>,
+    pub cf_token_file: Option<String>,
+}
+
+/// Which CA the hub should order from after this run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ca {
+    Staging,
+    Production,
+}
+
+/// `anago sync` (§8, §6.3).
+///
+/// Three shapes in one command: sync now, install the timer that syncs,
+/// or take that timer away. `timer` is what tells them apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sync {
+    /// `--quiet` — for the timer, which is why it is on the unit's
+    /// command line rather than sniffed from a tty (§8). Reading a
+    /// unit file should say why it is quiet.
+    pub quiet: bool,
+    /// `--config <path>`, the escape hatch from §9's XDG/`SUDO_UID`
+    /// rules — and the reason a timer can exist at all, since a unit
+    /// runs as root outside any user session.
+    pub config: Option<PathBuf>,
+    pub timer: Option<Timer>,
+}
+
+/// What to do about periodic runs (§8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Timer {
+    Install { interval: Duration },
+    Uninstall,
+}
+
+/// The default period (§6.3): most changes ask nothing of a client,
+/// and a removed device stops being routed the moment the hub drops the
+/// peer — so a late sync is late *news*, not late traffic.
+pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// Below this a timer costs more than it delivers and hammers the hub's
+/// API for nothing.
+pub const MIN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Above this the timer stops being a timer. A device that syncs once a
+/// day is one whose peer list is a day stale, and §6.3's promise is
+/// that the list is roughly current.
+pub const MAX_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// `anago join <domain> <code>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Join {
     pub domain: String,
     pub code: JoinCode,
     /// `None` means the client fills in this machine's hostname.
+    ///
+    /// **Never `None` when `export` is set.** The parser refuses that
+    /// combination, because the hostname belongs to the machine typing
+    /// the command and what is being registered is a phone (§8).
     pub name: Option<DeviceName>,
     /// Control-API port. Must match the hub's `--api-port`, which is
     /// why it is a flag and not a guess.
     pub api_port: u16,
+    /// `Some` turns this from "register this machine" into "register a
+    /// phone on its behalf" (§8, §7.3). Nothing is applied locally: no
+    /// wg config, no `device.json`.
+    pub export: Option<Export>,
+}
+
+/// What `--export` produces, and where it goes (§7.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Export {
+    /// `--export qr` — drawn on the terminal, and only there. There is
+    /// no `--out` for it: anago writes no image files, because §10.2
+    /// keeps an image crate out of the binary.
+    Qr,
+    /// `--export conf` — the config text, on stdout unless `--out`
+    /// names a file to put it in instead.
+    Conf { out: Option<PathBuf> },
 }
 
 /// `anago rm <name>`.
@@ -84,11 +204,7 @@ pub fn parse(argv: &[String]) -> Result<Command, CliError> {
         "ls" => no_args("ls", rest),
         "rm" => rm(rest),
         "help" => Ok(Command::Help(rest.first().cloned())),
-        "sync" => Err(CliError::NotYet {
-            what: "anago sync",
-            milestone: "M1",
-            because: "the hub already knows every peer, so M0 devices stay reachable without it",
-        }),
+        "sync" => sync(rest),
         "ping" => Err(CliError::NotYet {
             what: "anago ping",
             milestone: "M3",
@@ -143,6 +259,7 @@ fn server(argv: &[String]) -> Result<Command, CliError> {
         None => Err(CliError::MissingSubcommand("server")),
         Some((head, rest)) => match head.as_str() {
             "init" => server_init(rest),
+            "renew" => server_renew(rest),
             "run" => no_args("server run", rest).map(|_| Command::ServerRun),
             "status" => Err(CliError::NotYet {
                 what: "anago server status",
@@ -163,21 +280,15 @@ fn server_init(argv: &[String]) -> Result<Command, CliError> {
         Flag::value("port"),
         Flag::value("api-port"),
         Flag::boolean("no-systemd"),
-        // Routed so the M1 answer is specific; §8 keeps it out of M0.
+        Flag::value("acme-email"),
+        Flag::boolean("acme-staging"),
+        Flag::value("acme-challenge"),
         Flag::value("cf-token"),
+        Flag::value("cf-token-file"),
     ];
     let parsed = ParsedArgs::parse(argv, &spec)?;
     reject_extra_positionals(&parsed, "server init")?;
 
-    if parsed.is_set("cf-token") {
-        return Err(CliError::NotYet {
-            what: "--cf-token",
-            milestone: "M1",
-            because: "M0 asks you to add the DNS record and pass --tls-cert/--tls-key yourself",
-        });
-    }
-
-    let domain = domain(parsed.require("domain")?)?;
     let subnet = match parsed.value("subnet") {
         Some(text) => text,
         None => DEFAULT_SUBNET,
@@ -187,15 +298,174 @@ fn server_init(argv: &[String]) -> Result<Command, CliError> {
         message: e.to_string(),
     })?;
 
-    Ok(Command::ServerInit(ServerInit {
-        domain,
-        tls_cert: parsed.require("tls-cert")?.to_string(),
-        tls_key: parsed.require("tls-key")?.to_string(),
+    let init = ServerInit {
+        domain: domain(parsed.require("domain")?)?,
+        tls_cert: parsed.value("tls-cert").map(str::to_string),
+        tls_key: parsed.value("tls-key").map(str::to_string),
+        acme_email: parsed.value("acme-email").map(str::to_string),
+        acme_staging: parsed.is_set("acme-staging"),
+        acme_challenge: challenge(&parsed)?,
+        cf_token: token(&parsed)?,
+        cf_token_file: parsed.value("cf-token-file").map(str::to_string),
         subnet,
         listen_port: port(&parsed, "port", DEFAULT_LISTEN_PORT)?,
         api_port: port(&parsed, "api-port", DEFAULT_API_PORT)?,
         systemd: !parsed.is_set("no-systemd"),
-    }))
+    };
+    check_combination(&init)?;
+    Ok(Command::ServerInit(init))
+}
+
+/// `--acme-challenge http-01|dns-01`.
+///
+/// The spelling is the one the state file uses, so what a person types
+/// and what `anago server status` will print are the same string.
+fn challenge(parsed: &ParsedArgs) -> Result<Option<Challenge>, CliError> {
+    match parsed.value("acme-challenge") {
+        None => Ok(None),
+        Some(text) => match Challenge::parse(text) {
+            Some(challenge) => Ok(Some(challenge)),
+            None => Err(CliError::BadValue {
+                flag: "acme-challenge",
+                message: format!(
+                    "{text:?} is not a challenge — expected {} or {}",
+                    Challenge::Http01.as_str(),
+                    Challenge::Dns01.as_str()
+                ),
+            }),
+        },
+    }
+}
+
+/// `--cf-token <t>`, checked here rather than at first use.
+///
+/// A token truncated by a copy-paste is a command line that is wrong
+/// the moment it is typed, and the alternative is finding out from a
+/// 401 halfway through a setup — which reads as a permissions problem
+/// rather than a typo.
+fn token(parsed: &ParsedArgs) -> Result<Option<Token>, CliError> {
+    match parsed.value("cf-token") {
+        None => Ok(None),
+        Some(text) => Token::parse(text, Source::Flag)
+            .map(Some)
+            .map_err(CliError::Token),
+    }
+}
+
+/// The combination rules for `server init` (§8) that argv can settle.
+///
+/// **Not one of them is written out here.** They belong to the two pure
+/// functions that already own them and are already tested against the
+/// design — [`cfapi::choose`] for the two token flags, [`acme::plan`]
+/// for the fork between a certificate you have and one anago orders.
+/// Routing calls those so that a combination which cannot work is
+/// refused before anything is generated, and so that the sentence a
+/// person reads is the same wherever the check happens to run.
+///
+/// The plan itself is thrown away: `init` makes it again with the
+/// environment in hand, and that is the copy that decides anything.
+/// This call is here for the refusals.
+///
+/// One rule is deliberately **not** settled here. `--acme-challenge
+/// dns-01` needs a Cloudflare token, and a token can still arrive from
+/// `CLOUDFLARE_API_TOKEN` — which routing does not read, because not
+/// reading it is what keeps every rule in this module a unit test. So
+/// that verdict is left to `init`, which has the environment and runs
+/// the same function.
+fn check_combination(init: &ServerInit) -> Result<(), CliError> {
+    let token = cfapi::choose(
+        init.cf_token_file.as_deref(),
+        init.cf_token.as_ref().map(Token::expose),
+        None,
+    )
+    .map_err(CliError::Token)?;
+
+    match acme::plan(&acme::Request {
+        tls_cert: init.tls_cert.as_deref(),
+        tls_key: init.tls_key.as_deref(),
+        acme_email: init.acme_email.as_deref(),
+        staging: init.acme_staging,
+        challenge: init.acme_challenge,
+        token: token.as_ref(),
+    }) {
+        Ok(_) => Ok(()),
+        Err(PlanError::Dns01WithoutToken) => Ok(()),
+        Err(e) => Err(CliError::Plan(e)),
+    }
+}
+
+fn server_renew(argv: &[String]) -> Result<Command, CliError> {
+    let spec = [
+        Flag::boolean("force"),
+        Flag::boolean("dns"),
+        Flag::boolean("acme-staging"),
+        Flag::boolean("acme-production"),
+        Flag::value("acme-email"),
+        Flag::value("acme-challenge"),
+        Flag::value("cf-token"),
+        Flag::value("cf-token-file"),
+    ];
+    let parsed = ParsedArgs::parse(argv, &spec)?;
+    reject_extra_positionals(&parsed, "server renew")?;
+
+    // Both, or neither. `init` has no pair because production is the
+    // default there and `--acme-staging` is a plain opt-in; here the
+    // flag has to overwrite a value the hub already has, so the other
+    // direction needs a way to be said (§8).
+    let ca = match (
+        parsed.is_set("acme-staging"),
+        parsed.is_set("acme-production"),
+    ) {
+        (true, true) => {
+            return Err(CliError::Contradiction(
+                "--acme-staging",
+                "--acme-production",
+            ))
+        }
+        (true, false) => Some(Ca::Staging),
+        (false, true) => Some(Ca::Production),
+        (false, false) => None,
+    };
+
+    let renew = ServerRenew {
+        force: parsed.is_set("force"),
+        dns_only: parsed.is_set("dns"),
+        ca,
+        acme_email: parsed.value("acme-email").map(str::to_string),
+        acme_challenge: challenge(&parsed)?,
+        cf_token: token(&parsed)?,
+        cf_token_file: parsed.value("cf-token-file").map(str::to_string),
+    };
+
+    // The token flags are one question asked twice, wherever they
+    // appear — the rule and its wording belong to `cfapi::choose`.
+    cfapi::choose(
+        renew.cf_token_file.as_deref(),
+        renew.cf_token.as_ref().map(Token::expose),
+        None,
+    )
+    .map_err(CliError::Token)?;
+
+    // `--dns` means *only* DNS. Mixed with a re-issue or a settings
+    // change, a failure leaves it unclear which half took (§8). The
+    // token flags are the exception: pushing a record needs a token,
+    // and the hub may not have one recorded.
+    if renew.dns_only {
+        let mixed: Vec<&'static str> = [
+            (renew.force, "--force"),
+            (renew.ca.is_some(), "--acme-staging/--acme-production"),
+            (renew.acme_email.is_some(), "--acme-email"),
+            (renew.acme_challenge.is_some(), "--acme-challenge"),
+        ]
+        .into_iter()
+        .filter_map(|(given, flag)| given.then_some(flag))
+        .collect();
+        if let Some(other) = mixed.first() {
+            return Err(CliError::Contradiction("--dns", other));
+        }
+    }
+
+    Ok(Command::ServerRenew(renew))
 }
 
 fn join(argv: &[String]) -> Result<Command, CliError> {
@@ -203,16 +473,10 @@ fn join(argv: &[String]) -> Result<Command, CliError> {
         Flag::value("name"),
         Flag::value("api-port"),
         Flag::value("export"),
+        Flag::value("out"),
     ];
     let parsed = ParsedArgs::parse(argv, &spec)?;
-
-    if parsed.is_set("export") {
-        return Err(CliError::NotYet {
-            what: "--export",
-            milestone: "M1",
-            because: "phones join through the official WireGuard app once it can emit a config",
-        });
-    }
+    let export = export(&parsed)?;
 
     let positionals = parsed.positionals();
     let (host, code) = match positionals {
@@ -227,6 +491,15 @@ fn join(argv: &[String]) -> Result<Command, CliError> {
             flag: "name",
             message: e.to_string(),
         })?),
+        // Fine for this machine, never for a phone: see [`Join::name`].
+        None if export.is_some() => {
+            return Err(CliError::Needs {
+                flag: "--export",
+                needs: "--name",
+                because: "without it the name would be this machine's hostname, and what \
+                          is being registered is the phone",
+            })
+        }
         None => None,
     };
 
@@ -239,7 +512,191 @@ fn join(argv: &[String]) -> Result<Command, CliError> {
             message: e.to_string(),
         })?,
         name,
+        export,
     }))
+}
+
+/// `--export qr|conf`, and the `--out` that belongs to one of them.
+///
+/// Two flags, three rules.
+///
+/// The **value** is one of exactly two words. Anything else names both,
+/// rather than leaving somebody to guess whether `png` or `image` was
+/// the one meant.
+///
+/// **`--out` belongs to `conf` alone.** With `qr` it is not a narrower
+/// request but an impossible one — a QR code goes on the terminal, and
+/// anago writes no image file to put one in (§10.2). Refused rather
+/// than ignored: a flag accepted and dropped looks exactly like a flag
+/// that worked, and this one would have somebody looking for a file
+/// that was never going to exist.
+///
+/// **`--out` without `--export` is nothing at all.** A local join
+/// writes `/etc/wireguard/anago.conf` and `device.json` at paths §9
+/// decides; there is no output for `--out` to redirect.
+fn export(parsed: &ParsedArgs) -> Result<Option<Export>, CliError> {
+    let out = out(parsed);
+    let Some(kind) = parsed.value("export") else {
+        if out.is_some() {
+            return Err(CliError::Orphan {
+                flag: "--out",
+                needs: "--export conf",
+            });
+        }
+        return Ok(None);
+    };
+    match kind {
+        "conf" => Ok(Some(Export::Conf { out })),
+        "qr" => match out {
+            None => Ok(Some(Export::Qr)),
+            Some(_) => Err(CliError::Contradiction("--export qr", "--out")),
+        },
+        other => Err(CliError::BadValue {
+            flag: "export",
+            message: format!("{other:?} is not qr or conf"),
+        }),
+    }
+}
+
+/// `--out <path>`.
+///
+/// No demand that it be absolute — unlike `--config`, this one is typed
+/// by a person in a shell that has a working directory they can see.
+/// Empty is already refused a layer down, where every flag's value is.
+fn out(parsed: &ParsedArgs) -> Option<PathBuf> {
+    parsed.value("out").map(PathBuf::from)
+}
+
+fn sync(argv: &[String]) -> Result<Command, CliError> {
+    let spec = [
+        Flag::boolean("quiet"),
+        Flag::value("config"),
+        Flag::boolean("install-timer"),
+        Flag::boolean("uninstall-timer"),
+        Flag::value("interval"),
+    ];
+    let parsed = ParsedArgs::parse(argv, &spec)?;
+    reject_extra_positionals(&parsed, "sync")?;
+
+    let timer = match (
+        parsed.is_set("install-timer"),
+        parsed.is_set("uninstall-timer"),
+    ) {
+        (true, true) => {
+            return Err(CliError::Contradiction(
+                "--install-timer",
+                "--uninstall-timer",
+            ))
+        }
+        (true, false) => Some(Timer::Install {
+            interval: interval(&parsed)?,
+        }),
+        (false, true) => Some(Timer::Uninstall),
+        (false, false) => None,
+    };
+
+    // `--interval` belongs to installing a timer and to nothing else.
+    // Beside a run it looks like it changed a schedule and changed
+    // nothing; beside `--uninstall-timer` it is a period for a timer
+    // that is about to stop existing (§8).
+    if parsed.is_set("interval") && !matches!(timer, Some(Timer::Install { .. })) {
+        return Err(CliError::Orphan {
+            flag: "--interval",
+            needs: "--install-timer",
+        });
+    }
+
+    // The two flags that belong to a run, not to managing the timer.
+    // A quiet install would swallow the lines that say how to check
+    // the timer, which are the point of installing one.
+    if timer.is_some() && parsed.is_set("quiet") {
+        return Err(CliError::Orphan {
+            flag: "--quiet",
+            needs: "a sync run — the installed timer is quiet already",
+        });
+    }
+    if timer == Some(Timer::Uninstall) && parsed.is_set("config") {
+        return Err(CliError::Orphan {
+            flag: "--config",
+            needs: "a sync run or --install-timer — removing the timer reads no device file",
+        });
+    }
+
+    Ok(Command::Sync(Sync {
+        quiet: parsed.is_set("quiet"),
+        config: config(&parsed)?,
+        timer,
+    }))
+}
+
+/// `--config <path>`, which has to be absolute.
+///
+/// A relative path is resolved against the working directory, and the
+/// whole reason this flag exists is that a timer unit has no working
+/// directory a person would recognise — it runs as root, outside the
+/// session, from `/`. Baking `device.json` into a unit is only useful
+/// if it names the file from the root down (§8).
+fn config(parsed: &ParsedArgs) -> Result<Option<PathBuf>, CliError> {
+    let Some(text) = parsed.value("config") else {
+        return Ok(None);
+    };
+    let path = Path::new(text);
+    if !path.is_absolute() {
+        return Err(CliError::BadValue {
+            flag: "config",
+            message: format!(
+                "{text:?} is a relative path — give the full path from /, because the \
+                 timer that reads it runs from somewhere else entirely"
+            ),
+        });
+    }
+    Ok(Some(path.to_path_buf()))
+}
+
+/// `--interval 5m`.
+///
+/// A unit is required. A bare number would have to mean seconds by
+/// convention, and `--interval 5` meaning five *seconds* on a command
+/// whose default is five minutes is a mistake nobody would catch until
+/// the hub's API was being polled twelve times a minute.
+fn interval(parsed: &ParsedArgs) -> Result<Duration, CliError> {
+    let Some(text) = parsed.value("interval") else {
+        return Ok(DEFAULT_INTERVAL);
+    };
+    let bad = |message: String| CliError::BadValue {
+        flag: "interval",
+        message,
+    };
+
+    // `strip_suffix` takes a character, so a value that is not ASCII
+    // — `5분`, say — falls out here as "no unit" rather than splitting
+    // a byte index inside a character and panicking.
+    let Some((digits, seconds)) = [("s", 1), ("m", 60), ("h", 60 * 60)]
+        .into_iter()
+        .find_map(|(unit, seconds)| text.strip_suffix(unit).map(|digits| (digits, seconds)))
+    else {
+        return Err(bad(format!(
+            "{text:?} has no unit — write it as 90s, 5m or 1h"
+        )));
+    };
+    let count: u64 = digits
+        .parse()
+        .map_err(|_| bad(format!("{text:?} is not a length of time — try 5m")))?;
+    let interval = Duration::from_secs(count.saturating_mul(seconds));
+
+    if interval < MIN_INTERVAL {
+        return Err(bad(format!(
+            "{text:?} is shorter than a minute. Most changes ask nothing of a device, \
+             so syncing that often only polls the hub"
+        )));
+    }
+    if interval > MAX_INTERVAL {
+        return Err(bad(format!(
+            "{text:?} is longer than a day, which is not a timer any more — the peer \
+             list would be a day stale"
+        )));
+    }
+    Ok(interval)
 }
 
 fn rm(argv: &[String]) -> Result<Command, CliError> {
@@ -341,6 +798,26 @@ pub enum CliError {
         what: &'static str,
         message: String,
     },
+    /// Two flags that cannot both be meant.
+    Contradiction(&'static str, &'static str),
+    /// A flag that only means something beside another one.
+    Orphan {
+        flag: &'static str,
+        needs: &'static str,
+    },
+    /// A flag that cannot stand without another one — the mirror of
+    /// [`CliError::Orphan`], where it is the *given* flag that is
+    /// incomplete rather than the one left over.
+    Needs {
+        flag: &'static str,
+        needs: &'static str,
+        because: &'static str,
+    },
+    /// Flags that do not together describe a hub anago can set up
+    /// ([`acme::plan`]).
+    Plan(PlanError),
+    /// A Cloudflare token flag that anago cannot use ([`cfapi`]).
+    Token(CfError),
     /// Real, designed, and not in this milestone.
     NotYet {
         what: &'static str,
@@ -370,6 +847,22 @@ impl fmt::Display for CliError {
                 write!(f, "`anago {command}` got more arguments than it takes")
             }
             CliError::BadValue { flag, message } => write!(f, "--{flag}: {message}"),
+            // Both already name the flags they are about, so adding a
+            // prefix here would say one of them twice.
+            CliError::Contradiction(one, other) => write!(
+                f,
+                "{one} and {other} cannot both be given; pass one and run it again"
+            ),
+            CliError::Orphan { flag, needs } => {
+                write!(f, "{flag} only means something with {needs}")
+            }
+            CliError::Needs {
+                flag,
+                needs,
+                because,
+            } => write!(f, "{flag} needs {needs} — {because}"),
+            CliError::Plan(e) => write!(f, "{e}"),
+            CliError::Token(e) => write!(f, "{e}"),
             CliError::BadArgument { what, message } => write!(f, "{what}: {message}"),
             CliError::NotYet {
                 what,
@@ -398,7 +891,11 @@ pub fn help(topic: Option<&str>) -> String {
     match topic {
         Some("server") | Some("init") => format!(
             "\
-usage: anago server init --domain <d> --tls-cert <path> --tls-key <path>
+usage: anago server init --domain <d>
+                        [--tls-cert <path> --tls-key <path>]
+                        [--acme-email <address>] [--acme-staging]
+                        [--acme-challenge http-01|dns-01]
+                        [--cf-token <token> | --cf-token-file <path>]
                         [--subnet {DEFAULT_SUBNET}] [--port {DEFAULT_LISTEN_PORT}]
                         [--api-port {DEFAULT_API_PORT}] [--no-systemd]
 
@@ -406,12 +903,66 @@ Sets up the hub on this machine: generates its wg keypair, writes the
 state file, prints the DNS record to add and the ports to open, then
 issues the first join code.
 
-M0 takes an existing certificate; ACME and Cloudflare DNS arrive in M1.
-"
+The certificate pair decides everything else. Give both and anago
+serves the certificate you already have and never renews it. Leave both
+out and anago orders one from Let's Encrypt and renews it — which needs
+--acme-email, the address the CA writes to before an expiry.
+
+--acme-challenge defaults to dns-01 when there is a Cloudflare token
+and http-01 when there is not. http-01 needs port 80 reachable; dns-01
+needs the token, which is also what lets anago add the A record for
+you. The token can come from --cf-token-file (safest), --cf-token
+(visible to `ps` and in shell history), or {env}.
+
+Create the token with both Zone → DNS → Edit and Zone → Zone → Read, on
+the zone that holds the domain. The second is what finds the zone, and
+a token without it passes every other check before it fails.
+
+--acme-staging orders from Let's Encrypt's staging CA. Nothing trusts
+those certificates, so `anago join` will refuse them — it is for
+checking the wiring without spending the production limits. Staging has
+limits of its own; they are far larger, not absent.
+",
+            env = cfapi::TOKEN_ENV
+        ),
+        Some("renew") => format!(
+            "\
+usage: anago server renew [--force] [--dns]
+                         [--acme-staging | --acme-production]
+                         [--acme-email <address>]
+                         [--acme-challenge http-01|dns-01]
+                         [--cf-token <token> | --cf-token-file <path>]
+
+Run on the hub. Orders the certificate again, changes how it will be
+ordered next time, or pushes the A record — never all three, and never
+anything to do with WireGuard: no tunnel drops for any of this.
+
+With no flags it decides for itself. If the certificate is not due yet
+it says when it will be and does nothing, so it is safe in cron.
+--force orders one anyway, which spends one of the CA's few per week
+for this name.
+
+A flag that changes *which* certificate you would get — moving between
+{staging} and the real CA, or taking over a hub set up with
+--tls-cert/--tls-key — orders one straight away; --force is not needed
+and would not mean anything. Going *to* {staging} is the one to think
+about: what it orders replaces the certificate this hub is serving, and
+nothing trusts it, so `join` fails until --acme-production brings a real
+one back. A flag that does not change which certificate you get
+(--acme-email, --acme-challenge, the token) is written down and applies
+from the next renewal.
+
+--dns pushes the A record at this machine's current address and stops.
+That is for a server whose public IP changed; nothing else here does
+it, and `server init` refuses to run twice.
+",
+            staging = "staging"
         ),
         Some("join") => format!(
             "\
 usage: anago join <domain> <code> [--name <name>] [--api-port <port>]
+       anago join <domain> <code> --export conf --name <name> [--out <path>]
+       anago join <domain> <code> --export qr --name <name>
 
 Registers this device with the hub at <domain>. The wg keypair is made
 here and the private key never leaves — the server sees the public half
@@ -420,10 +971,51 @@ only. Without --name the machine's hostname is used.
 --api-port has to match the hub's; pass it when the server was set up
 with a non-default one.
 
+--export registers a phone instead, and leaves nothing on this machine:
+no wg config and no device file. --name is required there, because the
+hostname default would name this machine. `conf` prints the config,
+`--out` puts it in a file at 0600 instead (an existing file is an error,
+never an overwrite). `qr` draws it on the terminal and takes no --out —
+anago writes no image files. Its width follows the hub's name, so 80
+columns is enough for an ordinary one and a long name needs more; the
+size is only known once the hub has answered, and a window too narrow
+for it is refused rather than drawn wrapped. Either way what comes out
+is the phone's private key: move it, then delete the file — or, on
+screen, clear the screen and then the scrollback, which are two
+different commands.
+
 Join codes are single use and expire; ask the server for another with
 `anago code`. Format: {code}
 ",
             code = "XXXX-XXXX"
+        ),
+        Some("sync") => format!(
+            "\
+usage: anago sync [--quiet] [--config <path>]
+       anago sync --install-timer [--interval {default}] [--config <path>]
+       anago sync --uninstall-timer
+
+Run on a device, as root. Asks the hub for the peer list and rewrites
+the WireGuard config only if something changed.
+
+Nothing here is needed to reach the hub — it already knows every
+device. Syncing is how *this* device hears about the others.
+
+--config gives the full path to device.json, from / down. Without it
+anago works the path out the way `ls` and `rm` do, which needs your
+user session; a timer has none, so the installed unit carries the path
+on its command line. --quiet goes on that command line too, so opening
+the unit file says why it is silent.
+
+--install-timer writes the unit and starts it: a systemd timer on
+Linux, a LaunchDaemon on macOS. Where neither exists, it prints a cron
+line instead of pretending. --interval takes 90s, 5m or 1h — between
+{min} and {max}. A cron line narrows that further, to periods that divide
+an hour or a day: cron repeats on the clock, not on a stopwatch.
+",
+            default = "5m",
+            min = "1m",
+            max = "24h"
         ),
         Some("code") => "\
 usage: anago code
@@ -451,18 +1043,21 @@ working immediately.
 anago {version} — self-hosted WireGuard private network
 
 usage:
-  anago server init --domain <d> --tls-cert <path> --tls-key <path>
+  anago server init --domain <d>    set this machine up as the hub
+  anago server renew                order the certificate again, or change how
   anago server run                  run the hub (systemd does this for you)
   anago code                        issue a join code (on the server)
   anago join <domain> <code>        register this device
+  anago sync                        pull the peer list (on a device)
   anago ls                          list devices
   anago rm <name>                   remove a device
 
   -h, --help                        show this, or `anago help <command>`
   -V, --version                     show the version
 
-Later milestones: `anago sync` (M1), `--export qr|conf` (M1),
-`anago ping` and `anago server status` (M3).
+`anago join --export qr|conf` registers a phone; `anago sync
+--install-timer` schedules the check. Later milestones: `anago ping`
+and `anago server status` (M3).
 "
         ),
     }
@@ -505,8 +1100,11 @@ mod tests {
     fn server_init_fills_in_the_documented_defaults() {
         let init = init(&required_init()).unwrap();
         assert_eq!(init.domain, "net.example.com");
-        assert_eq!(init.tls_cert, "/etc/ssl/anago/fullchain.pem");
-        assert_eq!(init.tls_key, "/etc/ssl/anago/privkey.pem");
+        assert_eq!(
+            init.tls_cert.as_deref(),
+            Some("/etc/ssl/anago/fullchain.pem")
+        );
+        assert_eq!(init.tls_key.as_deref(), Some("/etc/ssl/anago/privkey.pem"));
         assert_eq!(init.subnet, Subnet::parse(DEFAULT_SUBNET).unwrap());
         assert_eq!(init.listen_port, 51820);
         assert_eq!(init.api_port, 443);
@@ -533,27 +1131,28 @@ mod tests {
     }
 
     #[test]
-    fn server_init_insists_on_what_m0_cannot_invent() {
-        // No ACME yet, so the certificate paths are not optional.
+    fn server_init_insists_on_what_it_cannot_invent() {
+        // The domain is the one thing with no default and no other
+        // way in: it is the DNS name, the certificate's subject, and
+        // what `anago join` is typed against.
         assert_eq!(
             parse_args(&["server", "init"]),
             Err(CliError::Arg(ArgError::Required("domain")))
         );
-        assert_eq!(
-            parse_args(&["server", "init", "--domain", "net.example.com"]),
-            Err(CliError::Arg(ArgError::Required("tls-cert")))
-        );
-        assert_eq!(
-            parse_args(&[
-                "server",
-                "init",
-                "--domain",
-                "net.example.com",
-                "--tls-cert",
-                "/c.pem"
-            ]),
-            Err(CliError::Arg(ArgError::Required("tls-key")))
-        );
+
+        // The certificate pair is not required any more — leaving it
+        // out is how a person asks anago to get one (§8).
+        let init = init(&[
+            "server",
+            "init",
+            "--domain",
+            "net.example.com",
+            "--acme-email",
+            "jo@example.com",
+        ])
+        .unwrap();
+        assert_eq!(init.tls_cert, None);
+        assert_eq!(init.tls_key, None);
     }
 
     #[test]
@@ -621,6 +1220,8 @@ mod tests {
                 code: JoinCode::parse("7QX4-M2KD").unwrap(),
                 name: None,
                 api_port: DEFAULT_API_PORT,
+                // Plain `join` registers *this* machine.
+                export: None,
             })
         );
 
@@ -632,6 +1233,7 @@ mod tests {
                 code: JoinCode::parse("7QX4-M2KD").unwrap(),
                 name: Some(DeviceName::parse("맥북").unwrap()),
                 api_port: DEFAULT_API_PORT,
+                export: None,
             })
         );
     }
@@ -738,7 +1340,6 @@ mod tests {
     #[test]
     fn later_milestones_answer_with_their_milestone() {
         for (args, what, milestone) in [
-            (vec!["sync"], "anago sync", "M1"),
             (vec!["ping", "macbook"], "anago ping", "M3"),
             (vec!["server", "status"], "anago server status", "M3"),
         ] {
@@ -756,16 +1357,825 @@ mod tests {
         }
     }
 
-    #[test]
-    fn later_flags_answer_the_same_way() {
-        let mut args = required_init();
-        args.extend(["--cf-token", "secret"]);
-        let e = parse_args(&args).unwrap_err();
-        assert!(e.to_string().starts_with("--cf-token arrives in M1"), "{e}");
+    fn joined(args: &[&str]) -> Result<Join, CliError> {
+        let mut line = vec!["join", "net.example.com", "7QX4-M2KD"];
+        line.extend_from_slice(args);
+        match parse_args(&line)? {
+            Command::Join(join) => Ok(join),
+            other => panic!("{other:?}"),
+        }
+    }
 
-        let e =
-            parse_args(&["join", "net.example.com", "7QX4-M2KD", "--export", "qr"]).unwrap_err();
-        assert!(e.to_string().starts_with("--export arrives in M1"), "{e}");
+    #[test]
+    fn export_names_the_two_things_it_can_produce() {
+        assert_eq!(
+            joined(&["--export", "conf", "--name", "폰"])
+                .unwrap()
+                .export,
+            Some(Export::Conf { out: None })
+        );
+        assert_eq!(
+            joined(&["--export", "qr", "--name", "폰"]).unwrap().export,
+            Some(Export::Qr)
+        );
+        // Anything else says both words rather than leaving somebody to
+        // guess whether `png` or `image` was the one meant.
+        for wrong in ["png", "CONF", "Qr", "qr conf", "qr,conf"] {
+            let e = joined(&["--export", wrong, "--name", "폰"]).unwrap_err();
+            assert_eq!(
+                e,
+                CliError::BadValue {
+                    flag: "export",
+                    message: format!("{wrong:?} is not qr or conf"),
+                },
+                "{wrong:?}"
+            );
+            assert_eq!(exit_code(&e), 2, "a mistake in typing, not a refusal");
+        }
+    }
+
+    #[test]
+    fn an_export_registers_a_phone_and_leaves_this_machine_alone() {
+        // Same domain, same code, same port — what changes is whose
+        // device this is. Nothing local follows from it (§8).
+        assert_eq!(
+            joined(&["--export", "conf", "--name", "폰", "--api-port", "8443"]).unwrap(),
+            Join {
+                domain: "net.example.com".to_string(),
+                code: JoinCode::parse("7QX4-M2KD").unwrap(),
+                name: Some(DeviceName::parse("폰").unwrap()),
+                api_port: 8443,
+                export: Some(Export::Conf { out: None }),
+            }
+        );
+        // The order the flags were typed in is not part of the meaning.
+        assert_eq!(
+            joined(&["--name", "폰", "--export", "qr"]).unwrap().export,
+            Some(Export::Qr)
+        );
+        // And a name still has to be a name.
+        assert!(matches!(
+            joined(&["--export", "conf", "--name", "phone.local"]),
+            Err(CliError::BadValue { flag: "name", .. })
+        ));
+    }
+
+    #[test]
+    fn exporting_needs_a_name_because_the_default_names_the_wrong_machine() {
+        // Without --name a join takes this machine's hostname, which is
+        // right for this machine and always wrong for the phone being
+        // registered on its behalf (§8).
+        for kind in ["conf", "qr"] {
+            let e = joined(&["--export", kind]).unwrap_err();
+            assert_eq!(
+                e,
+                CliError::Needs {
+                    flag: "--export",
+                    needs: "--name",
+                    because: "without it the name would be this machine's hostname, and \
+                              what is being registered is the phone",
+                },
+                "{kind}"
+            );
+            assert!(e.to_string().contains("--export needs --name"), "{e}");
+            assert_eq!(e.to_string().lines().count(), 1, "{e}");
+        }
+        // The rule belongs to --export and to nothing else: a local
+        // join still fills the name in from the hostname.
+        assert_eq!(joined(&[]).unwrap().name, None);
+    }
+
+    #[test]
+    fn out_belongs_to_conf_and_to_nothing_else() {
+        assert_eq!(
+            joined(&["--export", "conf", "--name", "폰", "--out", "phone.conf"])
+                .unwrap()
+                .export,
+            Some(Export::Conf {
+                out: Some(PathBuf::from("phone.conf")),
+            })
+        );
+        // Not a narrower request but an impossible one: a QR code goes
+        // on the terminal, and anago writes no image files (§10.2).
+        // Refused rather than dropped — a flag accepted and ignored
+        // looks exactly like one that worked, and this one would leave
+        // somebody looking for a file that was never coming.
+        assert_eq!(
+            joined(&["--export", "qr", "--name", "폰", "--out", "phone.png"]),
+            Err(CliError::Contradiction("--export qr", "--out"))
+        );
+        // A local join writes at the paths §9 decides; there is no
+        // output for --out to redirect.
+        assert_eq!(
+            joined(&["--out", "phone.conf"]),
+            Err(CliError::Orphan {
+                flag: "--out",
+                needs: "--export conf",
+            })
+        );
+        assert_eq!(
+            joined(&["--name", "맥북", "--out", "phone.conf"]),
+            Err(CliError::Orphan {
+                flag: "--out",
+                needs: "--export conf",
+            })
+        );
+    }
+
+    #[test]
+    fn an_empty_value_is_refused_before_it_means_anything() {
+        // `--out "$FILE"` with FILE unset, and the same for --export.
+        // Neither reaches the rules above: every flag's value is
+        // checked for emptiness a layer down, so there is one answer
+        // for all of them instead of one per flag.
+        for flag in ["out", "export"] {
+            let e = joined(&["--export", "conf", "--name", "폰", &format!("--{flag}"), ""])
+                .unwrap_err();
+            assert_eq!(
+                e,
+                CliError::Arg(ArgError::EmptyValue(if flag == "out" {
+                    "out"
+                } else {
+                    "export"
+                }))
+            );
+            assert!(e.to_string().contains("needs a non-empty value"), "{e}");
+        }
+    }
+
+    #[test]
+    fn the_usage_text_shows_both_shapes_of_join() {
+        let text = help(Some("join"));
+        assert!(
+            text.contains("--export conf --name <name> [--out <path>]"),
+            "{text}"
+        );
+        assert!(text.contains("--export qr --name <name>"), "{text}");
+        // The two things a person has to know before running it.
+        assert!(text.contains("leaves nothing on this machine"), "{text}");
+        assert!(text.contains("private key"), "{text}");
+    }
+
+    #[test]
+    fn leaving_the_certificate_out_is_how_acme_is_asked_for() {
+        let asked = init(&[
+            "server",
+            "init",
+            "--domain",
+            "net.example.com",
+            "--acme-email",
+            "jo@example.com",
+            "--acme-staging",
+            "--acme-challenge",
+            "dns-01",
+            "--cf-token",
+            "cf-secret-value",
+        ])
+        .unwrap();
+        assert_eq!(asked.tls_cert, None);
+        assert_eq!(asked.acme_email.as_deref(), Some("jo@example.com"));
+        assert!(asked.acme_staging);
+        assert_eq!(asked.acme_challenge, Some(Challenge::Dns01));
+        assert_eq!(
+            asked.cf_token.map(|t| t.expose().to_string()).as_deref(),
+            Some("cf-secret-value")
+        );
+        assert_eq!(asked.cf_token_file, None);
+
+        // Nothing but the domain: the challenge is left undecided,
+        // because whether there is a token is not argv's to know.
+        let bare = init(&[
+            "server",
+            "init",
+            "--domain",
+            "net.example.com",
+            "--acme-email",
+            "jo@example.com",
+        ])
+        .unwrap();
+        assert_eq!(bare.acme_challenge, None);
+        assert!(!bare.acme_staging);
+        assert_eq!(bare.cf_token, None);
+    }
+
+    #[test]
+    fn the_certificate_flags_come_as_a_pair() {
+        // Half a pair is a person meaning one of two different things,
+        // and neither is safe to pick: with the pair anago serves what
+        // it is given and never renews, without it anago orders one.
+        let e = init(&[
+            "server",
+            "init",
+            "--domain",
+            "net.example.com",
+            "--tls-cert",
+            "/c.pem",
+        ])
+        .unwrap_err();
+        assert_eq!(
+            e,
+            CliError::Plan(PlanError::HalfAPair {
+                given: "--tls-cert",
+                missing: "--tls-key",
+            })
+        );
+        assert!(e.to_string().contains("--tls-key"), "{e}");
+
+        let e = init(&[
+            "server",
+            "init",
+            "--domain",
+            "net.example.com",
+            "--tls-key",
+            "/k.pem",
+        ])
+        .unwrap_err();
+        assert_eq!(
+            e,
+            CliError::Plan(PlanError::HalfAPair {
+                given: "--tls-key",
+                missing: "--tls-cert",
+            })
+        );
+    }
+
+    #[test]
+    fn acme_flags_beside_a_certificate_are_refused_not_ignored() {
+        // The failure this prevents is silent: the pair means anago
+        // never orders anything, so an --acme-* flag that was quietly
+        // dropped leaves a person believing renewal is automatic, and
+        // they find out when the certificate expires.
+        let mut args = required_init();
+        args.extend(["--acme-email", "jo@example.com"]);
+        let e = parse_args(&args).unwrap_err();
+        assert_eq!(
+            e,
+            CliError::Plan(PlanError::AcmeFlagsWithCertificate(vec!["--acme-email"]))
+        );
+        assert!(e.to_string().contains("nothing here would renew"), "{e}");
+
+        // Every one of them is named, so the fix does not have to be
+        // guessed at one flag per attempt.
+        let mut args = required_init();
+        args.extend([
+            "--acme-email",
+            "jo@example.com",
+            "--acme-staging",
+            "--acme-challenge",
+            "http-01",
+        ]);
+        let e = parse_args(&args).unwrap_err();
+        let message = e.to_string();
+        for flag in ["--acme-email", "--acme-staging", "--acme-challenge"] {
+            assert!(message.contains(flag), "{flag} is missing from {message}");
+        }
+
+        // A Cloudflare token is the exception (§8): what it does — the
+        // A record — has nothing to do with where the certificate came
+        // from, and refusing it would tie two unrelated features
+        // together.
+        let mut args = required_init();
+        args.extend(["--cf-token", "cf-secret-value"]);
+        let init = match parse_args(&args).unwrap() {
+            Command::ServerInit(init) => init,
+            other => panic!("{other:?}"),
+        };
+        assert!(init.cf_token.is_some());
+        assert!(init.tls_cert.is_some());
+    }
+
+    #[test]
+    fn ordering_a_certificate_needs_an_address_to_warn() {
+        // Let's Encrypt will make an account without one. The expiry
+        // mail is the only alarm that reaches a person when automatic
+        // renewal has quietly stopped, and "set it up and forget it"
+        // is not worth trading for one flag (§8).
+        let e = init(&["server", "init", "--domain", "net.example.com"]).unwrap_err();
+        assert_eq!(e, CliError::Plan(PlanError::NoContact));
+        assert!(e.to_string().contains("about to expire"), "{e}");
+    }
+
+    #[test]
+    fn the_two_token_flags_are_one_question_asked_twice() {
+        let mut args = required_init();
+        args.extend([
+            "--cf-token",
+            "cf-secret-value",
+            "--cf-token-file",
+            "/root/cf",
+        ]);
+        let e = parse_args(&args).unwrap_err();
+        assert_eq!(e, CliError::Token(CfError::BothFlags));
+        // And it says which one to keep rather than just refusing.
+        assert!(e.to_string().contains("the safer of the two"), "{e}");
+    }
+
+    #[test]
+    fn a_truncated_token_is_caught_where_it_was_typed() {
+        // A token with whitespace in it is a copy-paste that lost its
+        // tail. Sending it produces a 401, which reads as a
+        // permissions problem rather than a typo — so it is refused
+        // here, before anything is generated.
+        let mut args = required_init();
+        args.extend(["--cf-token", "half a token"]);
+        let e = parse_args(&args).unwrap_err();
+        assert_eq!(e, CliError::Token(CfError::Malformed(Source::Flag)));
+        assert!(e.to_string().contains("--cf-token"), "{e}");
+
+        // Empty is the parser's own complaint, and comes first.
+        let mut args = required_init();
+        args.extend(["--cf-token="]);
+        assert_eq!(
+            parse_args(&args),
+            Err(CliError::Arg(ArgError::EmptyValue("cf-token")))
+        );
+    }
+
+    #[test]
+    fn the_challenge_is_spelled_the_way_the_state_file_spells_it() {
+        let mut args = required_init();
+        args.extend(["--acme-challenge", "dns"]);
+        let e = parse_args(&args).unwrap_err();
+        assert_eq!(
+            e,
+            CliError::BadValue {
+                flag: "acme-challenge",
+                message: "\"dns\" is not a challenge — expected http-01 or dns-01".to_string(),
+            }
+        );
+
+        for (text, expected) in [("http-01", Challenge::Http01), ("dns-01", Challenge::Dns01)] {
+            let init = init(&[
+                "server",
+                "init",
+                "--domain",
+                "net.example.com",
+                "--acme-email",
+                "jo@example.com",
+                "--acme-challenge",
+                text,
+                "--cf-token",
+                "cf-secret-value",
+            ])
+            .unwrap();
+            assert_eq!(init.acme_challenge, Some(expected));
+        }
+    }
+
+    #[test]
+    fn dns01_without_a_token_is_left_for_init_to_answer() {
+        // Routing does not read CLOUDFLARE_API_TOKEN — not reading it
+        // is what keeps every rule in this module a unit test — so it
+        // cannot know there is no token. Refusing here would break the
+        // documented third way of passing one; `init` runs the same
+        // check with the environment in hand.
+        let init = init(&[
+            "server",
+            "init",
+            "--domain",
+            "net.example.com",
+            "--acme-email",
+            "jo@example.com",
+            "--acme-challenge",
+            "dns-01",
+        ])
+        .unwrap();
+        assert_eq!(init.acme_challenge, Some(Challenge::Dns01));
+        assert_eq!(init.cf_token, None);
+        assert_eq!(init.cf_token_file, None);
+
+        // With a token flag the same line is settled here, and passes.
+        let mut with_file = vec![
+            "server",
+            "init",
+            "--domain",
+            "net.example.com",
+            "--acme-email",
+            "jo@example.com",
+            "--acme-challenge",
+            "dns-01",
+        ];
+        with_file.extend(["--cf-token-file", "/root/cf-token"]);
+        assert!(parse_args(&with_file).is_ok());
+    }
+
+    #[test]
+    fn a_token_never_prints_itself() {
+        // §13: `Debug` on a command is the sort of thing that ends up
+        // in a log, and argv being visible to `ps` already is no
+        // reason for anago to repeat it.
+        let mut args = required_init();
+        args.extend(["--cf-token", "cf-secret-value"]);
+        let printed = format!("{:?}", parse_args(&args).unwrap());
+        assert!(!printed.contains("cf-secret-value"), "{printed}");
+        assert!(printed.contains("redacted"), "{printed}");
+    }
+
+    #[test]
+    fn a_bad_combination_is_a_usage_error() {
+        // Exit 2 is "did not understand"; 1 is "understood, cannot do
+        // it". Flags that contradict each other are the former, and a
+        // script can tell them apart.
+        let e = init(&["server", "init", "--domain", "net.example.com"]).unwrap_err();
+        assert_eq!(exit_code(&e), 2);
+        let mut args = required_init();
+        args.extend(["--cf-token", "a", "--cf-token-file", "/b"]);
+        assert_eq!(exit_code(&parse_args(&args).unwrap_err()), 2);
+    }
+
+    fn renew(args: &[&str]) -> Result<ServerRenew, CliError> {
+        let mut argv = vec!["server", "renew"];
+        argv.extend_from_slice(args);
+        match parse_args(&argv)? {
+            Command::ServerRenew(renew) => Ok(renew),
+            other => panic!("expected server renew, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn server_renew_takes_nothing_at_all() {
+        // The command's whole point as a cron job: with no flags it is
+        // a check that decides for itself (§8).
+        let asked = renew(&[]).unwrap();
+        assert!(!asked.force);
+        assert!(!asked.dns_only);
+        assert_eq!(asked.ca, None);
+    }
+
+    #[test]
+    fn the_ca_is_three_states_and_not_a_flag() {
+        // An absent `--acme-staging` must not read as "production":
+        // that would move a staging hub to another CA on an ordinary
+        // renewal. Hence the pair, which `server init` does not need
+        // because production is the default there (§8).
+        assert_eq!(renew(&[]).unwrap().ca, None);
+        assert_eq!(renew(&["--acme-staging"]).unwrap().ca, Some(Ca::Staging));
+        assert_eq!(
+            renew(&["--acme-production"]).unwrap().ca,
+            Some(Ca::Production)
+        );
+
+        let e = renew(&["--acme-staging", "--acme-production"]).unwrap_err();
+        assert_eq!(
+            e,
+            CliError::Contradiction("--acme-staging", "--acme-production")
+        );
+        assert!(e.to_string().contains("cannot both be given"), "{e}");
+    }
+
+    #[test]
+    fn dns_means_only_dns() {
+        // Mixed with a re-issue or a settings change, a failure leaves
+        // it unclear which half took (§8).
+        assert!(renew(&["--dns"]).unwrap().dns_only);
+        for other in [
+            "--force",
+            "--acme-staging",
+            "--acme-production",
+            "--acme-email=jo@example.com",
+            "--acme-challenge=dns-01",
+        ] {
+            let e = renew(&["--dns", other]).unwrap_err();
+            assert!(
+                matches!(e, CliError::Contradiction("--dns", _)),
+                "{other}: {e:?}"
+            );
+        }
+
+        // The token flags are the exception: pushing a record needs a
+        // token, and the hub may have none recorded.
+        let asked = renew(&["--dns", "--cf-token-file", "/root/cf-token"]).unwrap();
+        assert!(asked.dns_only);
+        assert_eq!(asked.cf_token_file.as_deref(), Some("/root/cf-token"));
+    }
+
+    #[test]
+    fn server_renew_settles_the_token_flags_the_same_way_everywhere() {
+        let e = renew(&[
+            "--cf-token",
+            "cf-secret-value",
+            "--cf-token-file",
+            "/root/cf",
+        ])
+        .unwrap_err();
+        assert_eq!(e, CliError::Token(CfError::BothFlags));
+        assert!(e.to_string().contains("the safer of the two"), "{e}");
+
+        // And a truncated paste is caught where it was typed.
+        assert_eq!(
+            renew(&["--cf-token", "half a token"]),
+            Err(CliError::Token(CfError::Malformed(Source::Flag)))
+        );
+    }
+
+    #[test]
+    fn every_setting_flag_reaches_the_field_it_belongs_to() {
+        // `renew::plan` decides what to do by comparing these against
+        // the hub's recorded values (§8), so a flag that lands in the
+        // wrong field is a certificate ordered — or not — for the
+        // wrong reason.
+        let asked = renew(&[
+            "--acme-email",
+            "jo@example.com",
+            "--acme-challenge",
+            "dns-01",
+            "--cf-token-file",
+            "/root/cf-token",
+            "--acme-staging",
+            "--force",
+        ])
+        .unwrap();
+        assert_eq!(asked.acme_email.as_deref(), Some("jo@example.com"));
+        assert_eq!(asked.acme_challenge, Some(Challenge::Dns01));
+        assert_eq!(asked.cf_token_file.as_deref(), Some("/root/cf-token"));
+        assert_eq!(asked.ca, Some(Ca::Staging));
+        assert!(asked.force);
+        assert!(!asked.dns_only);
+
+        // And an empty command line leaves every one of them alone —
+        // which is what makes a bare `server renew` a check rather
+        // than an edit.
+        let bare = renew(&[]).unwrap();
+        assert_eq!(bare.acme_email, None);
+        assert_eq!(bare.acme_challenge, None);
+        assert_eq!(bare.cf_token, None);
+        assert_eq!(bare.cf_token_file, None);
+        assert_eq!(bare.ca, None);
+        assert!(!bare.force);
+    }
+
+    #[test]
+    fn server_renew_refuses_what_it_does_not_take() {
+        assert_eq!(
+            parse_args(&["server", "renew", "--domain", "net.example.com"]),
+            Err(CliError::Arg(ArgError::Unknown("--domain".to_string())))
+        );
+        assert_eq!(
+            parse_args(&["server", "renew", "net.example.com"]),
+            Err(CliError::TooManyArguments("server renew"))
+        );
+        // The same challenge spelling as everywhere else.
+        assert!(matches!(
+            renew(&["--acme-challenge", "dns"]),
+            Err(CliError::BadValue {
+                flag: "acme-challenge",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn the_help_for_server_renew_names_every_flag_it_accepts() {
+        let text = help(Some("renew"));
+        for flag in [
+            "--force",
+            "--dns",
+            "--acme-staging",
+            "--acme-production",
+            "--acme-email",
+            "--acme-challenge",
+            "--cf-token",
+            "--cf-token-file",
+        ] {
+            assert!(
+                text.contains(flag),
+                "the help for server renew omits {flag}"
+            );
+            assert_ne!(
+                parse_args(&["server", "renew", flag]),
+                Err(CliError::Arg(ArgError::Unknown(flag.to_string()))),
+                "{flag} is in the help but not in the spec"
+            );
+        }
+        // And the two things a person has to be told rather than find
+        // out: it is safe in cron, and it never touches the tunnel.
+        assert!(text.contains("safe in cron"), "{text}");
+        assert!(text.contains("no tunnel drops"), "{text}");
+    }
+
+    fn sync(args: &[&str]) -> Result<Sync, CliError> {
+        let mut argv = vec!["sync"];
+        argv.extend_from_slice(args);
+        match parse_args(&argv)? {
+            Command::Sync(sync) => Ok(sync),
+            other => panic!("expected sync, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_is_a_command_now_and_not_a_promise() {
+        // M0 answered `anago sync` with "arrives in M1". It has.
+        let asked = sync(&[]).unwrap();
+        assert!(!asked.quiet);
+        assert_eq!(asked.config, None);
+        assert_eq!(asked.timer, None);
+    }
+
+    #[test]
+    fn the_timer_form_is_the_one_the_unit_file_carries() {
+        // §8 fixes the installed command line as
+        // `anago sync --quiet --config <absolute path>`, so both have
+        // to parse exactly as the unit writes them.
+        let asked = sync(&["--quiet", "--config", "/home/jo/.config/anago/device.json"]).unwrap();
+        assert!(asked.quiet);
+        assert_eq!(
+            asked.config,
+            Some(PathBuf::from("/home/jo/.config/anago/device.json"))
+        );
+        assert_eq!(asked.timer, None);
+    }
+
+    #[test]
+    fn a_relative_config_path_is_refused() {
+        // The flag exists because a timer has no working directory a
+        // person would recognise: it runs as root, outside the
+        // session, from `/`. A relative path in a unit file is the
+        // failure this flag was added to avoid.
+        for path in ["device.json", "./device.json", "../anago/device.json"] {
+            let e = sync(&["--config", path]).unwrap_err();
+            assert!(
+                matches!(e, CliError::BadValue { flag: "config", .. }),
+                "{path}: {e:?}"
+            );
+            assert!(e.to_string().contains("full path from /"), "{e}");
+        }
+        assert!(sync(&["--config", "/root/device.json"]).is_ok());
+    }
+
+    #[test]
+    fn installing_and_uninstalling_are_not_both_meant() {
+        assert_eq!(
+            sync(&["--install-timer"]).unwrap().timer,
+            Some(Timer::Install {
+                interval: DEFAULT_INTERVAL
+            })
+        );
+        assert_eq!(
+            sync(&["--uninstall-timer"]).unwrap().timer,
+            Some(Timer::Uninstall)
+        );
+        assert_eq!(
+            sync(&["--install-timer", "--uninstall-timer"]),
+            Err(CliError::Contradiction(
+                "--install-timer",
+                "--uninstall-timer"
+            ))
+        );
+    }
+
+    #[test]
+    fn the_interval_needs_a_unit_and_stays_in_range() {
+        let interval =
+            |text: &str| sync(&["--install-timer", "--interval", text]).map(|asked| asked.timer);
+        let every = |seconds| {
+            Some(Timer::Install {
+                interval: Duration::from_secs(seconds),
+            })
+        };
+        assert_eq!(interval("90s").unwrap(), every(90));
+        assert_eq!(interval("5m").unwrap(), every(5 * 60));
+        assert_eq!(interval("1h").unwrap(), every(60 * 60));
+        // And left out, the default §6.3 argues for.
+        assert_eq!(
+            sync(&["--install-timer"]).unwrap().timer,
+            every(DEFAULT_INTERVAL.as_secs())
+        );
+
+        // A bare number would have to mean seconds by convention, and
+        // `--interval 5` meaning five *seconds* on a command whose
+        // default is five minutes is a mistake nobody catches until
+        // the hub is being polled twelve times a minute.
+        let e = interval("5").unwrap_err();
+        assert!(e.to_string().contains("no unit"), "{e}");
+        assert!(e.to_string().contains("5m"), "{e}");
+        assert!(interval("5min")
+            .unwrap_err()
+            .to_string()
+            .contains("no unit"));
+
+        // Regression: the unit used to be taken off by byte, so a
+        // value whose last character is not ASCII split inside that
+        // character and panicked the process instead of returning an
+        // error a person can read.
+        for text in ["5분", "5초", "５m", "5м", "5\u{301}"] {
+            let e = interval(text).unwrap_err();
+            assert!(
+                matches!(
+                    e,
+                    CliError::BadValue {
+                        flag: "interval",
+                        ..
+                    }
+                ),
+                "{text:?}: {e:?}"
+            );
+            // A usage error, which is what exit 2 means — not a crash.
+            assert_eq!(exit_code(&e), 2, "{text:?}");
+        }
+        assert!(interval("mm")
+            .unwrap_err()
+            .to_string()
+            .contains("not a length of time"));
+
+        // The floor: below a minute the timer only polls (§6.3).
+        assert!(interval("0m").is_err());
+        assert!(interval("59s")
+            .unwrap_err()
+            .to_string()
+            .contains("shorter than a minute"));
+        assert!(interval("1m").is_ok());
+        // And the ceiling, past which it is not a timer any more.
+        assert!(interval("24h").is_ok());
+        assert!(interval("25h")
+            .unwrap_err()
+            .to_string()
+            .contains("longer than a day"));
+    }
+
+    #[test]
+    fn a_flag_that_would_be_ignored_is_refused_instead() {
+        // The failure this prevents is silent: a flag accepted and
+        // dropped looks exactly like a flag that worked.
+        //
+        // `--interval` alone changes no schedule, because there is no
+        // timer to change (§8).
+        let e = sync(&["--interval", "5m"]).unwrap_err();
+        assert_eq!(
+            e,
+            CliError::Orphan {
+                flag: "--interval",
+                needs: "--install-timer"
+            }
+        );
+        assert!(e.to_string().contains("only means something with"), "{e}");
+
+        // `--quiet` belongs to a run. A quiet install would swallow
+        // the lines that say how to check the timer, which are why
+        // installing prints anything at all.
+        for timer in ["--install-timer", "--uninstall-timer"] {
+            assert!(
+                matches!(
+                    sync(&[timer, "--quiet"]),
+                    Err(CliError::Orphan {
+                        flag: "--quiet",
+                        ..
+                    })
+                ),
+                "{timer}"
+            );
+        }
+
+        // And removing the timer reads no device file.
+        assert!(matches!(
+            sync(&["--uninstall-timer", "--config", "/root/device.json"]),
+            Err(CliError::Orphan {
+                flag: "--config",
+                ..
+            })
+        ));
+        // Installing one does — that is the path it bakes in.
+        assert!(sync(&["--install-timer", "--config", "/root/device.json"]).is_ok());
+    }
+
+    #[test]
+    fn sync_refuses_what_it_does_not_take() {
+        assert_eq!(
+            parse_args(&["sync", "--domain", "net.example.com"]),
+            Err(CliError::Arg(ArgError::Unknown("--domain".to_string())))
+        );
+        assert_eq!(
+            parse_args(&["sync", "macbook"]),
+            Err(CliError::TooManyArguments("sync"))
+        );
+        assert_eq!(
+            parse_args(&["sync", "--config"]),
+            Err(CliError::Arg(ArgError::MissingValue("config")))
+        );
+    }
+
+    #[test]
+    fn the_help_for_sync_names_every_flag_it_accepts() {
+        let text = help(Some("sync"));
+        for flag in [
+            "--quiet",
+            "--config",
+            "--install-timer",
+            "--uninstall-timer",
+            "--interval",
+        ] {
+            assert!(text.contains(flag), "the help for sync omits {flag}");
+            assert_ne!(
+                parse_args(&["sync", flag]),
+                Err(CliError::Arg(ArgError::Unknown(flag.to_string()))),
+                "{flag} is in the help but not in the spec"
+            );
+        }
+        // The two things a person has to be told rather than discover:
+        // syncing is not what makes the hub reachable, and the path
+        // has to be absolute because a timer has no session.
+        assert!(text.contains("already knows every"), "{text}");
+        assert!(text.contains("full path to device.json"), "{text}");
+        assert!(text.contains("cron"), "{text}");
     }
 
     #[test]
@@ -874,15 +2284,20 @@ mod tests {
 
     #[test]
     fn recognized_but_unbuilt_commands_are_not_usage_errors() {
-        // `anago sync` was understood and refused on purpose; a typo
+        // `anago ping` was understood and refused on purpose; a typo
         // was not understood at all.
-        assert_eq!(exit_code(&parse_args(&["sync"]).unwrap_err()), 1);
         assert_eq!(exit_code(&parse_args(&["ping", "macbook"]).unwrap_err()), 1);
         assert_eq!(
             exit_code(&parse_args(&["server", "status"]).unwrap_err()),
             1
         );
         assert_eq!(exit_code(&parse_args(&["snyc"]).unwrap_err()), 2);
+        // And a flag `sync` does take, given wrongly, is a usage error
+        // like any other.
+        assert_eq!(
+            exit_code(&parse_args(&["sync", "--interval", "5m"]).unwrap_err()),
+            2
+        );
         assert_eq!(exit_code(&parse_args(&["rm"]).unwrap_err()), 2);
         assert_eq!(
             exit_code(&parse_args(&["rm", "--force", "x"]).unwrap_err()),
@@ -891,22 +2306,75 @@ mod tests {
     }
 
     #[test]
-    fn help_text_covers_every_m0_command() {
+    fn help_text_covers_every_built_command() {
         let general = help(None);
-        for command in ["server init", "code", "join", "ls", "rm"] {
+        for command in [
+            "server init",
+            "server renew",
+            "sync",
+            "code",
+            "join",
+            "ls",
+            "rm",
+        ] {
             assert!(general.contains(command), "general help omits {command}");
         }
-        // And says where the rest went.
-        assert!(general.contains("M1"), "{general}");
+        // The two flags M1 added are not subcommands, so the list
+        // above cannot carry them and the footer does.
+        assert!(general.contains("--export qr|conf"), "{general}");
+        assert!(general.contains("--install-timer"), "{general}");
+        // And what is still unbuilt says so, so its absence does not
+        // read as a bug. M1 is built now: deferring it here would send
+        // somebody looking for a flag they already have.
+        assert!(!general.contains("(M1)"), "{general}");
         assert!(general.contains("M3"), "{general}");
 
-        for topic in ["server", "join", "code", "ls", "rm"] {
+        for topic in ["server", "renew", "sync", "join", "code", "ls", "rm"] {
             let text = help(Some(topic));
             assert!(text.starts_with("usage: anago "), "{topic}: {text}");
         }
         // An unknown topic falls back to the overview rather than
         // printing nothing.
         assert_eq!(help(Some("nope")), general);
+    }
+
+    #[test]
+    fn the_help_for_server_init_names_every_flag_it_accepts() {
+        // Help that has drifted from the parser is worse than none:
+        // the flag a person copies out of it fails as unknown. This
+        // pins the two together.
+        let text = help(Some("init"));
+        for flag in [
+            "--domain",
+            "--tls-cert",
+            "--tls-key",
+            "--acme-email",
+            "--acme-staging",
+            "--acme-challenge",
+            "--cf-token",
+            "--cf-token-file",
+            "--subnet",
+            "--port",
+            "--api-port",
+            "--no-systemd",
+        ] {
+            assert!(text.contains(flag), "the help for server init omits {flag}");
+            // And every one of them parses, so the help is not
+            // advertising something the parser would refuse.
+            let e = parse_args(&["server", "init", flag]);
+            assert_ne!(
+                e,
+                Err(CliError::Arg(ArgError::Unknown(flag.to_string()))),
+                "{flag} is in the help but not in the spec"
+            );
+        }
+
+        // The two things a person has to be told rather than discover:
+        // staging certificates are not trusted, and a token in argv is
+        // visible to other users.
+        assert!(text.contains("Nothing trusts"), "{text}");
+        assert!(text.contains("`ps`"), "{text}");
+        assert!(text.contains(cfapi::TOKEN_ENV), "{text}");
     }
 
     #[test]

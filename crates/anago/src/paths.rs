@@ -40,6 +40,59 @@ impl ServerPaths {
         self.root.join("state.json")
     }
 
+    /// Where anago keeps the TLS material it issued itself (§9.1).
+    ///
+    /// Separate from a certificate a person gave anago with
+    /// `--tls-cert`: those files stay where they are and anago only
+    /// reads them. Everything under here is anago's to write and
+    /// replace, which is also what makes going back to a manual
+    /// certificate a matter of pointing the state elsewhere.
+    // Both land in the issuance slice, which writes the account key
+    // and the certificate under this directory.
+    pub fn tls_dir(&self) -> PathBuf {
+        self.root.join("tls")
+    }
+
+    /// The certificate anago issued (§9).
+    pub fn certificate(&self) -> PathBuf {
+        self.tls_dir().join("fullchain.pem")
+    }
+
+    /// Its private key.
+    pub fn private_key(&self) -> PathBuf {
+        self.tls_dir().join("privkey.pem")
+    }
+
+    /// The ACME account credentials — the account key, and the URL that
+    /// key is known to the CA by (§9.1).
+    pub fn account_key(&self) -> PathBuf {
+        self.tls_dir().join("account.key")
+    }
+
+    /// Where the Cloudflare API token is kept, and only when DNS-01
+    /// renewal will need it again (§9.1).
+    ///
+    /// Beside the state file rather than inside it: a state file leaks
+    /// through paths a token should not follow — a backup, a dump
+    /// pasted into an issue — and a token that can rewrite the zone is
+    /// the widest-reaching secret anago handles (§13).
+    pub fn cf_token(&self) -> PathBuf {
+        self.root.join("cf-token")
+    }
+
+    /// The flock target that serializes **issuance** — the renewal
+    /// timer against a `server renew` typed by hand (§9.1).
+    ///
+    /// Not the state lock: an issuance takes minutes (a CA looks, a
+    /// record spreads), and holding the state lock for that would stop
+    /// every join in the meantime. This one is held for the whole
+    /// attempt and protects what an issuance owns — the account file,
+    /// the certificate pair, and the CA's opinion of how often it is
+    /// being asked.
+    pub fn issue_lock(&self) -> PathBuf {
+        self.root.join("issue.lock")
+    }
+
     /// The flock target that serializes concurrent joins (§13).
     ///
     /// A separate file, not `state.json` itself: the writer replaces
@@ -57,6 +110,16 @@ pub const DEVICE_FILE: &str = "device.json";
 
 /// The join lock's name inside the config directory.
 pub const JOIN_LOCK: &str = "join.lock";
+
+/// The flock target that keeps two `sync` runs from rewriting the same
+/// config at once — the timer against a person typing the command
+/// (§6.3).
+///
+/// Beside the device file rather than beside the WireGuard config,
+/// because that is the directory this run has just read from and is
+/// therefore known to exist. A device with a `device.json` but no
+/// `/etc/wireguard` yet should still be able to report itself in sync.
+pub const SYNC_LOCK: &str = "sync.lock";
 
 /// Paths under a device's config directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -321,11 +384,13 @@ mod tests {
         // against the handle `join` holds). A name with a separator in
         // it would escape that directory and put the check and the
         // write back on different inodes.
-        for name in [DEVICE_FILE, JOIN_LOCK] {
+        for name in [DEVICE_FILE, JOIN_LOCK, SYNC_LOCK] {
             assert!(!name.contains('/'), "{name} is a path, not a name");
             assert_ne!(name, "..");
         }
         assert_ne!(DEVICE_FILE, JOIN_LOCK);
+        assert_ne!(DEVICE_FILE, SYNC_LOCK);
+        assert_ne!(JOIN_LOCK, SYNC_LOCK);
     }
 
     #[test]

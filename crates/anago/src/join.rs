@@ -10,7 +10,8 @@
 //! to say about each way the hub can refuse.
 
 use std::fmt;
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use anago_core::code::JoinCode;
 use anago_core::json::{self, Value};
@@ -345,8 +346,8 @@ pub fn run(
         host: domain,
         port: api_port,
         path: PATH_JOIN,
-        body: Some(&body),
-        token: None,
+        body: Some(client::Body::json(&body)),
+        authorization: None,
     })
     .map_err(JoinError::Client)?;
 
@@ -370,8 +371,475 @@ pub fn run(
             reservation.commit();
             Ok(Joined { config })
         }
-        Err(e) => Err(post_registration(&response.body, domain, api_port, &e)),
+        Err(e) => Err(post_registration(
+            &response.body,
+            domain,
+            api_port,
+            NOTHING_SAVED,
+            &e,
+        )),
     }
+}
+
+/// What `--export conf` registered, and where its config went.
+///
+/// No token. §8 throws the one the hub sent away: the official
+/// WireGuard app never calls anago's control API, so a token that
+/// reached the phone would be a credential with nothing to use it on.
+/// The consequence is that the phone cannot `ls`, `rm` or `sync` itself
+/// — it is removed from the hub with `anago rm <name>` (§8).
+#[derive(Debug)]
+pub struct Exported {
+    pub config: DeviceConfig,
+    /// Which way the config left, so the note that follows can say the
+    /// right thing about where it is now.
+    pub handed: Handed,
+}
+
+/// Which way a config left this machine.
+///
+/// The same three shapes as [`Handover`], minus what only the run
+/// needed. They are apart because what a person has to do next differs
+/// in each: a file to delete, a scrollback to clear, or a picture on a
+/// screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Handed {
+    Text,
+    File(PathBuf),
+    Qr,
+}
+
+/// Registers a **phone** and hands over its config (§8, §7.3).
+///
+/// **Nothing local happens.** No wg config, no `device.json`, no join
+/// lock, and so none of §6.2's already-joined refusal either — this
+/// machine is not the one joining. That is a property of the signature
+/// rather than a rule to remember: there is no `ClientPaths` and no wg
+/// path here to write to. Duplicate names are still refused, by the
+/// hub (§8.1).
+///
+/// It needs no root for the same reason. The one thing it shares with a
+/// local join is `wg genkey`/`wg pubkey`.
+///
+/// **The order is the same as a local join's, for the same reason.**
+/// Everything that can refuse happens before the code is spent: the
+/// tools, and the `--out` file, which is created empty and exclusively
+/// (§7.3 — anago never writes over a file that is already there). A
+/// file already at that name is then an error somebody can fix without
+/// burning a single-use code.
+///
+/// And every failure *after* the hub answers goes out through the same
+/// door a local join uses: [`post_registration`] undoes the
+/// registration, so a phone that never received its config is not left
+/// occupying a name and an address on the hub.
+///
+/// **Human verification needed**: runs `wg genkey` and talks to a real
+/// hub.
+/// Where an export puts the config it renders.
+///
+/// The rendered text never comes back to the caller. A [`SecretText`]
+/// travelling up the call stack would only widen the set of places a
+/// private key can be printed from by accident (§7.3), so the thing
+/// that will consume it is handed *in*.
+pub enum Handover<'a> {
+    /// `--export conf` with no `--out`: the config text, on stdout.
+    Text,
+    /// `--export conf --out <p>`: the config text, in a file at 0600.
+    File(&'a Path),
+    /// `--export qr`: drawn on the terminal, in `columns` of it. Never
+    /// a file — anago writes no image files (§10.2), and a QR is only
+    /// ever looked at.
+    Qr { columns: usize },
+}
+
+impl Handover<'_> {
+    /// The file this will take before the code is spent, if any.
+    fn claims(&self) -> Option<&Path> {
+        match self {
+            Handover::File(path) => Some(path),
+            Handover::Text | Handover::Qr { .. } => None,
+        }
+    }
+
+    fn handed(&self) -> Handed {
+        match self {
+            Handover::Text => Handed::Text,
+            Handover::File(path) => Handed::File(path.to_path_buf()),
+            Handover::Qr { .. } => Handed::Qr,
+        }
+    }
+}
+
+pub fn export_conf(
+    domain: &str,
+    code: &JoinCode,
+    name: &DeviceName,
+    api_port: u16,
+    to: Handover<'_>,
+) -> Result<Exported, JoinError> {
+    // `wg` alone: this makes a keypair and brings no interface up, so
+    // asking for `wg-quick` would refuse a machine that can do all of
+    // it, in a sentence about a program it never runs.
+    wg::check_keygen_from_env().map_err(JoinError::Wg)?;
+    // Still before the code is spent: a window that could not hold the
+    // smallest QR there is cannot hold whatever the hub answers with
+    // either. The exact size needs the answer, so the rest of that
+    // check waits — but this half costs nothing and saves a code.
+    if let Handover::Qr { columns } = to {
+        let floor = anago_core::qr::columns(anago_core::qr::SMALLEST, anago_core::qr::Blocks::Half);
+        if columns < floor {
+            return Err(JoinError::TooNarrow {
+                needed: floor,
+                available: columns,
+            });
+        }
+    }
+    let mut claimed = match to.claims() {
+        Some(path) => Some(Claimed::take(path)?),
+        None => None,
+    };
+
+    let (private_key, public_key) = wg::generate_keypair().map_err(JoinError::Wg)?;
+    let body = request_body(code, name, &public_key);
+    let response = client::send(&Request {
+        method: Method::Post,
+        host: domain,
+        port: api_port,
+        path: PATH_JOIN,
+        body: Some(client::Body::json(&body)),
+        authorization: None,
+    })
+    .map_err(JoinError::Client)?;
+
+    if !response.is_success() {
+        // Nothing was registered, so nothing needs undoing — and the
+        // claimed file goes away with the guard.
+        return Err(JoinError::Refused(explain(response.status, &response.body)));
+    }
+
+    match hand_over(
+        &response.body,
+        domain,
+        api_port,
+        private_key,
+        &to,
+        claimed.as_mut(),
+    ) {
+        Ok(config) => {
+            if let Some(claimed) = claimed.as_mut() {
+                claimed.keep();
+            }
+            Ok(Exported {
+                config,
+                handed: to.handed(),
+            })
+        }
+        Err(e) => Err(post_registration(
+            &response.body,
+            domain,
+            api_port,
+            NOTHING_HANDED_OVER,
+            &e,
+        )),
+    }
+}
+
+/// Renders the phone's config and hands it over — the export's half of
+/// [`finish`].
+///
+/// The rendered text goes straight from here to its destination and is
+/// never returned. A [`SecretText`] that travelled back up the call
+/// stack would only widen the set of places a private key can be
+/// printed from by accident (§7.3).
+fn hand_over(
+    body: &str,
+    domain: &str,
+    api_port: u16,
+    private_key: PrivateKey,
+    to: &Handover<'_>,
+    claimed: Option<&mut Claimed>,
+) -> Result<DeviceConfig, JoinError> {
+    let (config, profile) = accepted(body, domain, api_port, private_key)?;
+    let text = wgconf::export_profile(&profile);
+    match to {
+        Handover::File(_) => match claimed {
+            Some(claimed) => claimed.fill(&text)?,
+            // Only reachable if `claims` and this ever disagreed about
+            // which endings take a file.
+            None => return Err(JoinError::Unsent("no file was claimed".to_string())),
+        },
+        Handover::Text => to_stdout(text.expose())?,
+        Handover::Qr { columns } => {
+            let drawn = drawn_code(&text, *columns)?;
+            to_stdout(&drawn)?;
+        }
+    }
+    Ok(config)
+}
+
+/// The config as a QR code, ready to print.
+///
+/// The encoder is the binary's (§10.2); everything from the module grid
+/// on is [`anago_core::qr`], where it is unit-tested. A window too
+/// narrow is an error rather than a smaller code: a QR wider than the
+/// terminal wraps, and a wrapped one still looks like a QR.
+fn drawn_code(text: &wgconf::SecretText, columns: usize) -> Result<String, JoinError> {
+    let modules = crate::qrcode::encode(text).ok_or_else(|| {
+        // A wg config is a few hundred bytes and the largest version
+        // holds thousands, so this is unreachable short of a hub
+        // answering with something enormous.
+        JoinError::BadResponse("the config is too long to put in a QR code".to_string())
+    })?;
+    match anago_core::qr::draw(&modules, columns) {
+        anago_core::qr::Drawing::Code(text) => Ok(text),
+        anago_core::qr::Drawing::TooNarrow { needed, available } => {
+            Err(JoinError::TooNarrow { needed, available })
+        }
+    }
+}
+
+/// Writes the body out, and turns a closed pipe into an error the undo
+/// path understands.
+fn to_stdout(text: &str) -> Result<(), JoinError> {
+    let mut stdout = std::io::stdout().lock();
+    stdout
+        .write_all(text.as_bytes())
+        .and_then(|()| stdout.flush())
+        .map_err(|e| JoinError::Unsent(e.to_string()))
+}
+
+/// A `--out` file, created before the join and deleted unless it is
+/// filled.
+///
+/// The descriptor is held from the create to the write, so what gets
+/// written is the file this run made — not whatever has since arrived
+/// at that name. A `--out` is a path a person typed, in a directory
+/// anago knows nothing about and may not own (§13): `/tmp` is the
+/// ordinary case, and anybody can rename a file out of `/tmp` and put
+/// their own there.
+///
+/// **Holding the descriptor is not enough on its own.** It settles
+/// which file gets written; it says nothing about which file has that
+/// *name* by the time the hub has answered. Both endings need the
+/// answer, and they need it for opposite reasons:
+///
+/// - Success would otherwise report a path that no longer holds the
+///   config — "written to phone.conf" about somebody else's file.
+/// - Cleanup would otherwise `remove_file` whatever is at the name
+///   now, which is the one thing §7.3 promises never happens: anago
+///   does not delete a file it did not create.
+///
+/// So both ask [`Claimed::is_ours`] first, and neither touches the name
+/// when the answer is no.
+#[derive(Debug)]
+struct Claimed {
+    path: PathBuf,
+    file: std::fs::File,
+    kept: bool,
+}
+
+impl Claimed {
+    fn take(path: &Path) -> Result<Claimed, JoinError> {
+        let file = fsutil::open_new_private(path).map_err(|e| JoinError::Save {
+            what: "the config file",
+            target: Target::user_file(path),
+            kind: e.kind(),
+            source: e.to_string(),
+        })?;
+        Ok(Claimed {
+            path: path.to_path_buf(),
+            file,
+            kept: false,
+        })
+    }
+
+    fn fill(&mut self, text: &wgconf::SecretText) -> Result<(), JoinError> {
+        self.file
+            .write_all(text.expose().as_bytes())
+            .and_then(|()| self.file.sync_all())
+            .map_err(|e| JoinError::Save {
+                what: "the config file",
+                target: Target::user_file(&self.path),
+                kind: e.kind(),
+                source: e.to_string(),
+            })?;
+        // Asked after the write, because it is the write that has to
+        // have landed somewhere reachable. The config is in the file
+        // this run created either way; the question is whether anyone
+        // can still find it by the name they gave.
+        if !self.is_ours() {
+            return Err(JoinError::Taken(self.path.clone()));
+        }
+        Ok(())
+    }
+
+    /// Whether `path` still names the file this run created.
+    ///
+    /// `fstat` on the held descriptor against `lstat` on the name:
+    /// same device, same inode. `lstat` rather than `stat`, so a
+    /// symlink dropped at the name is a mismatch rather than a
+    /// follow-through to whatever it points at.
+    ///
+    /// Anything unreadable is a "no". The two callers both want the
+    /// careful answer — one would report a path it cannot vouch for,
+    /// the other would delete something.
+    ///
+    /// It cannot make the check atomic with what follows it: POSIX has
+    /// no unlink-this-descriptor. What it does is shrink the window
+    /// from the whole network call, which is seconds long and easy to
+    /// win, to the gap between two syscalls.
+    fn is_ours(&self) -> bool {
+        use std::os::unix::fs::MetadataExt;
+
+        let (Ok(held), Ok(named)) = (self.file.metadata(), std::fs::symlink_metadata(&self.path))
+        else {
+            return false;
+        };
+        held.dev() == named.dev() && held.ino() == named.ino()
+    }
+
+    fn keep(&mut self) {
+        self.kept = true;
+    }
+}
+
+impl Drop for Claimed {
+    fn drop(&mut self) {
+        if self.kept {
+            return;
+        }
+        // Only ever the file this run created: `open_new_private`
+        // refused to open an existing one, and this refuses to delete
+        // a name that has stopped meaning it. What was written into
+        // the orphaned inode goes away when the descriptor closes —
+        // unless somebody renamed it somewhere, and a name nobody here
+        // knows is not one to go deleting.
+        if self.is_ours() {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// What to say once a phone's config has left this machine (§7.3).
+///
+/// Always, and without looking at where standard output goes. Whether
+/// it is a terminal or a pipe changes what a person should do about it,
+/// but detecting that would mean two behaviours to reason about and one
+/// of them wrong whenever the guess missed. The same sentence every
+/// time is the one that can be relied on.
+pub fn export_note(name: &DeviceName, handed: &Handed) -> String {
+    // A QR is not plain text on the screen, and calling it that would
+    // let somebody think the picture is safer than the words. It is the
+    // same key; anything that can read the code has it.
+    let mut note = String::from(match handed {
+        Handed::Qr => {
+            "This code carries the phone's private key. Anything that can\nread it has the key.\n\n"
+        }
+        Handed::Text | Handed::File(_) => "This is the phone's private key, in plain text.\n\n",
+    });
+    match handed {
+        Handed::File(path) => note.push_str(&indented(&[
+            &format!(
+                "It is in {} (0600). Move it to the phone, then",
+                path.display()
+            ),
+            &format!(
+                "delete it: `rm {}`. Backups and cloud-synced",
+                path.display()
+            ),
+            "folders are the real risk — a .conf left in",
+            "~/Documents copies itself somewhere quietly.",
+        ])),
+        Handed::Text => note.push_str(&indented(&[
+            "Move it to the phone, then take it off the screen and out",
+            "of the record. Both: neither on its own is enough.",
+            "",
+            "`clear` (or Ctrl-L) takes it off the screen — and puts it",
+            "in the scrollback. So clear that next, with your terminal's",
+            "own command: Clear Scrollback in its menu, or",
+            "`clear-history` under tmux. In that order nothing is left;",
+            "clearing the record first only files the screen away after",
+            "it. Some terminals keep scrollback on disk, and over SSH",
+            "it is at both ends.",
+            "",
+            "For a file, use --out rather than `>`: a shell redirect",
+            "takes its mode from your umask, which is usually 0644.",
+            "anago's own file is 0600, and never replaces one that",
+            "is already there.",
+        ])),
+        // The same key, as a picture. `--out` is not the advice here:
+        // `--export qr` takes none, because anago writes no image
+        // files (§10.2).
+        Handed::Qr => note.push_str(&indented(&[
+            "Scan it, then take it off the screen and out of the",
+            "record. Both: neither on its own is enough.",
+            "",
+            "`clear` (or Ctrl-L) takes it off the screen — and puts it",
+            "in the scrollback. So clear that next, with your terminal's",
+            "own command: Clear Scrollback in its menu, or",
+            "`clear-history` under tmux, which empties the record and",
+            "leaves what is on the pane exactly where it is. In that",
+            "order nothing is left.",
+            "",
+            "A photograph of the screen keeps it too, and a QR is the",
+            "shape people photograph.",
+            "",
+            "For a file instead, `--export conf --out <path>` writes",
+            "one at 0600.",
+        ])),
+    }
+    note.push('\n');
+    // What the phone cannot do is remove *itself*: §8 throws its token
+    // away, so it has no way to call the API. Removing it is ordinary
+    // — `anago rm` on the hub, or on any device that did keep a
+    // token, since the API authenticates the caller and not the
+    // subject. Naming only the hub would send somebody to the server
+    // for something they could do from the laptop in front of them.
+    note.push_str(&indented(&[
+        &format!("The hub knows this phone as {name}, like any other device."),
+        "What it cannot do is remove itself — it has no anago and no",
+        &format!("token — so somebody else does: `anago rm {name}` on the"),
+        "hub, or on any device that has joined.",
+    ]));
+    // A code that is too wide is refused before it is drawn
+    // (`JoinError::TooNarrow`). A code that is drawn and still will not
+    // scan has no error to report: the terminal's font decides whether
+    // the half-height blocks meet, and anago cannot see the screen. So
+    // the way out is said here, beside the code, while the person is
+    // still looking at it — and it is the removal above, because the
+    // key is only on this screen and there is no re-drawing it.
+    if matches!(handed, Handed::Qr) {
+        note.push('\n');
+        note.push_str(&indented(&[
+            "If the phone will not read it, that is the way out too:",
+            "some fonts draw the half-height blocks with a seam, and a",
+            "code nothing can scan cannot be re-sent — the key is only",
+            &format!("on this screen. `anago rm {name}`, a fresh `anago code`,"),
+            "then `--export conf` hands the same config over as text.",
+        ]));
+    }
+    note
+}
+
+/// Lays a block of detail out under a heading, the way every other note
+/// here does.
+///
+/// Built line by line rather than as one literal with continuations:
+/// the indentation is part of what this prints, and a literal that
+/// carries it in backslash-continued source is one a reformat can
+/// quietly rewrite.
+fn indented(lines: &[&str]) -> String {
+    lines
+        .iter()
+        .map(|line| {
+            if line.is_empty() {
+                // No trailing spaces on a blank line.
+                "\n".to_string()
+            } else {
+                format!("     {line}\n")
+            }
+        })
+        .collect()
 }
 
 /// Where a finished join writes, and on whose behalf.
@@ -391,27 +859,58 @@ fn finish(
     private_key: PrivateKey,
     to: &Destination,
 ) -> Result<DeviceConfig, JoinError> {
+    let (config, profile) = accepted(body, domain, api_port, private_key)?;
+    publish(&config, &profile, to)?;
+    Ok(config)
+}
+
+/// The hub's answer, decoded and checked, with this device's key in it.
+///
+/// One place for it, because both endings need exactly the same thing
+/// first: nothing from the hub reaches a config file — root-owned here,
+/// a phone's there — unparsed.
+fn accepted(
+    body: &str,
+    domain: &str,
+    api_port: u16,
+    private_key: PrivateKey,
+) -> Result<(DeviceConfig, ClientProfile), JoinError> {
     let value = json::parse(body).map_err(|e| JoinError::BadResponse(e.to_string()))?;
     let answer =
         JoinResponse::from_json(&value).map_err(|e| JoinError::BadResponse(e.to_string()))?;
 
     let config = DeviceConfig::from_response(domain, api_port, answer);
-    // Validated before a byte is written: nothing from the hub reaches
-    // a root-owned file unparsed.
     config.validate()?;
     let profile = config.profile(private_key)?;
-
-    publish(&config, &profile, to)?;
-    Ok(config)
+    Ok((config, profile))
 }
+
+/// What a failed local join leaves undone.
+const NOTHING_SAVED: &str = "nothing could be saved on this machine";
+
+/// What a failed export leaves undone. Deliberately not the same
+/// sentence: that path writes no local files at all (§8), so "nothing
+/// could be saved" would send somebody looking on this machine for a
+/// file that was never going to be here.
+const NOTHING_HANDED_OVER: &str = "the config never reached the phone";
 
 /// Turns a failure that happened after registration into an error that
 /// says what state the hub is in.
 ///
+/// `what` is the half of that sentence only the caller knows — the two
+/// paths leave different things undone, and one wording for both would
+/// be wrong for whichever it was not written for.
+///
 /// The credentials for undoing are read from the raw body, not from the
 /// decoded config — the point is to still clean up when it was a *later*
 /// field that was unreadable.
-fn post_registration(body: &str, domain: &str, api_port: u16, cause: &JoinError) -> JoinError {
+fn post_registration(
+    body: &str,
+    domain: &str,
+    api_port: u16,
+    what: &'static str,
+    cause: &JoinError,
+) -> JoinError {
     let outcome = match undo_credentials(body) {
         Some((name, token)) => {
             if undo_registration(domain, api_port, &name, &token).is_ok() {
@@ -425,6 +924,7 @@ fn post_registration(body: &str, domain: &str, api_port: u16, cause: &JoinError)
         None => Undo::Unknown,
     };
     JoinError::SavedNothing {
+        what,
         source: cause.to_string(),
         recovery: recovery_note(outcome),
     }
@@ -652,7 +1152,7 @@ fn undo_registration(
         port: api_port,
         path: &path,
         body: None,
-        token: Some(token),
+        authorization: Some(&client::HeaderValue::device_token(token)),
     })
     .map_err(JoinError::Client)?;
     if response.is_success() {
@@ -803,7 +1303,7 @@ fn publish(
     profile: &ClientProfile,
     to: &Destination,
 ) -> Result<(), JoinError> {
-    fsutil::write_private(to.wg_config, &wgconf::client_config(profile)).map_err(|e| {
+    fsutil::write_private(to.wg_config, wgconf::client_config(profile).expose()).map_err(|e| {
         JoinError::Save {
             what: "the WireGuard config",
             target: Target::system_file(to.wg_config),
@@ -875,9 +1375,26 @@ pub enum JoinError {
         kind: std::io::ErrorKind,
         source: String,
     },
-    /// The hub registered this device and the local files could not be
-    /// saved — the one failure that leaves the two sides disagreeing.
-    SavedNothing { source: String, recovery: String },
+    /// The hub registered this device and this side could not finish —
+    /// the one failure that leaves the two sides disagreeing. `what`
+    /// says which side of the finish it was: files that could not be
+    /// written, or a config that never reached the phone.
+    SavedNothing {
+        /// What did not happen, in the terms of the path that failed:
+        /// a local join saves files, an export hands a config over.
+        what: &'static str,
+        source: String,
+        recovery: String,
+    },
+    /// A rendered config could not be written to standard output — a
+    /// closed pipe, most often. Its own variant because there is no
+    /// file and no owner to blame, only a destination that went away.
+    Unsent(String),
+    /// The `--out` name stopped meaning the file anago created, while
+    /// the hub was being asked.
+    Taken(PathBuf),
+    /// The terminal is too narrow to draw the code in.
+    TooNarrow { needed: usize, available: usize },
     /// An existing `device.json` could not be read — raised by
     /// [`DeviceConfig::parse`], and so reached through `ls`/`rm` as
     /// well as through a re-`join`.
@@ -941,10 +1458,32 @@ impl fmt::Display for JoinError {
                 Some(target),
                 *kind,
             )),
-            JoinError::SavedNothing { source, recovery } => write!(
+            JoinError::SavedNothing {
+                what,
+                source,
+                recovery,
+            } => write!(
                 f,
-                "the hub registered this device but nothing could be saved locally \
-                 ({source}) — {recovery}"
+                "the hub registered this device but {what} ({source}) — {recovery}"
+            ),
+            JoinError::Unsent(detail) => write!(
+                f,
+                "the config could not be written to standard output: {detail} — so \
+                 nothing reached the phone"
+            ),
+            JoinError::Taken(path) => write!(
+                f,
+                "{} was renamed, removed or replaced while the hub was being asked, so \
+                 the config went into a file that no longer has that name — whatever \
+                 is there now was left alone, and is not it",
+                path.display()
+            ),
+            JoinError::TooNarrow { needed, available } => write!(
+                f,
+                "this terminal is {available} columns and the code needs {needed} — a \
+                 QR wider than the window wraps, and a wrapped one still looks like a \
+                 QR code. Widen the window and run this again, or use `--export conf` \
+                 to hand the same config over as text"
             ),
             JoinError::DeviceFile(detail) => write!(f, "device file: {detail}"),
         }
@@ -999,6 +1538,336 @@ mod tests {
         let mut broken = config();
         broken.server_address = "10.100.0.999".to_string();
         assert_eq!(broken.server_ip(), None);
+    }
+
+    #[test]
+    fn an_exported_config_is_the_same_profile_without_the_comments() {
+        // §8: identical fields in identical order, because a phone
+        // needs exactly what a laptop needs. What it drops is the
+        // "generated file" comment, which would be a lie — anago never
+        // sees this file again.
+        let profile = profile_of(&config());
+        let phone = wgconf::export_profile(&profile);
+        let laptop = wgconf::client_config(&profile);
+        assert!(phone.expose().contains("[Interface]"), "{}", phone.expose());
+        assert!(phone.expose().contains("[Peer]"), "{}", phone.expose());
+        for line in phone.expose().lines() {
+            assert!(!line.starts_with('#'), "{line}");
+            assert!(
+                laptop.expose().contains(line),
+                "{line} is not in the laptop's config"
+            );
+        }
+        // The rendered text is the one thing that carries the key out.
+        assert!(phone.expose().contains("PrivateKey"), "{}", phone.expose());
+        // And it says so nowhere else: both wrappers redact.
+        assert_eq!(format!("{phone:?}"), "SecretText(redacted)");
+        assert_eq!(format!("{phone}"), "SecretText(redacted)");
+    }
+
+    #[test]
+    fn an_out_file_is_taken_before_the_code_is_spent() {
+        // A local join claims its two files before asking the hub for
+        // anything, so a permission problem is a retry rather than a
+        // dead end. An export has one file and the same rule.
+        let dir = TempDirs::new();
+        let path = dir.root.join("phone.conf");
+
+        let mut claimed = Claimed::take(&path).unwrap();
+        assert!(path.exists(), "claimed up front");
+        assert_eq!(mode_of(&path), 0o600, "§7.3: anago's own file is 0600");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+
+        claimed
+            .fill(&wgconf::export_profile(&profile_of(&config())))
+            .unwrap();
+        claimed.keep();
+        drop(claimed);
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("PrivateKey"), "{written}");
+        assert_eq!(mode_of(&path), 0o600, "and still is after the write");
+    }
+
+    #[test]
+    fn an_export_that_does_not_finish_leaves_no_file() {
+        // The same shape as the local join's reservation: the claim
+        // deletes itself unless the export gets all the way through, so
+        // a hub call that fails does not leave an empty `phone.conf`
+        // for somebody to send to a phone.
+        let dir = TempDirs::new();
+        let path = dir.root.join("phone.conf");
+        drop(Claimed::take(&path).unwrap());
+        assert!(!path.exists(), "{}", path.display());
+    }
+
+    #[test]
+    fn an_export_never_writes_over_a_file_that_is_already_there() {
+        // §7.3, and the reason it is `O_EXCL` rather than a check: a
+        // person's existing profile is not something to overwrite by
+        // accident, and between looking and writing somebody could put
+        // one there.
+        let dir = TempDirs::new();
+        let path = dir.root.join("phone.conf");
+        std::fs::write(&path, "somebody else's config\n").unwrap();
+
+        let e = Claimed::take(&path).unwrap_err();
+        assert!(matches!(
+            e,
+            JoinError::Save {
+                kind: std::io::ErrorKind::AlreadyExists,
+                ..
+            }
+        ));
+        // Untouched, including by the failed claim's own cleanup.
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "somebody else's config\n"
+        );
+    }
+
+    #[test]
+    fn a_name_that_stopped_meaning_our_file_is_not_written_off_as_success() {
+        // Between the claim and the answer, anybody with write access
+        // to that directory — `/tmp` is the ordinary case — can rename
+        // the file away and put their own at the name. The config went
+        // into the file this run made, which nobody can reach by the
+        // name they typed, so reporting "written to phone.conf" would
+        // be a sentence about somebody else's file.
+        let dir = TempDirs::new();
+        let path = dir.root.join("phone.conf");
+
+        let mut claimed = Claimed::take(&path).unwrap();
+        std::fs::rename(&path, dir.root.join("stolen.conf")).unwrap();
+        std::fs::write(&path, "somebody else's config\n").unwrap();
+
+        let e = claimed
+            .fill(&wgconf::export_profile(&profile_of(&config())))
+            .unwrap_err();
+        assert_eq!(e, JoinError::Taken(path.clone()));
+        assert!(e.to_string().contains("left alone"), "{e}");
+
+        // Dropped without `keep`, and it still leaves the replacement
+        // exactly as it found it — §7.3 promises anago deletes no file
+        // it did not create.
+        drop(claimed);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "somebody else's config\n"
+        );
+    }
+
+    #[test]
+    fn a_cleanup_deletes_only_the_file_it_made() {
+        let dir = TempDirs::new();
+        let path = dir.root.join("phone.conf");
+
+        // Replaced outright, without the claim ever being filled.
+        let claimed = Claimed::take(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, "not ours\n").unwrap();
+        drop(claimed);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not ours\n");
+        std::fs::remove_file(&path).unwrap();
+
+        // A symlink dropped at the name is a mismatch too, not a
+        // follow-through to whatever it points at.
+        let target = dir.root.join("elsewhere.conf");
+        std::fs::write(&target, "elsewhere\n").unwrap();
+        let claimed = Claimed::take(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        drop(claimed);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "elsewhere\n");
+        assert!(
+            path.symlink_metadata().is_ok(),
+            "the symlink is still there"
+        );
+
+        // And the ordinary ending still cleans up after itself.
+        std::fs::remove_file(&path).unwrap();
+        drop(Claimed::take(&path).unwrap());
+        assert!(!path.exists(), "{}", path.display());
+    }
+
+    #[test]
+    fn a_stolen_out_file_undoes_the_registration() {
+        // The phone never got its config, so a name and an address on
+        // the hub belong to nothing. Same door as every other failure
+        // after the hub answers.
+        let e = JoinError::Taken(PathBuf::from("/tmp/phone.conf"));
+        let after = post_registration(
+            &body_with_credentials(),
+            "net.example.com",
+            443,
+            NOTHING_HANDED_OVER,
+            &e,
+        );
+        assert!(matches!(after, JoinError::SavedNothing { .. }), "{after:?}");
+        assert!(after.to_string().contains("/tmp/phone.conf"), "{after}");
+    }
+
+    /// A note's words, with the hand-made wrapping taken back out —
+    /// so an assertion is about what it says, not where a line broke.
+    fn flowed(note: &str) -> String {
+        note.lines().map(str::trim).collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn the_note_says_what_leaked_and_what_to_do_about_it() {
+        let name = DeviceName::parse("폰").unwrap();
+
+        let piped = export_note(&name, &Handed::Text);
+        assert!(piped.contains("private key, in plain text"), "{piped}");
+        assert!(piped.contains("scrollback"), "{piped}");
+        // §7.3: always, without looking at where stdout goes. A shell
+        // redirect takes its mode from the umask; anago's own file does
+        // not.
+        assert!(piped.contains("--out rather than `>`"), "{piped}");
+        assert!(piped.contains("0644"), "{piped}");
+
+        let filed = export_note(&name, &Handed::File(PathBuf::from("/home/jo/phone.conf")));
+        assert!(filed.contains("/home/jo/phone.conf (0600)"), "{filed}");
+        assert!(filed.contains("`rm /home/jo/phone.conf`"), "{filed}");
+        // The risk that is specific to a file rather than a screen.
+        assert!(filed.contains("cloud-synced"), "{filed}");
+        assert!(!filed.contains("scrollback"), "{filed}");
+
+        // §8: the token is thrown away, so the phone cannot remove
+        // itself and somebody has to be told where that happens.
+        // A QR takes no `--out` at all (§10.2), so sending somebody to
+        // one would be advice for a flag this path refuses.
+        let drawn = export_note(&name, &Handed::Qr);
+        assert!(drawn.contains("Scan it"), "{drawn}");
+        assert!(drawn.contains("photograph"), "{drawn}");
+        assert!(!drawn.contains("--out rather than"), "{drawn}");
+        assert!(drawn.contains("--export conf --out <path>"), "{drawn}");
+        // A picture is not safer than the words, and calling it plain
+        // text would let somebody believe it is.
+        assert!(!drawn.contains("in plain text"), "{drawn}");
+        assert!(
+            flowed(&drawn).contains("Anything that can read it has the key"),
+            "{drawn}"
+        );
+
+        // §7.3: the key is on the screen *and* in the record, and the
+        // two are cleared by different commands. `clear` empties the
+        // screen and files it into the scrollback; `clear-history`
+        // empties the scrollback and leaves the pane as it is. A note
+        // that named only one would read as a complete instruction and
+        // leave the key in the half it did not mention.
+        for screen in [&piped, &drawn] {
+            let said = flowed(screen);
+            assert!(
+                said.contains("off the screen and out of the record"),
+                "{screen}"
+            );
+            assert!(said.contains("neither on its own is enough"), "{screen}");
+            // The screen half, and the record half.
+            assert!(
+                said.contains("`clear` (or Ctrl-L) takes it off the screen"),
+                "{screen}"
+            );
+            assert!(said.contains("puts it in the scrollback"), "{screen}");
+            assert!(said.contains("Clear Scrollback in its menu"), "{screen}");
+            assert!(said.contains("`clear-history` under tmux"), "{screen}");
+            // And the order, which is not arbitrary: clearing the
+            // record first only files the screen away after it.
+            assert!(said.contains("In that order"), "{screen}");
+        }
+        // A file leaves nothing on the screen to clear.
+        assert!(!filed.contains("scrollback"), "{filed}");
+
+        for note in [piped, filed, drawn] {
+            assert!(note.contains("The hub knows this phone as 폰"), "{note}");
+            assert!(note.contains("`anago rm 폰`"), "{note}");
+            // What the phone cannot do is remove *itself* — it kept no
+            // token (§8). Removing it is ordinary, and the API
+            // authenticates the caller rather than the subject, so any
+            // joined device can. Naming only the hub would send
+            // somebody to the server for something the laptop in front
+            // of them does.
+            let said = flowed(&note);
+            assert!(said.contains("cannot do is remove itself"), "{note}");
+            assert!(said.contains("or on any device that has joined"), "{note}");
+            // Laid out by hand, so no blank line carries invisible
+            // spaces and no line trails off with them either.
+            for line in note.lines() {
+                assert_eq!(line, line.trim_end(), "{line:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_window_that_could_never_hold_a_code_refuses_before_the_code_is_spent() {
+        // The exact size needs the hub's answer, so most of that check
+        // has to wait. This half does not: a window too narrow for the
+        // smallest QR there is could not hold whatever comes back
+        // either, and a join code is single use.
+        let floor = anago_core::qr::columns(anago_core::qr::SMALLEST, anago_core::qr::Blocks::Half);
+        assert_eq!(floor, 29, "version 1 plus its quiet zone, compact");
+
+        let e = JoinError::TooNarrow {
+            needed: 65,
+            available: 40,
+        };
+        assert!(e.to_string().contains("40 columns"), "{e}");
+        assert!(e.to_string().contains("needs 65"), "{e}");
+        // Both ways out: the one they can act on now, and the one that
+        // does not depend on the window at all.
+        assert!(e.to_string().contains("Widen the window"), "{e}");
+        assert!(e.to_string().contains("--export conf"), "{e}");
+        assert_eq!(e.to_string().lines().count(), 1, "{e}");
+
+        // Found after the answer, it goes out through the same door
+        // every post-registration failure does — the phone got nothing,
+        // so the hub must not keep a name and an address for it.
+        let after = post_registration(
+            &body_with_credentials(),
+            "net.example.com",
+            443,
+            NOTHING_HANDED_OVER,
+            &e,
+        );
+        assert!(matches!(after, JoinError::SavedNothing { .. }), "{after:?}");
+        assert!(after.to_string().contains("Widen the window"), "{after}");
+    }
+
+    #[test]
+    fn a_config_that_never_reached_the_phone_says_so() {
+        // A closed pipe — `anago join … --export conf | head -1`. The
+        // registration stands, so this goes out through the same door
+        // every post-registration failure does.
+        let e = JoinError::Unsent("Broken pipe (os error 32)".to_string());
+        assert!(e.to_string().contains("nothing reached the phone"), "{e}");
+
+        let after = post_registration(
+            &body_with_credentials(),
+            "net.example.com",
+            443,
+            NOTHING_HANDED_OVER,
+            &e,
+        );
+        assert!(matches!(after, JoinError::SavedNothing { .. }), "{after:?}");
+        assert!(
+            after.to_string().contains("nothing reached the phone"),
+            "the cause survives: {after}"
+        );
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    fn body_with_credentials() -> String {
+        format!(
+            "{{\"name\": \"폰\", \"token\": {:?}, \"address\": \"10.100.0.3\"}}",
+            "ab".repeat(32)
+        )
     }
 
     #[test]
@@ -1126,7 +1995,8 @@ mod tests {
         assert_eq!(profile.subnet.to_string(), "10.100.0.0/24");
         assert_eq!(profile.server_endpoint, "net.example.com:51820");
 
-        let text = wgconf::client_config(&profile);
+        let rendered = wgconf::client_config(&profile);
+        let text = rendered.expose();
         assert!(text.contains("PrivateKey = ZGV2aWNlIHByaXZhdGU="), "{text}");
         assert!(text.contains("AllowedIPs = 10.100.0.0/24"), "{text}");
     }
@@ -1453,6 +2323,7 @@ mod tests {
         assert!(unknown.contains("anago ls"), "{unknown}");
 
         let e = JoinError::SavedNothing {
+            what: NOTHING_SAVED,
             source: "No space left on device".to_string(),
             recovery: stuck,
         };
@@ -1682,7 +2553,8 @@ mod tests {
 
         // Nothing that survives validation can carry a second line.
         let good = super::tests::config();
-        let text = wgconf::client_config(&profile_of(&good));
+        let rendered = wgconf::client_config(&profile_of(&good));
+        let text = rendered.expose();
         assert!(!text.contains("PostUp"), "{text}");
     }
 

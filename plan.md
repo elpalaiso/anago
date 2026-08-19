@@ -1,68 +1,88 @@
-# M0 구현 계획
+# M1 구현 계획
 
-범위(DESIGN.md §11 M0): `server init`(DNS 수동 안내, TLS는 기존 인증서
-경로 `--tls-cert/--tls-key`) + `join` + 허브-스포크 통신 + `code`/`ls`/`rm`.
-`sync`/ACME/Cloudflare/`--export qr`/홀펀칭은 M1+ — 이 계획에 없다.
+범위(DESIGN.md §11 M1): ACME 자동 TLS 발급·갱신(HTTP-01 기본, Cloudflare
+토큰이 있으면 DNS-01) + Cloudflare A 레코드 자동 upsert + `anago sync`
+(피어 목록을 당겨 wg 설정 갱신) + systemd timer(맥 launchd) 주기 실행
+설치 + `anago join --export qr|conf`(공식 WireGuard 앱용, 폰 경로).
 
-규칙: anago-core는 순수 std(외부 크레이트 금지), 코어 로직은 순수 함수로
-유닛 테스트, 설계 변경은 DESIGN.md 갱신이 먼저, 실서버 검증은 시도하지
-않고 "사람 확인 필요"로 남긴다. 게이트는 `cargo test`.
+M0의 수동 경로는 **그대로 남긴다** — `--tls-cert/--tls-key`로 기존
+인증서를 지정하는 길과 A 레코드 수동 안내는 계속 동작하고, 자동화는
+그 위에 얹는다. 홀펀칭 직결(M2), 이름 해석·`server status`(M3)는 이
+계획에 없다.
 
-## A. 설계 확정 (코드보다 먼저)
+규칙(CLAUDE.md, DESIGN.md §12): anago-core는 순수 std(외부 크레이트
+금지), 코어 로직은 순수 함수로 유닛 테스트, 설계 변경은 DESIGN.md 갱신이
+먼저, env를 바꾸는 테스트 금지(씸 패턴), 실서버(VPS·DNS·인증서·폰)
+검증은 시도하지 않고 `HUMAN-VERIFY.md`에 "사람 확인 필요"로 남긴다.
+게이트는 `cargo test`. 커밋은 지시가 있을 때만.
 
-- [x] DESIGN.md §9/§10 갱신: M0 상태 파일 스키마(필드 목록)와 직렬화 결정을 명시 — 프로토콜/상태 타입의 JSON 인코딩은 anago-core의 순수 std 미니 JSON으로 하고 serde는 쓰지 않는다(또는 반대 결정)를 문장으로 확정
-- [x] DESIGN.md §7 갱신: 기기 토큰의 M0 처리 확정 — 해시(sha2 등 바이너리 크레이트) vs 평문 0600 저장 중 하나를 고르고 근거를 적는다. 코어는 형식 검증·상수시간 비교만 담당함을 명시
-- [x] DESIGN.md §8 갱신: M0에서 실제 구현할 CLI 표면과 API 엔드포인트만 추려 M0/M1 표기를 붙인다(`sync`, `--export`, `/api/v1/endpoint`는 M1+ 표시)
-- [x] DESIGN.md §7 갱신(건너뜀 복구 — 순회 버그로 미실행): 기기 토큰의 M0 처리 확정 — 해시(바이너리 크레이트) vs 평문 0600 저장 중 하나를 고르고 근거를 적는다. 코어는 형식 검증·상수시간 비교만 담당함을 명시
+(M0 계획은 git 히스토리에 있다 — 이 파일은 M1로 교체됐다.)
 
-## B. anago-core — 순수 함수 기반 (외부 크레이트 금지)
+## A. 설계 확정 (코드보다 먼저 — DESIGN.md 갱신)
 
-- [x] `json.rs`: 최소 JSON 값 타입 + 파서(객체/배열/문자열/숫자/불/널, 이스케이프 처리) — 파싱 유닛 테스트
-- [x] `json.rs`: JSON 직렬화(문자열 이스케이프, 결정적 키 순서) + 라운드트립 유닛 테스트, 잘못된 입력에 대한 에러 케이스 테스트
-- [x] `proto.rs`: 컨트롤 API 타입 정의 — JoinRequest/JoinResponse/PeerInfo/PeersResponse/ApiError — 필드 확정만
-- [x] `proto.rs`: 각 타입의 to_json/from_json 구현 + 라운드트립·누락 필드·타입 불일치 유닛 테스트
-- [x] `subnet.rs` 확장: CIDR 문자열 파싱(`10.100.0.0/24`), 서버 주소(.1) 계산, 잘못된 CIDR 거부 — 기존 `next_free_octet`과 결합한 할당 함수 + 유닛 테스트
-- [x] `code.rs`: 조인 코드 형식(`XXXX-XXXX` 문자열 규약 — DESIGN §7.2, 혼동 문자 제외 charset) 정의 + 형식 검증 함수 + 유닛 테스트 (난수 생성은 바이너리 책임, 코어는 형식/검증만)
-- [x] `code.rs`: 코드 수명 판정 순수 함수 — `is_valid(code, issued_at, now, ttl, used)` 형태로 만료·1회용 소진을 판정 + 경계값 유닛 테스트
-- [x] `name.rs`: 기기 이름 검증/정규화(길이, 허용 문자, 소문자화 등) + 상태 내 중복 판정 + 유닛 테스트
-- [x] `token.rs`: 기기 토큰 형식 검증 + 상수시간 비교 함수 + 유닛 테스트 (해싱은 A단계 결정에 따라 바이너리 측)
-- [x] `state.rs`: 서버 상태 모델(서브넷, 서버 키쌍, 포트, 도메인, 피어 목록, 발급 코드) 타입 정의 + json.rs 기반 직렬화/역직렬화 + 라운드트립 유닛 테스트
-- [x] `state.rs`: 상태 전이 순수 함수 — `add_peer`(IP 할당·이름 중복·코드 소진 반영), `remove_peer` + 유닛 테스트(중복 이름, 서브넷 소진, 없는 이름 제거)
-- [x] `wgconf.rs`: 서버측 wg 설정 생성 순수 함수(`[Interface]` + 피어별 `[Peer]`, AllowedIPs = /32) + 스냅샷 유닛 테스트
-- [x] `wgconf.rs`: 클라이언트측 wg 설정 생성 순수 함수(Address, PrivateKey 자리, 서버 Peer: 공개키·엔드포인트·`AllowedIPs = <subnet>`·`PersistentKeepalive = 25`) + 유닛 테스트
-- [x] `render.rs`: `anago ls` 출력 표 렌더링 순수 함수(이름·IP·공개키 축약·마지막 핸드셰이크 표기, 빈 목록 처리) + 유닛 테스트
+- [x] DESIGN.md §10 갱신: M1 의존성 확정 — ACME 라이브러리(instant-acme 등) 채택안, 그것이 끌고 오는 serde/HTTP 스택을 §10.1의 "제3자 JSON은 바이너리 몫" 예외로 명시, QR 인코딩 방식(크레이트 vs 자체), 전부 바이너리 크레이트 한정이며 anago-core는 순수 std 유지임을 문장으로 못박는다
+- [x] DESIGN.md §9.1 갱신: M1 상태 파일 스키마 — TLS 출처(수동 경로 vs ACME 발급물), ACME 계정·인증서 경로, 발급 방식(`http-01`|`dns-01`), 인증서 만료 epoch, Cloudflare zone/record id 캐시 필드를 추가하고 `version` 처리(2로 올릴지, M0 파일을 어떻게 읽을지)를 확정
+- [x] DESIGN.md §8 갱신: M1 CLI 표면 확정 — `server init`의 `--cf-token`/`--acme-email`/`--acme-staging`과 `--tls-cert/--tls-key` 생략 규칙(둘 다 없으면 ACME), `anago sync`의 플래그(`--install-timer`/`--uninstall-timer` 등), `anago join --export qr|conf`의 인자·출력 규약, 이미 선 허브의 인증서 재발급 표면(`server renew` 도입 여부)
+- [x] DESIGN.md §6.3 갱신: `sync`가 M1에서 실제로 하는 일 확정 — 허브-스포크라 클라 `AllowedIPs`가 안 변하는데 무엇을 갱신하는가(서버 공개키·엔드포인트 변경 반영, 제거된 기기의 401 감지·안내, 허브의 `last_seen` 갱신), 타이머 기본 주기, 네트워크 실패 시 조용히 끝내는 규약
+- [x] DESIGN.md §7 갱신: `--export`로 만든 폰 프로필의 보안 모델 — 개인키가 폰이 아니라 이 기기에서 생성돼 화면/파일로 나가는 §6.2 원칙의 단서, QR의 터미널 스크롤백 노출, conf 파일 0600·사용 후 삭제 안내를 명시
+- [x] DESIGN.md §11/§13 갱신: M1 검증 조건(폰이 공식 wg 앱으로 합류)과 새 리스크 — HTTP-01의 :80 개방 요구, DNS-01이 그것을 없애는 대신 토큰 권한을 요구하는 트레이드오프, Let's Encrypt 레이트 리밋(staging 권장), Cloudflare 프록시 off 강제, 맥 launchd 권한 차이
 
-## C. anago 바이너리 — CLI 골격과 파일 I/O
+## B. anago-core — 상태·판정 (순수 std, 외부 크레이트 금지)
 
-- [x] krill `args.rs` 스타일 수제 플래그 파서 이식 + 파싱 유닛 테스트(순수 함수, env 미변경)
-- [x] CLI 디스패치와 도움말: `server init|status`, `code`, `join`, `ls`, `rm` 라우팅 + M0 미구현 서브커맨드의 명확한 안내 문구
-- [x] 경로 해석 씸: 서버 `/var/lib/anago/`, 클라 `~/.config/anago/`, `/etc/wireguard/anago.conf` — env/HOME 의존부를 순수 함수(입력으로 받은 base 경로)로 분리 + 유닛 테스트
-- [x] 파일 유틸: 원자적 쓰기(tmp+rename), 0600 퍼미션 설정(unix), flock 기반 상태 파일 잠금 — 임시 디렉터리 대상 테스트
-- [x] `wg`/`wg-quick` 래퍼: 존재 확인과 설치 안내(맥 brew / 리눅스 배포판), `wg genkey`/`wg pubkey` 호출로 키쌍 생성 (커맨드 조립부는 순수 함수로 분리해 테스트)
+- [x] `state.rs`: TLS 출처 모델 추가 — 수동 인증서 경로와 ACME 발급물을 구분해 담는 타입 + JSON 직렬화/역직렬화 + A단계에서 정한 `version` 규칙(구버전 파일 처리 포함) + 라운드트립·거부 케이스 유닛 테스트
+- [x] `state.rs`: ACME/DNS 상태 필드 추가(계정 키 경로, 발급 방식, 인증서 만료 epoch, Cloudflare zone id/record id 캐시) + 갱신 판정 순수 함수 `needs_renewal(expires_at, now, lead_secs)` + 경계값 유닛 테스트
+- [x] `acme.rs`(core): ACME의 순수한 부분만 — HTTP-01 챌린지 경로(`/.well-known/acme-challenge/<token>`)와 응답 본문 조립, DNS-01 TXT 레코드 이름(`_acme-challenge.<domain>`) 조립, 토큰 형식 검증 + 유닛 테스트. 서명·키·해싱·네트워크는 바이너리 몫임을 주석으로 못박는다
+- [x] `dns.rs`(core): Cloudflare A 레코드 upsert **판정** 순수 함수 — 기존 레코드 목록과 원하는 IP를 받아 `생성 / 수정 / 변경 없음 / 거부(프록시 켜짐·다른 타입 충돌)` 중 하나를 내는 결정 함수 + 유닛 테스트
+- [x] `sync.rs`(core): 동기화 판정 순수 함수 — 저장된 기기 설정과 서버가 준 피어 목록·서버 정보를 비교해 `변경 없음 / wg 설정 재작성 / 이 기기가 제거됨` 중 하나를 내는 결정 함수 + 유닛 테스트(피어 추가만 된 경우가 "변경 없음"임을 고정)
+- [x] `wgconf.rs`: `--export`용 완결형 클라이언트 프로필 생성 순수 함수 — 개인키를 실제로 담아 공식 wg 앱이 읽는 필드만 내보낸다. M0 `client_config`와의 공유·분기를 정리하고 스냅샷 유닛 테스트
+- [x] `render.rs`: M1 출력 렌더링 순수 함수 — `sync` 결과 한 줄 요약, ACME 발급/갱신 진행·성공 문구, `--export` 사용 안내(경고 포함) + 유닛 테스트
 
-## D. 서버 — 컨트롤 플레인
+## C. anago 바이너리 — HTTP 클라이언트와 Cloudflare
 
-- [x] 바이너리 크레이트에 서버 의존성 추가(tokio, axum, rustls 계열) 후 `cargo build` 통과 — 코어는 손대지 않음을 확인
-- [x] HTTPS 리스너: `--tls-cert/--tls-key` PEM 로드 → rustls 설정, 잘못된 경로·형식에 대한 명확한 에러 (경로 검증·에러 문구는 순수 함수 분리)
-- [x] `POST /api/v1/join` 핸들러: 코드 검증 → 이름/공개키 등록 → IP 할당 → 상태 저장(잠금) → JoinResponse (코어 순수 함수 호출부만 얇게)
-- [x] `GET /api/v1/peers` + `DELETE /api/v1/peers/{name}` 핸들러: 기기 토큰 bearer 인증 → 코어 상태 전이 호출
-- [x] 서버 wg 인터페이스 반영: 상태 변경 시 서버 wg 설정 재생성 + `wg syncconf`(또는 wg-quick) 적용, `ip_forward` 확인/안내
-- [x] `anago server init` 조립: 키쌍 생성 → 상태 파일 초기 생성 → DNS 수동 안내 출력(A 레코드 문구, 서버 공인 IP 조회는 실패해도 진행) → 방화벽 체크리스트(:443, :51820/udp) → 첫 조인 코드 출력
-- [x] `--no-systemd` 포그라운드 실행 경로 + systemd 유닛 파일 생성/설치(유닛 텍스트 생성은 순수 함수 + 유닛 테스트)
-- [x] `anago code`: 서버 로컬에서 상태 파일에 코드 발급·저장·출력(`anago join <domain> 7QX4-M2KD` 형태로 복붙 가능하게 — 형식은 DESIGN §7.2)
+- [x] `client.rs` 확장: 허브 이외의 호스트(api.cloudflare.com, ACME 디렉터리)로 보내는 GET/POST/PUT/DELETE 요청 지원 — 헤더(Authorization, Content-Type), 응답 본문 크기 상한, 타임아웃. 요청 조립부는 순수 함수로 유닛 테스트
+- [x] `cfapi.rs`: Cloudflare 토큰 취득 경로 — `--cf-token` / env / 파일(0600) 우선순위 결정 순수 함수 + 토큰 검증 호출 + 권한 부족·만료 시 안내 문구 + 유닛 테스트
+- [x] `cfapi.rs`: zone 조회(도메인 → zone id, 서브도메인이면 상위 zone 탐색) + 응답 파싱 + 실패 시 M0 수동 안내로의 폴백 경로 + 픽스처 기반 파싱 유닛 테스트
+- [x] `cfapi.rs`: A 레코드 목록 조회 → 코어의 upsert 판정 호출 → 생성/수정 실행 + 프록시(주황 구름) 켜짐 거부·경고 + 픽스처 파싱 유닛 테스트
+- [x] `cfapi.rs`: DNS-01용 TXT 레코드 생성·삭제 + 전파 대기(폴링 간격·타임아웃) — 대기 정책은 순수 함수로 분리해 테스트하고, 실패해도 TXT를 반드시 정리하는 경로를 만든다
 
-## E. 클라이언트 — join / ls / rm
+## D. anago 바이너리 — ACME
 
-- [x] HTTPS 클라이언트 최소 구현(rustls 기반 요청/응답, JSON 본문, 타임아웃, 에러 메시지) — 요청 조립부 순수 함수 테스트
-- [x] `anago join <domain> <code> [--name]`: 로컬 키쌍 생성(개인키 로컬 0600) → join 호출 → 응답 저장(`~/.config/anago/`: 도메인·토큰·할당 IP)
-- [x] `anago join` 후속: 클라 wg 설정 파일 작성 + `wg-quick up` 위임 + 서버 .1 ping으로 연결 확인, 실패 시 진단 안내
-- [x] `anago ls`: 로컬 토큰으로 `/api/v1/peers` 호출 → 코어 렌더러로 출력. 서버에서 실행 시 상태 파일 직접 읽는 경로도 지원
-- [x] `anago rm <이름>`: `DELETE /api/v1/peers/{name}` 호출(서버 로컬이면 상태 직접 수정) → 서버 wg 설정 갱신 확인
+- [x] ACME 의존성 추가(A단계 결정 반영) + feature 최소화 + ring provider 유지 확인 → `cargo build`·`cargo test` 통과, 코어 의존성 무변경 확인
+- [x] `acme.rs`(bin): 발급 방식 선택 순수 함수 — `--tls-cert/key` 지정 여부, Cloudflare 토큰 유무, `--acme-staging`을 받아 `수동 인증서 / HTTP-01 / DNS-01`과 디렉터리 URL을 결정 + 유닛 테스트
+- [x] `acme.rs`(bin): 계정 키 생성·저장(`/var/lib/anago/tls/account.key`, 0600) + 디렉터리 조회 + 계정 등록, 기존 계정 재사용 판정 + 순수 부분 유닛 테스트
+- [x] `acme.rs`(bin): HTTP-01 경로 — :80 임시 리스너(챌린지 응답 전용) 기동·종료, 주문→챌린지→검증 폴링→인증서 수령→`/var/lib/anago/tls/`에 0600 저장. 포트 점유·권한 실패 안내
+- [x] `acme.rs`(bin): DNS-01 경로 — Cloudflare TXT 챌린지로 :80 없이 발급, 성공·실패 모두에서 TXT 정리, A단계에서 정한 폴백 규칙대로 HTTP-01 전환 여부 구현
+- [x] `acme.rs`(bin): 갱신 — `server run` 안의 주기 점검 태스크(만료 임박 시 재발급), 재시도 백오프(계산은 순수 함수로 테스트), 레이트 리밋에 걸리지 않도록 실패 간격을 벌리는 정책
+- [x] `tls.rs`/`serve.rs`: 갱신된 인증서를 무중단으로 반영 — rustls 설정 교체(또는 A단계 결정대로 재기동 안내) + 교체 시점 판정 순수 함수 유닛 테스트
 
-## F. 마무리
+## E. server init 통합 (수동 경로 유지)
 
-- [x] 코어 통합 성격 유닛 테스트: 초기 상태 → 코드 발급 → join 2대 → wg 설정 생성 → rm 까지 순수 함수만으로 이어지는 시나리오 테스트
-- [x] 에러 메시지·usage 문구 일괄 점검(권한 부족, wg 미설치, 인증서 없음, 코드 만료, 서브넷 소진 각각의 안내 문구)
-- [x] README에 M0 사용법(서버 1회 + 기기 join) 및 방화벽/DNS 사전 준비 문서화, DESIGN.md §11의 M0 상태 갱신
-- [x] `HUMAN-VERIFY.md`(또는 PR 본문 절)에 "사람 확인 필요" 항목 명시: 실 VPS에서 A 레코드 반영, 실 TLS 인증서로 HTTPS 기동, :443/:51820 방화벽 개방, 기기 2대 join 후 상호 ping, wg-quick 맥/리눅스 동작 차이
-- [x] `cargo test`·`cargo build` 그린 확인, REVIEW.md 지적 반영 여부 점검 (커밋은 지시가 있을 때만)
+- [x] `cli.rs`: `server init` 플래그 확장 — `--cf-token`, `--acme-email`, `--acme-staging` 추가, `--tls-cert/--tls-key`를 선택으로 완화, 상호 배타·필수 조합 검증과 에러 문구 + 파싱 유닛 테스트
+- [x] `init.rs`: 조립 갱신 — 토큰이 있으면 A 레코드 자동 upsert, 없으면 M0 수동 안내 유지 → TLS 확보(수동 경로 검증 또는 ACME 발급) → 상태 저장 → wg·systemd 기동. **실패 시 아무 파일도 남기지 않는 M0의 순서를 유지**하고 검증
+- [x] `init.rs`: 안내 문구 갱신 — 자동화가 한 일(레코드 upsert 결과, 발급된 인증서 만료일)과 사람이 여전히 해야 하는 일(:80/:443/:51820 방화벽, 프록시 off)을 구분해 출력 + 렌더링 유닛 테스트
+- [x] A단계에서 인증서 재발급 표면을 도입하기로 했다면 구현: 이미 선 허브에서 DNS만 다시 밀거나 인증서만 재발급하는 경로(상태 갱신·wg 무영향) + 유닛 테스트
+
+## F. sync 와 주기 실행(timer / launchd)
+
+- [x] `cli.rs`: `anago sync` 라우팅 추가(M0의 "M1에서 들어옴" 안내 제거) + 플래그 파싱 + 유닛 테스트
+- [x] `sync.rs`(bin): 본체 — device.json 로드 → `/api/v1/peers` 호출 → 코어 판정 → 필요할 때만 wg 설정 재작성 + `wg syncconf` 적용. 변경 없으면 조용히 종료
+- [x] `sync.rs`(bin): 실패 처리 — 401(제거된 기기)일 때의 정리 안내, 네트워크 실패 시 타이머가 스팸하지 않도록 하는 종료 코드·로그 규약, 동시 실행 방지 잠금 + 유닛 테스트
+- [x] `systemd.rs`: `anago-sync.service` + `anago-sync.timer` 텍스트 생성 순수 함수(기본 주기, 사용자 단위 여부, 샌드박스 설정) + 유닛 테스트
+- [x] `launchd.rs`: 맥 plist 생성 순수 함수(`StartInterval`, 라벨, 로그 경로) + `launchctl bootstrap/bootout` 명령 조립 순수 함수 + 유닛 테스트
+- [x] `sync --install-timer` / `--uninstall-timer`: 플랫폼 감지 → systemd 또는 launchd 설치·활성화, 비-systemd·비-맥 환경에서는 설치하지 않고 수동 실행 방법을 안내 + 설치 경로 결정부 유닛 테스트
+- [x] `join` 성공 후 타이머 안내/자동 설치(A단계 결정대로) 반영 + 문구 유닛 테스트
+
+## G. 폰 경로 — `join --export qr|conf`
+
+- [x] `cli.rs`: `join --export qr|conf` 파싱 — 값 검증, 로컬 적용 플래그와의 상호 배타, `--name` 기본값 규칙 + 유닛 테스트
+- [x] `join.rs`: `--export conf` 구현 — 로컬 wg 적용과 device.json 쓰기를 건너뛰고, 키쌍 생성 → join 호출 → 완결형 conf를 표준출력 또는 파일(0600)로 출력. 실패 시 서버에 등록만 남지 않도록 기존 undo 경로 재사용
+- [x] QR 인코딩(A단계 결정 방식) 구현 + 터미널 렌더링(반각/전각 블록, 좁은 터미널 안내) + 렌더링 순수 함수 유닛 테스트
+- [x] `--export qr` 조립 + 경고 문구(스크롤백에 개인키가 남음, 스캔 후 화면 정리) 출력 + 폰 기기가 허브 상태에 정상 등록되어 `ls`/`rm`으로 다뤄지는지 확인하는 테스트
+
+## H. 마무리
+
+- [x] 코어 통합 시나리오 테스트 확장: 초기 상태 → ACME 상태 필드 → 기기 2대 join(폰 export 포함) → sync 판정 → rm 까지 순수 함수만으로 잇는 수명주기 테스트
+- [x] 에러 메시지·usage 일괄 점검: :80 점유·권한, CF 토큰 권한 부족·zone 없음, 프록시 켜짐, ACME 레이트 리밋, DNS 전파 타임아웃, 타이머 설치 불가, QR 미지원 터미널
+- [x] README 갱신: M1 사용법(자동 TLS·DNS 경로와 M0 수동 경로 둘 다), 폰 join(QR) 절차, 타이머 설치·확인 방법, 필요한 방화벽 포트 변경(:80)
+- [x] DESIGN.md §11의 M1 상태 갱신 + `HUMAN-VERIFY.md`에 M1 절 추가: 실 ACME 발급·갱신 성공, :80 개방(HTTP-01), CF A 레코드 실제 반영·프록시 off, DNS-01 발급, 폰이 QR로 합류해 상호 ping, 타이머가 실제로 주기 실행됨, 재부팅 후 타이머·인증서 유지
+- [x] `cargo test`·`cargo build`(가능하면 `cargo clippy`) 그린 확인, REVIEW.md 지적 반영 여부 점검 (커밋은 지시가 있을 때만)

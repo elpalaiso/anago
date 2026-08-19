@@ -29,8 +29,31 @@ rustls-pemfile = "2"
 rustls-native-certs = "0.8"
 # SHA-256 for device-token hashes (DESIGN.md §7.1).
 sha2 = "0.10"
+# Third-party JSON only — Cloudflare's and ACME's schemas, never
+# anago's own (DESIGN.md §10.1, §10.2). The mini JSON in anago-core is
+# deliberately strict, which is right for a schema we define and wrong
+# for one we do not.
+serde_json = "1"
+
+# ACME (DESIGN.md §10.2). `default-features = false` is a requirement,
+# not a preference: the defaults select aws-lc-rs, which would put a
+# second crypto backend and a C toolchain requirement under a binary
+# that pins ring above. `rcgen` makes the certificate key and CSR;
+# `hyper-rustls` is the library's own HTTP stack (hyper is already here
+# for the server). `x509-parser` and `time` stay off — they are the ARI
+# path, and it is not taken in M1.
+instant-acme = { version = "0.8", default-features = false, features = ["ring", "rcgen", "hyper-rustls"] }
+
+# QR encoding for `join --export qr` (DESIGN.md §10.2). MIT, no
+# dependencies of its own, and no features to trim. Reed-Solomon,
+# masking and version selection are not ours for the reason §4 principle
+# 1 gives; drawing the grid on a terminal is, and lives in anago-core.
+qrcodegen = "1.8"
 
 [dev-dependencies]
 # Drives the router in tests without binding a port.
 tower = { version = "0.5", default-features = false, features = ["util"] }
+# `tokio::time::pause` — the renewal loop waits in days, and a test that
+# waited with it would too.
+tokio = { version = "1", features = ["test-util"] }
 # tokio/axum/rustls/serde는 M0 서버 구현이 요구할 때 추가한다 (원칙 4).

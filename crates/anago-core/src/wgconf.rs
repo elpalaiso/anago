@@ -15,15 +15,63 @@
 //! subnet — that single `AllowedIPs` line is what makes hub-and-spoke
 //! work without the device knowing any other device exists (§5).
 //!
+//! There is a third file, and it is the device one wearing different
+//! clothes: the profile `join --export` hands to a phone (§8). Same
+//! fields, same order, no comments — [`export_profile`] explains why.
+//!
+//! Every function here returns [`SecretText`], because every file it
+//! renders has a private key in it. The type redacts itself in both
+//! `Debug` and `Display`, so the only way the bytes reach a log line is
+//! through [`SecretText::expose`] — one call that greps (§7.3).
+//!
 //! Making packets actually cross between two devices also needs
 //! `net.ipv4.ip_forward=1` on the server. That is a sysctl, not a
 //! config line, so it belongs to the binary's setup path rather than
 //! here.
 
+use std::fmt;
 use std::net::Ipv4Addr;
 
 use crate::state::{PrivateKey, ServerState};
 use crate::subnet::{Subnet, PREFIX_LEN};
+
+/// Rendered text with a private key in it (§7.3).
+///
+/// [`PrivateKey`] stops a stray `{:?}` on the *structs* that hold a key.
+/// It stops nothing once those are rendered: a config is a plain
+/// `String` with the key inside, and putting one in an error or a debug
+/// line spills it. This type carries that protection across the render.
+///
+/// Both `Debug` and `Display` redact, so the bytes leave through
+/// [`SecretText::expose`] and nowhere else — file, terminal, QR
+/// encoder, and those three should be the whole list.
+///
+/// It cannot make a mistake impossible: an error type that puts
+/// `expose()` in its message still leaks. It makes the mistake visible
+/// at the call site, which is the most a type can do here.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SecretText(String);
+
+impl SecretText {
+    /// The bytes. Deliberately the only way out.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SecretText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SecretText(redacted)")
+    }
+}
+
+impl fmt::Display for SecretText {
+    /// Redacts too. A `Display` that printed the config would be the
+    /// hole this type exists to close.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SecretText(redacted)")
+    }
+}
 
 /// Seconds between keepalives on the device side (§6.3). One config
 /// line is the whole of anago's NAT story: it keeps the mapping open
@@ -39,7 +87,7 @@ pub const PERSISTENT_KEEPALIVE_SECS: u32 = 25;
 ///
 /// Peers appear in state order — the order they joined — so the file
 /// only changes when the network does.
-pub fn server_config(state: &ServerState) -> String {
+pub fn server_config(state: &ServerState) -> SecretText {
     let mut out = String::new();
     out.push_str("[Interface]\n");
     out.push_str("# anago server — generated file, edits are overwritten\n");
@@ -59,7 +107,7 @@ pub fn server_config(state: &ServerState) -> String {
         out.push_str(&format!("PublicKey = {}\n", peer.public_key));
         out.push_str(&format!("AllowedIPs = {}/32\n", peer.address));
     }
-    out
+    SecretText(out)
 }
 
 /// What a device knows about the network after `join` — everything the
@@ -79,20 +127,83 @@ pub struct ClientProfile {
     pub server_endpoint: String,
 }
 
-/// The device's `anago.conf`.
+/// The device's `/etc/wireguard/anago.conf` — the file anago writes and
+/// rewrites.
 ///
 /// One `[Peer]`: the hub. `AllowedIPs` is the whole subnet, so packets
 /// for any device go up the tunnel and the server routes them — which
 /// is why a new device joining needs no change here at all (§6.3).
-pub fn client_config(profile: &ClientProfile) -> String {
+pub fn client_config(profile: &ClientProfile) -> SecretText {
+    SecretText(render_client(profile, true))
+}
+
+/// The same profile for the official WireGuard app, as
+/// `join --export qr|conf` hands it over (§8).
+///
+/// **Identical fields in identical order** — it is the same wg-quick
+/// format, and a phone needs exactly what a laptop needs: an address, a
+/// key, the hub, the whole subnet, and the keepalive that holds a NAT
+/// mapping open from a phone network (§6.3).
+///
+/// What it drops is the comments, for three reasons that all point the
+/// same way:
+///
+/// - "generated file, edits are overwritten" would be a lie. anago
+///   never sees this file again; the phone owns it the moment it is
+///   scanned.
+/// - The official app does not show comments, so they cost the reader
+///   nothing and gain them nothing.
+/// - It also goes out as a QR (§8), and every byte dropped is a
+///   sparser, easier-to-scan code.
+///
+/// The private key inside is this device's doing, not the phone's —
+/// the one deliberate exception to "the private key never leaves the
+/// machine", with its own security rules in §7.3.
+pub fn export_profile(profile: &ClientProfile) -> SecretText {
+    SecretText(render_client(profile, false))
+}
+
+/// Finds this device's private key in its own config.
+///
+/// The one copy of that key is in this file (§9.2) — `device.json`
+/// never holds it — so a `sync` that has to rewrite the config starts
+/// here. `None` when there is no `PrivateKey` line, and then §6.3's
+/// rule applies: do not repair, tell the person to join again, because
+/// there is nothing to build a config out of.
+///
+/// Deliberately forgiving about layout: a person may have reindented
+/// the file or changed its line endings, and neither is a reason to
+/// refuse. It returns the text rather than a validated key because the
+/// shape of a WireGuard key is checked in one place, beside the tools
+/// that print them.
+pub fn private_key_line(config: &str) -> Option<&str> {
+    config.lines().find_map(|line| {
+        let (name, value) = line.trim().split_once('=')?;
+        // `[Peer]` carries no `PrivateKey`, so there is no section to
+        // track: the first one in the file is the interface's.
+        name.trim()
+            .eq_ignore_ascii_case("privatekey")
+            .then(|| value.trim())
+    })
+}
+
+/// The one renderer behind both. The files differ by their comments and
+/// by nothing else, and keeping that true is the point of sharing it:
+/// a phone that works and a laptop that does not would be a bug nobody
+/// would think to look for here.
+fn render_client(profile: &ClientProfile, comments: bool) -> String {
     let mut out = String::new();
     out.push_str("[Interface]\n");
-    out.push_str("# anago — generated file, edits are overwritten\n");
+    if comments {
+        out.push_str("# anago — generated file, edits are overwritten\n");
+    }
     out.push_str(&format!("Address = {}/{PREFIX_LEN}\n", profile.address));
     out.push_str(&format!("PrivateKey = {}\n", profile.private_key.as_str()));
 
     out.push_str("\n[Peer]\n");
-    out.push_str("# anago server\n");
+    if comments {
+        out.push_str("# anago server\n");
+    }
     out.push_str(&format!("PublicKey = {}\n", profile.server_public_key));
     out.push_str(&format!("Endpoint = {}\n", profile.server_endpoint));
     out.push_str(&format!("AllowedIPs = {}\n", profile.subnet));
@@ -106,11 +217,25 @@ pub fn client_config(profile: &ClientProfile) -> String {
 mod tests {
     use super::*;
     use crate::name::DeviceName;
-    use crate::state::{Peer, PrivateKey, ServerKeys, ServerState};
+    use crate::state::{Peer, PrivateKey, ServerKeys, ServerState, Tls};
     use crate::subnet::Subnet;
     use crate::token::TokenHash;
 
     const NOW: i64 = 1_755_500_000;
+
+    // The renderers return `SecretText`; these unwrap once so the
+    // assertions below read as the text they are checking.
+    fn server_config(state: &ServerState) -> String {
+        super::server_config(state).expose().to_string()
+    }
+
+    fn client_config(profile: &ClientProfile) -> String {
+        super::client_config(profile).expose().to_string()
+    }
+
+    fn export_profile(profile: &ClientProfile) -> String {
+        super::export_profile(profile).expose().to_string()
+    }
 
     fn ip(text: &str) -> Ipv4Addr {
         text.parse().unwrap()
@@ -133,8 +258,8 @@ mod tests {
             subnet: Subnet::parse("10.100.0.0/24").unwrap(),
             listen_port: 51820,
             api_port: 443,
-            tls_cert_path: "/etc/ssl/anago/fullchain.pem".to_string(),
-            tls_key_path: "/etc/ssl/anago/privkey.pem".to_string(),
+            tls: Tls::manual("/etc/ssl/anago/fullchain.pem", "/etc/ssl/anago/privkey.pem"),
+            cloudflare: None,
             server: ServerKeys {
                 private_key: PrivateKey::new("c2VydmVyIHByaXZhdGU="),
                 public_key: "c2VydmVyIHB1YmxpYw==".to_string(),
@@ -143,6 +268,48 @@ mod tests {
             peers,
             codes: Vec::new(),
         }
+    }
+
+    #[test]
+    fn the_private_key_is_found_wherever_a_person_left_it() {
+        // The one copy of a device's key is in this file (§9.2), so a
+        // `sync` that has to rewrite the config starts by reading it
+        // back. A file somebody reindented or saved with CRLF is not a
+        // reason to refuse.
+        let key = "dGhpcyBkZXZpY2UncyBwcml2YXRlIGtleSA0NCBjaGE=";
+        let profile = ClientProfile {
+            address: "10.100.0.2".parse().unwrap(),
+            subnet: Subnet::parse("10.100.0.0/24").unwrap(),
+            private_key: PrivateKey::new(key),
+            server_public_key: "c2VydmVyIGtleQ==".to_string(),
+            server_endpoint: "net.example.com:51820".to_string(),
+        };
+        assert_eq!(private_key_line(&client_config(&profile)), Some(key));
+
+        for text in [
+            format!("[Interface]\nPrivateKey={key}\n"),
+            format!("[Interface]\n   PrivateKey   =   {key}   \n"),
+            format!("[Interface]\r\nprivatekey = {key}\r\n"),
+            format!("[Interface]\nPRIVATEKEY = {key}\n[Peer]\n"),
+        ] {
+            assert_eq!(private_key_line(&text), Some(key), "{text:?}");
+        }
+
+        // Nothing to find is `None`, and §6.3 turns that into "join
+        // again" rather than into a repair anago cannot make.
+        assert_eq!(private_key_line(""), None);
+        assert_eq!(
+            private_key_line("[Interface]\nAddress = 10.100.0.2/24\n"),
+            None
+        );
+        assert_eq!(
+            private_key_line("[Peer]\nPublicKey = c2VydmVyIGtleQ==\n"),
+            None,
+            "a public key is not a private one"
+        );
+        // A commented-out line is not a setting. wg-quick reads `#`
+        // as a comment, and so does this.
+        assert_eq!(private_key_line(&format!("# PrivateKey = {key}\n")), None);
     }
 
     #[test]
@@ -280,6 +447,77 @@ AllowedIPs = 10.100.0.0/24
 PersistentKeepalive = 25
 ";
         assert_eq!(client_config(&profile()), expected);
+    }
+
+    #[test]
+    fn an_exported_profile_is_the_same_file_without_the_comments() {
+        // What a phone's official app reads (§8). Comments are the only
+        // difference, and this snapshot is what says so.
+        let expected = "\
+[Interface]
+Address = 10.100.0.2/24
+PrivateKey = ZGV2aWNlIHByaXZhdGU=
+
+[Peer]
+PublicKey = c2VydmVyIHB1YmxpYw==
+Endpoint = net.example.com:51820
+AllowedIPs = 10.100.0.0/24
+PersistentKeepalive = 25
+";
+        assert_eq!(export_profile(&profile()), expected);
+    }
+
+    #[test]
+    fn the_two_client_files_differ_only_in_comments() {
+        // The property the shared renderer exists to hold. A phone that
+        // works and a laptop that does not — or the reverse — would be a
+        // bug nobody would look for in here.
+        let exported = export_profile(&profile());
+        let local: String = client_config(&profile())
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert_eq!(exported, local);
+        assert!(!exported.contains('#'), "{exported}");
+    }
+
+    #[test]
+    fn an_exported_profile_carries_the_key_the_phone_needs() {
+        // It is a standalone file: without the private key the phone
+        // has nothing to bring a tunnel up with. §7.3 covers what that
+        // costs and how the output warns about it.
+        let text = export_profile(&profile());
+        assert!(text.contains("PrivateKey = ZGV2aWNlIHByaXZhdGU="), "{text}");
+        assert!(text.contains("PersistentKeepalive = 25"), "{text}");
+        assert!(text.contains("AllowedIPs = 10.100.0.0/24"), "{text}");
+    }
+
+    #[test]
+    fn an_exported_profile_still_routes_the_whole_subnet_and_no_more() {
+        // Not `0.0.0.0/0`: anago is a private network between devices,
+        // not a full VPN (§3). A phone importing this keeps using its
+        // own connection for everything else.
+        let text = export_profile(&profile());
+        assert!(!text.contains("0.0.0.0/0"), "{text}");
+        let allowed: Vec<&str> = text
+            .lines()
+            .filter(|line| line.starts_with("AllowedIPs"))
+            .collect();
+        assert_eq!(allowed, ["AllowedIPs = 10.100.0.0/24"]);
+    }
+
+    #[test]
+    fn rendered_configs_redact_themselves() {
+        // §7.3: the key survives the render, so the type has to as well.
+        let secret = super::client_config(&profile());
+        assert_eq!(format!("{secret:?}"), "SecretText(redacted)");
+        assert_eq!(format!("{secret}"), "SecretText(redacted)");
+        assert!(!format!("{secret:?}{secret}").contains("ZGV2aWNl"));
+        // And the server's own key gets the same treatment.
+        let secret = super::server_config(&state(Vec::new()));
+        assert_eq!(format!("{secret}"), "SecretText(redacted)");
+        assert!(secret.expose().contains("c2VydmVyIHByaXZhdGU="));
     }
 
     #[test]

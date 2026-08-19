@@ -26,6 +26,9 @@ pub const WG: &str = "wg";
 pub const WG_QUICK: &str = "wg-quick";
 
 /// A command line, assembled but not run.
+///
+/// Not only wg's: `launchd` builds its `launchctl` lines with the same
+/// type, so "what would this run?" has one answer and one `display`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cmd {
     pub program: String,
@@ -33,14 +36,14 @@ pub struct Cmd {
 }
 
 impl Cmd {
-    fn new(program: &str, args: &[&str]) -> Cmd {
+    pub(crate) fn new(program: &str, args: &[&str]) -> Cmd {
         Cmd {
             program: program.to_string(),
             args: args.iter().map(|arg| arg.to_string()).collect(),
         }
     }
 
-    fn with_path(program: &str, args: &[&str], path: &Path) -> Cmd {
+    pub(crate) fn with_path(program: &str, args: &[&str], path: &Path) -> Cmd {
         let mut cmd = Cmd::new(program, args);
         cmd.args.push(path.to_string_lossy().into_owned());
         cmd
@@ -226,20 +229,37 @@ fn is_executable_file(path: &Path) -> bool {
 /// to get it.
 pub fn check_tools(path_var: &str, platform: Platform) -> Result<(), WgError> {
     for tool in [WG, WG_QUICK] {
-        if find_in_path(path_var, tool).is_none() {
-            return Err(WgError::NotFound {
-                tool,
-                hint: install_hint(platform),
-            });
-        }
+        check_tool(path_var, tool, platform)?;
     }
     Ok(())
+}
+
+/// The same, for one tool.
+///
+/// `join --export` makes a keypair and never brings an interface up, so
+/// `wg-quick` is none of its business. Asking for it anyway would
+/// refuse a machine that can do the whole job, and say so in a sentence
+/// about a program the command was never going to run.
+pub fn check_tool(path_var: &str, tool: &'static str, platform: Platform) -> Result<(), WgError> {
+    match find_in_path(path_var, tool) {
+        Some(_) => Ok(()),
+        None => Err(WgError::NotFound {
+            tool,
+            hint: install_hint(platform),
+        }),
+    }
 }
 
 /// [`check_tools`] against this process's real environment.
 pub fn check_tools_from_env() -> Result<(), WgError> {
     let path = std::env::var("PATH").unwrap_or_default();
     check_tools(&path, platform_from(std::env::consts::OS))
+}
+
+/// [`check_tool`] for `wg` alone, against this process's environment.
+pub fn check_keygen_from_env() -> Result<(), WgError> {
+    let path = std::env::var("PATH").unwrap_or_default();
+    check_tool(&path, WG, platform_from(std::env::consts::OS))
 }
 
 /// Generates a keypair by running the tools — the private key is made
@@ -587,6 +607,28 @@ ZGVza3RvcA==\t(none)\t(none)\t10.100.0.3/32\t0\t0\t0\toff
 
         dir.tool("wg-quick", 0o755);
         assert_eq!(check_tools(&bin, Platform::MacOs), Ok(()));
+    }
+
+    #[test]
+    fn a_command_asks_only_for_the_tools_it_runs() {
+        // `join --export` makes a keypair and brings no interface up.
+        // Refusing a machine that has `wg` but not `wg-quick` would
+        // turn away one that can do the whole job, and explain itself
+        // with a sentence about a program it never runs.
+        let dir = TempDir::new();
+        let bin = dir.tool("wg", 0o755).to_string_lossy().into_owned();
+
+        assert_eq!(check_tool(&bin, WG, Platform::MacOs), Ok(()));
+        assert!(
+            check_tools(&bin, Platform::MacOs).is_err(),
+            "wg-quick is not there"
+        );
+
+        // And the narrow check still refuses when its own tool is gone.
+        assert!(matches!(
+            check_tool("/nonexistent-anago", WG, Platform::Linux),
+            Err(WgError::NotFound { tool: WG, .. })
+        ));
     }
 
     #[test]

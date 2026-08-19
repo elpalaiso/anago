@@ -25,13 +25,64 @@ pub const PRIVATE_FILE_MODE: u32 = 0o600;
 /// Mode for the directories those files sit in.
 pub const PRIVATE_DIR_MODE: u32 = 0o700;
 
+/// Mode for the files anago writes for the *system* to read: a systemd
+/// unit, a launchd property list.
+///
+/// Readable by anyone, writable by root alone. Both halves matter.
+/// World-writable would let any user rewrite what root runs at the next
+/// reload — and launchd refuses a group- or world-writable daemon
+/// outright. Unreadable would break `systemctl cat anago-sync.service`,
+/// which §8 tells people to run to see which device file the schedule
+/// reads, and the file holds nothing but paths anyway.
+pub const SYSTEM_FILE_MODE: u32 = 0o644;
+
 /// Writes `contents` to `path` atomically, 0600.
 ///
 /// The temp file is a sibling because `rename(2)` is only atomic within
 /// one filesystem — a temp under `/tmp` would silently degrade to a
 /// copy across a mount boundary.
 pub fn write_private(path: &Path, contents: &str) -> io::Result<()> {
+    write_private_owned(path, contents.as_bytes(), None)
+}
+
+/// [`write_private`] for contents that are not text.
+///
+/// The one caller is the rollback that puts a certificate or an account
+/// key back as it was: it holds the bytes it read, and re-encoding them
+/// through a `str` would refuse a file that is not UTF-8 — at the
+/// moment its job is to restore it untouched.
+pub fn write_private_bytes(path: &Path, contents: &[u8]) -> io::Result<()> {
     write_private_owned(path, contents, None)
+}
+
+/// Writes `contents` to `path` atomically, [`SYSTEM_FILE_MODE`]
+/// exactly.
+///
+/// Atomically because the reader is not a person: a systemd unit or a
+/// launchd plist half on disk is one a reload can pick up as a whole
+/// file. A rename means the name flips from the old contents to the new
+/// ones with nothing in between.
+pub fn write_system(path: &Path, contents: &str) -> io::Result<()> {
+    let tmp = temp_sibling(path)?;
+    let mut file = replace_with(&tmp, SYSTEM_FILE_MODE)?;
+    let wrote = file
+        .write_all(contents.as_bytes())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(e) = wrote {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    match fs::rename(&tmp, path) {
+        Ok(()) => {
+            sync_parent(path);
+            Ok(())
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
 }
 
 /// [`write_private`], giving the result to `owner`.
@@ -42,19 +93,25 @@ pub fn write_private(path: &Path, contents: &str) -> io::Result<()> {
 /// name owned by root.
 pub fn write_private_owned(
     path: &Path,
-    contents: &str,
+    contents: &[u8],
     owner: Option<(u32, u32)>,
 ) -> io::Result<()> {
     let tmp = temp_sibling(path)?;
 
     let mut file = create_private_new(&tmp)?;
-    file.write_all(contents.as_bytes())?;
-    if let Some((uid, gid)) = owner {
-        give_fd_to(&file, uid, gid)?;
-    }
-    // Durability before visibility: rename must not expose a file whose
-    // contents are still in the page cache.
-    file.sync_all()?;
+    // Every step from here on has to undo the create if it fails: the
+    // error says nothing happened, so nothing may be left at the temp
+    // name to say otherwise.
+    let written = file
+        .write_all(contents)
+        .and_then(|()| match owner {
+            Some((uid, gid)) => give_fd_to(&file, uid, gid),
+            None => Ok(()),
+        })
+        // Durability before visibility: rename must not expose a file
+        // whose contents are still in the page cache.
+        .and_then(|()| file.sync_all());
+    let file = or_remove(file, &tmp, written)?;
     drop(file);
 
     match fs::rename(&tmp, path) {
@@ -69,6 +126,133 @@ pub fn write_private_owned(
             Err(e)
         }
     }
+}
+
+/// Publishes two files that have to agree with each other, 0600.
+///
+/// A certificate and its key are one thing in two files: either half on
+/// its own is a hub that will not start. Writing them with two separate
+/// [`write_private`] calls means an ordinary failure on the second —
+/// a full disk, a bad path — leaves the first already replaced and the
+/// pair mismatched, and the error tells the caller nothing was done.
+///
+/// So nothing is published until everything is ready to be:
+///
+/// 1. both new files are written to temp siblings and made durable;
+/// 2. whatever `first` held is copied to a backup sibling, also
+///    durable. **A previous file that cannot be read stops the whole
+///    thing here**, before anything has changed — the alternative is
+///    publishing a half that cannot be undone.
+/// 3. the two renames.
+///
+/// If the second rename fails, the first is undone: by renaming the
+/// backup back when there was a previous file, and by deleting the file
+/// when there was not (a first issuance has nothing to restore, and
+/// leaving a lone new key beside no certificate is the same mismatch in
+/// a different shape). The undo is a rename, not a rewrite, so it
+/// cannot itself run out of disk halfway. **If it fails anyway, that is
+/// reported** — an error that says "nothing happened" while a mismatched
+/// pair sits on disk is worse than the failure it hides.
+///
+/// What is left is a crash between two renames. That window is real and
+/// this cannot close it; it is a few microseconds wide, and the state it
+/// leaves is visible at startup rather than silent.
+pub fn write_private_pair(first: (&Path, &str), second: (&Path, &str)) -> io::Result<()> {
+    let first_tmp = prepare_private(first.0, first.1.as_bytes())?;
+    let second_tmp = match prepare_private(second.0, second.1.as_bytes()) {
+        Ok(tmp) => tmp,
+        Err(e) => {
+            let _ = fs::remove_file(&first_tmp);
+            return Err(e);
+        }
+    };
+
+    let backup = match back_up(first.0) {
+        Ok(backup) => backup,
+        Err(e) => {
+            let _ = fs::remove_file(&first_tmp);
+            let _ = fs::remove_file(&second_tmp);
+            return Err(e);
+        }
+    };
+
+    if let Err(e) = fs::rename(&first_tmp, first.0) {
+        let _ = fs::remove_file(&first_tmp);
+        let _ = fs::remove_file(&second_tmp);
+        if let Some(backup) = backup {
+            let _ = fs::remove_file(backup);
+        }
+        return Err(e);
+    }
+
+    if let Err(e) = fs::rename(&second_tmp, second.0) {
+        let _ = fs::remove_file(&second_tmp);
+        return Err(undo(first.0, backup, e));
+    }
+
+    if let Some(backup) = backup {
+        let _ = fs::remove_file(backup);
+    }
+    sync_parent(first.0);
+    sync_parent(second.0);
+    Ok(())
+}
+
+/// Copies what `path` holds to a sibling, so it can be renamed back.
+///
+/// `Ok(None)` means there was nothing there — a first issuance. An
+/// unreadable file is an error, and deliberately so: without a copy
+/// there is no undo, and finding that out after publishing is too late.
+fn back_up(path: &Path) -> io::Result<Option<PathBuf>> {
+    let previous = match fs::read(path) {
+        Ok(previous) => previous,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let backup = sibling(path, ".bak")?;
+    let mut file = create_private_new(&backup)?;
+    file.write_all(&previous)?;
+    file.sync_all()?;
+    Ok(Some(backup))
+}
+
+/// Puts `path` back the way it was before the first rename.
+///
+/// The error returned is the one that caused the undo; if the undo
+/// itself fails, both are reported, because at that point the pair on
+/// disk does not match and somebody has to be told which files to look
+/// at.
+fn undo(path: &Path, backup: Option<PathBuf>, cause: io::Error) -> io::Error {
+    let undone = match &backup {
+        Some(backup) => fs::rename(backup, path),
+        // Nothing was there before: the undo is to take the new file
+        // away again.
+        None => fs::remove_file(path),
+    };
+    match undone {
+        Ok(()) => cause,
+        Err(e) => io::Error::new(
+            cause.kind(),
+            format!(
+                "{cause}; and {} could not be put back afterwards ({e}){}",
+                path.display(),
+                match backup {
+                    Some(backup) => format!(" — the previous contents are in {}", backup.display()),
+                    None => String::new(),
+                }
+            ),
+        ),
+    }
+}
+
+/// Writes a temp sibling, 0600, and makes it durable. The rename is the
+/// caller's to do.
+fn prepare_private(path: &Path, contents: &[u8]) -> io::Result<PathBuf> {
+    let tmp = sibling(path, ".tmp")?;
+    let mut file = create_private_new(&tmp)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    Ok(tmp)
 }
 
 /// Creates a directory and everything above it, then makes the leaf
@@ -90,15 +274,21 @@ pub fn create_new_private(path: &Path, contents: &str) -> io::Result<()> {
 
 /// `path` with `.tmp` appended to its file name.
 fn temp_sibling(path: &Path) -> io::Result<PathBuf> {
+    sibling(path, ".tmp")
+}
+
+/// `path` with `suffix` appended to its file name. A sibling, because
+/// `rename(2)` is only atomic within one filesystem.
+fn sibling(path: &Path, suffix: &str) -> io::Result<PathBuf> {
     let name = path.file_name().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("{path:?} has no file name"),
         )
     })?;
-    let mut tmp = name.to_os_string();
-    tmp.push(".tmp");
-    Ok(path.with_file_name(tmp))
+    let mut sibling = name.to_os_string();
+    sibling.push(suffix);
+    Ok(path.with_file_name(sibling))
 }
 
 /// Creates `path` fresh, 0600, failing if it already exists.
@@ -110,17 +300,81 @@ fn temp_sibling(path: &Path) -> io::Result<PathBuf> {
 /// exclusively means the content never exists under a looser mode, and
 /// `O_NOFOLLOW` means a symlink left in its place is not followed.
 fn create_private_new(path: &Path) -> io::Result<File> {
+    replace_with(path, PRIVATE_FILE_MODE)
+}
+
+/// Creates `path` at 0600, and **fails if anything is already there**.
+///
+/// The rule §7.3 puts on `join --export conf --out`: anago never writes
+/// over a file somebody already has. `O_EXCL` makes that a property of
+/// the create rather than a check followed by a write, which a person
+/// with write access to that directory could win. `O_NOFOLLOW` refuses
+/// a symlink at the name, so the mode below lands on the file that was
+/// named and not on whatever it pointed at.
+///
+/// The descriptor is returned rather than the path being reopened, so
+/// what gets written is the file this call made — and so the contents
+/// can arrive later than the claim, which is what lets a `--out` be
+/// taken before the join code is spent.
+pub fn open_new_private(path: &Path) -> io::Result<File> {
+    create_new_with(path, PRIVATE_FILE_MODE)
+}
+
+/// The same, at whatever mode the caller needs.
+///
+/// The mode is set twice on purpose. `open(2)` takes it as a *maximum*
+/// — the umask can only clear bits, never add them, so the file can
+/// never arrive looser than asked — and then `fchmod` puts it exactly
+/// where it was asked for. Without the second step a tight umask would
+/// hand back a 0600 systemd unit, and what a file's permissions are
+/// would depend on the shell that ran the command.
+///
+/// `fchmod` on the descriptor rather than `chmod` on the name, for the
+/// same reason [`give_fd_to`] uses `fchown`.
+fn create_new_with(path: &Path, mode: u32) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let permissions = file.set_permissions(fs::Permissions::from_mode(mode));
+    or_remove(file, path, permissions)
+}
+
+/// [`create_new_with`], after clearing anything left at that name.
+///
+/// For the temp siblings the writers here rename into place: one left
+/// by a killed run must not block the next one, and nothing else ever
+/// uses those names. The exclusive create is still what makes the file,
+/// so two runs racing at the same sibling still cannot share it.
+fn replace_with(path: &Path, mode: u32) -> io::Result<File> {
     match fs::remove_file(path) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(PRIVATE_FILE_MODE)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
+    create_new_with(path, mode)
+}
+
+/// Keeps a just-created file, or takes it away again and reports why.
+///
+/// Anything that fails **after** the create has to undo the create.
+/// Every caller here is writing a temp sibling it is about to rename,
+/// and the error it returns says nothing happened — so a file left at
+/// `<name>.tmp` is both a lie and litter for the next run to trip over.
+///
+/// Closed before it is unlinked, so nothing is still holding the inode
+/// when the name goes.
+fn or_remove(file: File, path: &Path, outcome: io::Result<()>) -> io::Result<File> {
+    match outcome {
+        Ok(()) => Ok(file),
+        Err(e) => {
+            drop(file);
+            let _ = fs::remove_file(path);
+            Err(e)
+        }
+    }
 }
 
 /// Best-effort directory flush so the rename itself survives a power
@@ -302,9 +556,33 @@ impl DirHandle {
         }
     }
 
+    /// Who owns `name`, without following a symlink at it.
+    ///
+    /// For the one job that has to hand a file back exactly as it
+    /// found it: a root process rewriting a file in somebody's home
+    /// must not make it root's, or the ordinary commands that read it
+    /// stop working (§9).
+    pub fn owner_of(&self, name: &str) -> io::Result<(u32, u32)> {
+        let c_name = c_name(name)?;
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: both pointers are valid for the call.
+        let result = unsafe {
+            libc::fstatat(
+                self.fd.as_raw_fd(),
+                c_name.as_ptr(),
+                &mut stat,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((stat.st_uid, stat.st_gid))
+    }
+
     /// Reads a file here.
     pub fn read_to_string(&self, name: &str) -> io::Result<String> {
-        let mut file = self.open_file(name, libc::O_RDONLY, 0)?;
+        let mut file = self.open_file(name, libc::O_RDONLY | libc::O_NOFOLLOW, 0)?;
         let mut text = String::new();
         std::io::Read::read_to_string(&mut file, &mut text)?;
         Ok(text)
@@ -530,13 +808,12 @@ impl FileLock {
 
     /// Takes the lock if it is free, `None` if someone else holds it.
     ///
-    /// Only tests take a lock this way. Every caller in the program
-    /// waits instead: a `server init` that gave up because another one
-    /// held the lock for a moment would be worse than one that waited.
-    /// Keeping it here — rather than reimplementing `flock` in the
-    /// tests — means the contention they check is this lock, not a
-    /// lookalike.
-    #[cfg(test)]
+    /// Most callers wait instead: a `server init` that gave up because
+    /// another one held the lock for a moment would be worse than one
+    /// that waited. The renewal timer is the exception — if a person is
+    /// already renewing by hand, the timer has nothing to add by
+    /// queueing behind them for two minutes, and coming back later is
+    /// exactly what a timer is for.
     pub fn try_acquire(path: &Path) -> io::Result<Option<FileLock>> {
         let file = lock_file(path)?;
         match flock(&file, libc::LOCK_EX | libc::LOCK_NB) {
@@ -632,6 +909,108 @@ mod tests {
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "{\"version\":1}");
         assert_eq!(mode_of(&path), PRIVATE_FILE_MODE);
+    }
+
+    #[test]
+    fn a_system_file_is_readable_by_everyone_and_writable_by_root_alone() {
+        // A systemd unit or a launchd plist decides what runs as root.
+        // World-writable means any user can rewrite it before the next
+        // reload, and launchd refuses a group-writable daemon outright.
+        // Unreadable would break `systemctl cat anago-sync.service`,
+        // which §8 tells people to run.
+        let dir = TempDir::new();
+        let path = dir.join("anago-sync.timer");
+        write_system(&path, "[Timer]\nOnBootSec=5min\n").unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "[Timer]\nOnBootSec=5min\n"
+        );
+        assert_eq!(mode_of(&path), SYSTEM_FILE_MODE);
+        assert_eq!(mode_of(&path) & 0o022, 0, "nobody but root may write it");
+        assert_ne!(mode_of(&path) & 0o044, 0, "everybody may read it");
+
+        // The bound holds under every umask, because a umask can only
+        // clear bits and never add them — so this file can never
+        // arrive looser than it was asked for, whatever shell ran the
+        // command. The `fchmod` behind `write_system` is what makes it
+        // land on exactly this mode rather than something tighter.
+    }
+
+    #[test]
+    fn a_step_that_fails_after_the_create_takes_the_file_away_again() {
+        // Every writer here creates a temp sibling and renames it. A
+        // failure between those two returns an error saying nothing
+        // happened, so a file left at `<name>.tmp` is both a lie and
+        // litter — and the timer's rollback only knows about the final
+        // unit path, so it would never find it.
+        //
+        // The failing step is handed in rather than provoked: `fchmod`
+        // on a file this process just created does not fail on any
+        // machine a test can arrange, and the decision worth pinning is
+        // what happens when it does.
+        let dir = TempDir::new();
+        let path = dir.join("anago-sync.timer.tmp");
+
+        let file = create_new_with(&path, SYSTEM_FILE_MODE).unwrap();
+        assert!(path.exists(), "the create worked");
+        let e = or_remove(
+            file,
+            &path,
+            Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+        )
+        .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "the real cause");
+        assert!(!path.exists(), "and nothing left at {}", path.display());
+
+        // The success side hands the same file back untouched.
+        let mut kept = or_remove(
+            create_new_with(&path, SYSTEM_FILE_MODE).unwrap(),
+            &path,
+            Ok(()),
+        )
+        .unwrap();
+        kept.write_all(b"still open").unwrap();
+        drop(kept);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "still open");
+    }
+
+    #[test]
+    fn a_write_that_fails_leaves_no_temp_beside_the_target() {
+        // The whole-directory version of the rule above: whatever goes
+        // wrong, the only name that may exist afterwards is the one the
+        // caller asked for. Here the rename is what fails, because the
+        // target name is a directory.
+        let dir = TempDir::new();
+        let path = dir.join("anago-sync.service");
+        fs::create_dir(&path).unwrap();
+
+        assert!(write_system(&path, "[Service]\n").is_err());
+        let mut entries: Vec<String> = fs::read_dir(&dir.path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        entries.sort();
+        assert_eq!(entries, ["anago-sync.service"], "no .tmp left behind");
+    }
+
+    #[test]
+    fn a_system_file_arrives_whole_or_not_at_all() {
+        // A reload can pick up a half-written unit as if it were the
+        // whole file, so the name flips from the old contents to the
+        // new with nothing in between — and no temp file is left for
+        // the next run to find.
+        let dir = TempDir::new();
+        let path = dir.join("anago-sync.service");
+        write_system(&path, "the first version, which is longer").unwrap();
+        write_system(&path, "short").unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "short");
+        let entries: Vec<String> = fs::read_dir(&dir.path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries, ["anago-sync.service"]);
     }
 
     #[test]

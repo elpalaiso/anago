@@ -3,15 +3,21 @@
 //! (DESIGN.md §4 principle 4). The binary crate is a thin shell around
 //! these pure functions.
 
+pub mod acme;
 pub mod code;
+pub mod dns;
+pub mod dnswire;
 pub mod json;
 pub mod name;
 pub mod proto;
+pub mod qr;
 pub mod render;
 pub mod state;
 pub mod subnet;
+pub mod sync;
 pub mod token;
 pub mod wgconf;
+pub mod x509;
 
 #[cfg(test)]
 mod tests {

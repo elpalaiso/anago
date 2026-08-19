@@ -13,6 +13,7 @@ use std::path::Path;
 use anago_core::json;
 use anago_core::name::DeviceName;
 use anago_core::proto::{ErrorCode, PeerInfo, PATH_PEERS};
+use anago_core::render;
 use anago_core::state::Peer;
 
 use crate::client::{self, Method, Request};
@@ -53,11 +54,11 @@ pub fn report(removed: &Removed, device_file: &Path, wg_config: &Path) -> String
     }
     if removed.was_self {
         out.push_str(&format!(
-            "\nThat was this device. Its config is now stale: \
-             `sudo wg-quick down {wg}`, then delete {wg} and {device} \
-             before joining again.\n",
-            wg = wg_config.display(),
-            device = device_file.display()
+            "\nThat was this device. Its config is now stale: {}\n",
+            render::rejoin_steps(
+                &wg_config.display().to_string(),
+                &device_file.display().to_string()
+            )
         ));
     }
     out
@@ -153,7 +154,7 @@ fn remove_remotely(
         port: config.api_port(),
         path: &path,
         body: None,
-        token: Some(&token),
+        authorization: Some(&client::HeaderValue::device_token(&token)),
     })
     .map_err(RmError::Client)?;
 
@@ -228,10 +229,11 @@ pub fn explain(
         // network, and the tunnel is probably still up.
         Some(ErrorCode::Unauthorized) => format!(
             " — this device's token is no longer accepted, so it cannot remove anything. \
-             If it was removed from the hub: `sudo wg-quick down {wg}`, delete {wg} and \
-             {device}, then join again with a fresh code",
-            wg = wg_config.display(),
-            device = device_file.display()
+             If it was removed from the hub: {}",
+            render::rejoin_steps(
+                &wg_config.display().to_string(),
+                &device_file.display().to_string()
+            )
         ),
         _ => String::new(),
     };
@@ -284,7 +286,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use anago_core::proto::ApiError;
-    use anago_core::state::{PrivateKey, ServerKeys, ServerState};
+    use anago_core::state::{PrivateKey, ServerKeys, ServerState, Tls};
     use anago_core::subnet::Subnet;
     use anago_core::token::TokenHash;
 
@@ -342,8 +344,8 @@ mod tests {
             subnet: Subnet::parse("10.100.0.0/24").unwrap(),
             listen_port: 51820,
             api_port: 443,
-            tls_cert_path: "/etc/ssl/anago/fullchain.pem".to_string(),
-            tls_key_path: "/etc/ssl/anago/privkey.pem".to_string(),
+            tls: Tls::manual("/etc/ssl/anago/fullchain.pem", "/etc/ssl/anago/privkey.pem"),
+            cloudflare: None,
             server: ServerKeys {
                 private_key: PrivateKey::new("c2VydmVyIHByaXZhdGU="),
                 public_key: "c2VydmVyIHB1YmxpYw==".to_string(),

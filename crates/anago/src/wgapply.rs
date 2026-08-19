@@ -17,6 +17,7 @@ use std::sync::Mutex;
 
 use anago_core::state::ServerState;
 use anago_core::wgconf;
+use anago_core::wgconf::SecretText;
 
 use crate::fsutil;
 use crate::wg::{self, Platform, WgError};
@@ -64,10 +65,10 @@ pub fn plan(interface_is_up: bool, last_applied: Option<&str>, wanted: &str) -> 
 /// something that was not there should not disturb a running interface.
 pub fn write_config(state: &ServerState, path: &Path) -> Result<bool, WgError> {
     let wanted = wgconf::server_config(state);
-    if std::fs::read_to_string(path).is_ok_and(|current| current == wanted) {
+    if std::fs::read_to_string(path).is_ok_and(|current| current == wanted.expose()) {
         return Ok(false);
     }
-    fsutil::write_private(path, &wanted).map_err(|e| WgError::Spawn {
+    fsutil::write_private(path, wanted.expose()).map_err(|e| WgError::Spawn {
         line: format!("write {}", path.display()),
         source: e.to_string(),
     })?;
@@ -156,7 +157,10 @@ pub struct WgApplier {
     /// The config text of the last *successful* apply. `None` after a
     /// failure, which is what makes the next attempt retry instead of
     /// deciding the file already looks right.
-    last_applied: Mutex<Option<String>>,
+    /// The last text handed to the interface. Kept as [`SecretText`]
+    /// rather than `String` because it is the server config, private
+    /// key and all, and this struct derives `Debug` (§7.3).
+    last_applied: Mutex<Option<SecretText>>,
     platform: Platform,
 }
 
@@ -185,7 +189,11 @@ impl Applier for WgApplier {
 
         let action = {
             let last_applied = self.last_applied.lock().expect("applier mutex");
-            plan(self.interface_is_up(), last_applied.as_deref(), &wanted)
+            plan(
+                self.interface_is_up(),
+                last_applied.as_ref().map(SecretText::expose),
+                wanted.expose(),
+            )
         };
         let Some(action) = action else {
             return Ok(());
@@ -251,7 +259,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use anago_core::name::DeviceName;
-    use anago_core::state::{Peer, PrivateKey, ServerKeys};
+    use anago_core::state::{Peer, PrivateKey, ServerKeys, Tls};
     use anago_core::subnet::Subnet;
     use anago_core::token::TokenHash;
 
@@ -282,8 +290,8 @@ mod tests {
             subnet: Subnet::parse("10.100.0.0/24").unwrap(),
             listen_port: 51820,
             api_port: 443,
-            tls_cert_path: "/etc/ssl/anago/fullchain.pem".to_string(),
-            tls_key_path: "/etc/ssl/anago/privkey.pem".to_string(),
+            tls: Tls::manual("/etc/ssl/anago/fullchain.pem", "/etc/ssl/anago/privkey.pem"),
+            cloudflare: None,
             server: ServerKeys {
                 private_key: PrivateKey::new("c2VydmVyIHByaXZhdGU="),
                 public_key: "c2VydmVyIHB1YmxpYw==".to_string(),
@@ -314,7 +322,7 @@ mod tests {
         assert!(write_config(&state, &path).unwrap());
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
-            wgconf::server_config(&state)
+            wgconf::server_config(&state).expose()
         );
         // It holds the server's private key, so it is private.
         assert_eq!(
