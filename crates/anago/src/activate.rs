@@ -66,7 +66,7 @@ impl Outcome {
 /// need a real kernel, root, and a hub at the other end.
 pub fn run(wg_config_path: &Path, server_address: Ipv4Addr, path_var: &str) -> Outcome {
     let platform = wg::platform_from(std::env::consts::OS);
-    if let Err(e) = wg::run(&wg::quick_up(wg_config_path), None) {
+    if let Err(e) = wg::bring_up(wg_config_path) {
         return Outcome::NotUp(e);
     }
     if wg::find_in_path(path_var, "ping").is_none() {

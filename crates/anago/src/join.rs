@@ -1600,6 +1600,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // drives unix file modes
     fn an_out_file_is_taken_before_the_code_is_spent() {
         // A local join claims its two files before asking the hub for
         // anything, so a permission problem is a retry rather than a
@@ -1890,8 +1891,8 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn mode_of(path: &Path) -> u32 {
-        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         std::fs::metadata(path)
             .expect("metadata")

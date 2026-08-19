@@ -533,13 +533,14 @@ fn apply(
         },
     )?;
 
-    // `wg-quick strip` turns the file into what `wg` itself
-    // understands (it drops `Address`, which is wg-quick's not wg's),
-    // and `syncconf` then changes the running interface **without
-    // dropping the tunnels on it** — which `down`/`up` would.
-    let stripped = wg::run(&wg::quick_strip(wg_config), None).map_err(|e| SyncError::Apply {
-        detail: e.to_string(),
-    })?;
+    // Stripping turns the file into what `wg` itself understands (it
+    // drops `Address`, which is wg-quick's not wg's), and `syncconf`
+    // then changes the running interface **without dropping the
+    // tunnels on it** — which `down`/`up` would.
+    let stripped = wg::stripped_config(wg_config, wgconf::client_config(&profile).expose())
+        .map_err(|e| SyncError::Apply {
+            detail: e.to_string(),
+        })?;
     let interface = interface_of(wg_config);
     let stripped_file = Stripped::write(wg_config, &stripped)?;
     wg::run(&wg::syncconf(&interface, stripped_file.path()), None).map_err(|e| {

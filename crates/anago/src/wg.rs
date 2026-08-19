@@ -24,6 +24,10 @@ use anago_core::state::PrivateKey;
 pub const WG: &str = "wg";
 pub const WG_QUICK: &str = "wg-quick";
 
+/// Windows: the official client's controller. Its tunnel service is
+/// what replaces wg-quick + systemd for the interface (§11.1 결정 2).
+pub const WIREGUARD: &str = "wireguard";
+
 /// A command line, assembled but not run.
 ///
 /// Not only wg's: `launchd` builds its `launchctl` lines with the same
@@ -100,6 +104,60 @@ pub fn syncconf(interface: &str, stripped: &Path) -> Cmd {
     cmd
 }
 
+/// Windows: `wireguard /installtunnelservice <conf>` — turns the conf
+/// into a Windows service, starts it, and keeps it across reboots
+/// (§11.1 결정 2). The service name is the file stem, so `anago.conf`
+/// becomes the tunnel `anago`, matching wg-quick's naming rule.
+pub fn tunnel_install(config: &Path) -> Cmd {
+    Cmd::with_path(WIREGUARD, &["/installtunnelservice"], config)
+}
+
+/// Windows: `wireguard /uninstalltunnelservice <interface>` — stops and
+/// removes the tunnel service. Absent is fine: bring-up tolerates it.
+pub fn tunnel_uninstall(interface: &str) -> Cmd {
+    Cmd::new(WIREGUARD, &["/uninstalltunnelservice", interface])
+}
+
+/// Brings the interface up, the platform's way: `wg-quick up` where it
+/// exists, the official client's tunnel service on Windows. Windows
+/// reinstalls rather than starts — install both starts the service and
+/// registers it for boot, and a stale service from an earlier conf must
+/// not shadow the file just written.
+///
+/// **Human verification needed**: real tools, root/admin, real kernel.
+pub fn bring_up(config: &Path) -> Result<String, WgError> {
+    #[cfg(not(windows))]
+    {
+        run(&quick_up(config), None)
+    }
+    #[cfg(windows)]
+    {
+        let interface = config
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| crate::paths::WG_INTERFACE.to_string());
+        let _ = run(&tunnel_uninstall(&interface), None); // absent is fine
+        run(&tunnel_install(config), None)
+    }
+}
+
+/// The config as plain `wg` understands it, for `syncconf`: wg-quick's
+/// `strip` where wg-quick exists, the pure stripper on Windows (§11.1
+/// 결정 2). `text` is the same content `config` holds — the unix path
+/// reads the file, the Windows path never touches the disk.
+pub fn stripped_config(config: &Path, text: &str) -> Result<String, WgError> {
+    #[cfg(not(windows))]
+    {
+        let _ = text;
+        run(&quick_strip(config), None)
+    }
+    #[cfg(windows)]
+    {
+        let _ = config;
+        Ok(anago_core::wgconf::strip_quick_keys(text))
+    }
+}
+
 /// `wg show <interface> dump` — machine-readable peer state, including
 /// the last handshake `anago ls` shows on the server.
 pub fn show_dump(interface: &str) -> Cmd {
@@ -174,6 +232,7 @@ pub fn parse_dump(text: &str) -> Vec<DumpPeer> {
 pub enum Platform {
     MacOs,
     Linux,
+    Windows,
     Other,
 }
 
@@ -183,6 +242,7 @@ pub fn platform_from(os: &str) -> Platform {
     match os {
         "macos" => Platform::MacOs,
         "linux" => Platform::Linux,
+        "windows" => Platform::Windows,
         _ => Platform::Other,
     }
 }
@@ -197,9 +257,14 @@ pub fn install_hint(platform: Platform) -> &'static str {
              (Debian/Ubuntu), dnf install wireguard-tools (Fedora), \
              pacman -S wireguard-tools (Arch)"
         }
+        Platform::Windows => {
+            "install the official WireGuard client: `winget install WireGuard.WireGuard` \
+             (or download it from https://www.wireguard.com/install/) — it provides \
+             wg.exe and the tunnel service anago drives (§11.1)"
+        }
         Platform::Other => {
-            "anago needs WireGuard's userspace tools (wg, wg-quick); \
-             Windows is not supported in v1 — use WSL2"
+            "anago needs WireGuard's tools (wg, and wg-quick outside Windows); \
+             see https://www.wireguard.com/install/"
         }
     }
 }
@@ -210,16 +275,36 @@ pub fn install_hint(platform: Platform) -> &'static str {
 /// directory: a tool found there would depend on where the user
 /// happened to `cd`, which is not something to run as root.
 pub fn find_in_path(path_var: &str, program: &str) -> Option<PathBuf> {
+    let separator = if cfg!(windows) { ';' } else { ':' };
+    let program = exe_name(program);
     path_var
-        .split(':')
+        .split(separator)
         .filter(|dir| !dir.is_empty())
-        .map(|dir| Path::new(dir).join(program))
+        .map(|dir| Path::new(dir).join(&program))
         .find(|candidate| is_executable_file(candidate))
+}
+
+/// `wg` → `wg.exe` on Windows; untouched elsewhere.
+fn exe_name(program: &str) -> String {
+    if cfg!(windows) && !program.ends_with(".exe") {
+        format!("{program}.exe")
+    } else {
+        program.to_string()
+    }
+}
+
+/// Where the official Windows client installs its tools when nothing
+/// put them on `PATH` — the installer does not, by default.
+#[cfg(windows)]
+fn windows_install_dir() -> Option<PathBuf> {
+    std::env::var("ProgramFiles")
+        .ok()
+        .filter(|pf| !pf.is_empty())
+        .map(|pf| Path::new(&pf).join("WireGuard"))
 }
 
 #[cfg(unix)]
 fn is_executable_file(path: &Path) -> bool {
-    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     match std::fs::metadata(path) {
         Ok(meta) => meta.is_file() && meta.permissions().mode() & 0o111 != 0,
@@ -235,9 +320,11 @@ fn is_executable_file(path: &Path) -> bool {
 }
 
 /// Checks that both tools are present, naming the missing one and how
-/// to get it.
+/// to get it. What "both" means is the platform's: wg + wg-quick where
+/// wg-quick exists, wg + the official client's controller on Windows.
 pub fn check_tools(path_var: &str, platform: Platform) -> Result<(), WgError> {
-    for tool in [WG, WG_QUICK] {
+    let tools: [&'static str; 2] = if cfg!(windows) { [WG, WIREGUARD] } else { [WG, WG_QUICK] };
+    for tool in tools {
         check_tool(path_var, tool, platform)?;
     }
     Ok(())
@@ -250,13 +337,21 @@ pub fn check_tools(path_var: &str, platform: Platform) -> Result<(), WgError> {
 /// refuse a machine that can do the whole job, and say so in a sentence
 /// about a program the command was never going to run.
 pub fn check_tool(path_var: &str, tool: &'static str, platform: Platform) -> Result<(), WgError> {
-    match find_in_path(path_var, tool) {
-        Some(_) => Ok(()),
-        None => Err(WgError::NotFound {
-            tool,
-            hint: install_hint(platform),
-        }),
+    if find_in_path(path_var, tool).is_some() {
+        return Ok(());
     }
+    // The Windows installer does not touch PATH — look where it puts
+    // the tools before concluding they are missing.
+    #[cfg(windows)]
+    if let Some(dir) = windows_install_dir() {
+        if is_executable_file(&dir.join(exe_name(tool))) {
+            return Ok(());
+        }
+    }
+    Err(WgError::NotFound {
+        tool,
+        hint: install_hint(platform),
+    })
 }
 
 /// [`check_tools`] against this process's real environment.
@@ -554,16 +649,20 @@ ZGVza3RvcA==\t(none)\t(none)\t10.100.0.3/32\t0\t0\t0\toff
     fn install_hints_match_the_platform() {
         assert_eq!(platform_from("macos"), Platform::MacOs);
         assert_eq!(platform_from("linux"), Platform::Linux);
-        assert_eq!(platform_from("windows"), Platform::Other);
+        assert_eq!(platform_from("windows"), Platform::Windows);
         assert_eq!(platform_from("freebsd"), Platform::Other);
 
         assert!(install_hint(Platform::MacOs).contains("brew install wireguard-tools"));
         assert!(install_hint(Platform::Linux).contains("apt install wireguard-tools"));
         assert!(install_hint(Platform::Linux).contains("dnf"));
-        assert!(install_hint(Platform::Other).contains("WSL2"));
+        // Windows is first-class since M1.5 (§11.1): the official
+        // client, not WSL2.
+        assert!(install_hint(Platform::Windows).contains("winget install WireGuard.WireGuard"));
+        assert!(install_hint(Platform::Other).contains("wireguard.com/install"));
     }
 
     #[test]
+    #[cfg(unix)] // ':'-separated PATH and the executable bit are unix semantics
     fn finds_a_tool_on_path() {
         let dir = TempDir::new();
         let bin = dir.tool("wg", 0o755).to_string_lossy().into_owned();
@@ -576,6 +675,7 @@ ZGVza3RvcA==\t(none)\t(none)\t10.100.0.3/32\t0\t0\t0\toff
     }
 
     #[test]
+    #[cfg(unix)] // ':'-separated PATH and the executable bit are unix semantics
     fn a_non_executable_file_does_not_count() {
         let dir = TempDir::new();
         let bin = dir.tool("wg", 0o644).to_string_lossy().into_owned();
@@ -583,6 +683,7 @@ ZGVza3RvcA==\t(none)\t(none)\t10.100.0.3/32\t0\t0\t0\toff
     }
 
     #[test]
+    #[cfg(unix)] // ':'-separated PATH and the executable bit are unix semantics
     fn empty_path_entries_are_skipped_not_read_as_the_cwd() {
         // A tool picked up from "." would depend on where the user
         // stood — not something to run as root.
@@ -597,6 +698,7 @@ ZGVza3RvcA==\t(none)\t(none)\t10.100.0.3/32\t0\t0\t0\toff
     }
 
     #[test]
+    #[cfg(unix)] // ':'-separated PATH and the executable bit are unix semantics
     fn a_missing_tool_is_named_with_how_to_get_it() {
         let dir = TempDir::new();
         let bin = dir.tool("wg", 0o755).to_string_lossy().into_owned();
@@ -625,6 +727,7 @@ ZGVza3RvcA==\t(none)\t(none)\t10.100.0.3/32\t0\t0\t0\toff
     }
 
     #[test]
+    #[cfg(unix)] // ':'-separated PATH and the executable bit are unix semantics
     fn a_command_asks_only_for_the_tools_it_runs() {
         // `join --export` makes a keypair and brings no interface up.
         // Refusing a machine that has `wg` but not `wg-quick` would
@@ -667,5 +770,24 @@ ZGVza3RvcA==\t(none)\t(none)\t10.100.0.3/32\t0\t0\t0\toff
             e.to_string(),
             "could not run `wg genkey`: No such file or directory"
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_finds_tools_with_exe_and_semicolons() {
+        let dir = TempDir::new();
+        let exe = dir.path.join("wg.exe");
+        std::fs::write(&exe, "MZ").unwrap();
+        let bin = dir.path.to_string_lossy().into_owned();
+
+        // ';' separates, the .exe suffix is implied, empty entries skip.
+        let path = format!(";C:\\nonexistent-anago;{bin};");
+        assert_eq!(find_in_path(&path, "wg"), Some(exe));
+        assert_eq!(find_in_path(&path, "wg-quick"), None);
+
+        // Windows asks for wg + the official client, never wg-quick.
+        let e = check_tools(&bin, Platform::Windows).unwrap_err();
+        assert!(matches!(e, WgError::NotFound { tool: WIREGUARD, .. }), "{e:?}");
+        assert!(e.to_string().contains("winget"), "{e}");
     }
 }
