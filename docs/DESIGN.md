@@ -2418,8 +2418,11 @@ C 툴체인 요구)를 ACME 클라이언트 밑에 밀어 넣는 것이 이 테�
 | M3 | 이름 해석(`맥북.net.example.com` 또는 /etc/hosts 갱신), `server status` 대시보드 | |
 | M4 | 릴리스: CI + 태그 릴리스 + Homebrew — krill의 워크플로 재활용 | |
 
-**현재 상태(2026-08)**: M0와 M1 모두 **코드가 완성**됐고, 둘 다 아직
-**미검증**이다.
+**현재 상태(2026-08)**: M0·M1 모두 **코드가 완성**됐고, 둘 다 아직
+**미검증**이다. M1.5(허브 플랫폼 확장)도 코드가 완성됐다 — 상주 씸
+(service.rs), 윈도우 SCM 진입(winsvc.rs), 터널 서비스 위임과 순수
+strip, launchd 허브 데몬, 경로·잠금의 크로스플랫폼화 — 검증 항목은
+HUMAN-VERIFY.md 17~20절.
 
 - **M0**: `server init`, `server run`, `code`, `join`, `ls`, `rm`이 모두
   동작한다.

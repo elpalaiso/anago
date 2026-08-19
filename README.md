@@ -26,6 +26,10 @@ M0에 있는 것: `server init` / `server run` / `code` / `join` / `ls` / `rm`,
 M1에서 더해진 것: Let's Encrypt 자동 발급·갱신(ACME), Cloudflare A 레코드
 자동 등록과 DNS-01, `anago sync`와 그 주기 실행 타이머(systemd·launchd),
 그리고 `join --export qr|conf` — 폰이 공식 WireGuard 앱으로 합류합니다.
+M1.5에서 더해진 것(이 브랜치): **허브가 윈도우 PC·맥에서도 됩니다** —
+윈도우는 진짜 윈도우 서비스로, 맥은 LaunchDaemon으로 상주하고, 터널은
+공식 WireGuard 클라이언트(윈도우)·wireguard-tools(맥)가 맡습니다.
+"서버"가 없어도 집에 늘 켜져 있는 PC면 그게 허브입니다.
 M2에서 올 것: 홀펀칭 직결(성능 최적화이지 정합성 요건이 아닙니다).
 
 이 프로젝트는 [krill](https://github.com/elpalaiso/krill)의 협업 모드
@@ -33,9 +37,15 @@ M2에서 올 것: 홀펀칭 직결(성능 최적화이지 정합성 요건이 �
 
 ## 준비물
 
-**서버(허브)**
+**서버(허브)** — 다음 중 하나:
 
-- 공인 IP를 가진 리눅스 VPS. 1코어면 충분합니다.
+- 공인 IP를 가진 리눅스 VPS (1코어면 충분), **또는**
+- **집에 늘 켜져 있는 PC**(윈도우·맥·리눅스) + 공유기 포트포워딩.
+  공유기에서 아래 "방화벽" 절의 두 포트를 이 PC로 전달해 주세요
+  (통신사 장비 뒤에 공유기가 또 있는 이중 NAT면 양쪽 다 — 위층은 DMZ로
+  아래층 공유기를 지정하는 것이 간단합니다). 윈도우는 관리자 PowerShell
+  에서 실행하고, 공식 WireGuard 클라이언트가 미리 설치되어 있어야
+  합니다: `winget install WireGuard.WireGuard`.
 - 도메인 하나. 예: `net.example.com`.
 - **A 레코드**가 그 VPS의 공인 IP를 가리켜야 합니다. 둘 중 하나입니다:
   - **Cloudflare API 토큰을 주면 anago가 만듭니다.** 없으면 어떤 레코드를
