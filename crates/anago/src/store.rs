@@ -219,7 +219,9 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // exercises unix modes/ownership/symlinks
     fn the_state_file_is_private() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         let temp = TempStore::new();
         temp.store.write(&sample()).unwrap();

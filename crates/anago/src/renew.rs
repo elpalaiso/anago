@@ -1049,6 +1049,7 @@ mod tests {
     use anago_core::state::{PrivateKey, ServerKeys};
     use anago_core::subnet::Subnet;
     use anago_core::wgconf;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
@@ -2076,6 +2077,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // exercises unix modes/ownership/symlinks
     fn an_issuance_that_is_never_committed_puts_the_old_files_back() {
         // The failure this exists for: the CA answers, the account and
         // the pair are replaced, and then the state file cannot be

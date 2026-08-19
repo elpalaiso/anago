@@ -10,7 +10,6 @@
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -157,10 +156,19 @@ pub fn permission_warning(path: &Path, mode: Option<u32>) -> Option<String> {
     ))
 }
 
+#[cfg(unix)]
 fn mode_of(path: &Path) -> Option<u32> {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path)
         .ok()
         .map(|meta| meta.permissions().mode())
+}
+
+/// Windows has ACLs, not modes — no mode, no warning (§11.1 결정 4).
+#[cfg(not(unix))]
+fn mode_of(_path: &Path) -> Option<u32> {
+    None
 }
 
 fn read(path: &Path) -> Result<Vec<u8>, TlsError> {
@@ -489,7 +497,13 @@ mod tests {
         fn write(&self, name: &str, bytes: &[u8], mode: u32) -> PathBuf {
             let path = self.path.join(name);
             fs::write(&path, bytes).expect("write");
-            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).expect("chmod");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(mode)).expect("chmod");
+            }
+            #[cfg(not(unix))]
+            let _ = mode; // modes are advisory on Windows (§11.1 결정 4)
             path
         }
     }

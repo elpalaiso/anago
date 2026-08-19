@@ -21,6 +21,59 @@ pub const DEFAULT_WG_DIR: &str = "/etc/wireguard";
 /// makes the interface `anago` for `wg-quick up anago`.
 pub const WG_INTERFACE: &str = "anago";
 
+/// Windows server state root (§11.1 결정 4): `%ProgramData%\anago`.
+///
+/// Pure — the env read stays in [`default_server_root`]. An unset or
+/// empty `ProgramData` falls back to the OS default location, which is
+/// what the variable contains on any stock Windows.
+pub fn server_root_from_program_data(program_data: Option<&str>) -> PathBuf {
+    match program_data.filter(|pd| !pd.is_empty()) {
+        Some(pd) => Path::new(pd).join("anago"),
+        None => PathBuf::from(r"C:\ProgramData\anago"),
+    }
+}
+
+/// Windows client config dir (§11.1 결정 4): `%APPDATA%\anago`.
+///
+/// Windows has no sudo and no XDG — the roaming profile is the one
+/// conventional per-user location, so the resolver is a straight line.
+pub fn client_config_dir_from_appdata(appdata: Option<&str>) -> Result<ClientPaths, PathError> {
+    match appdata.filter(|ad| Path::new(ad).is_absolute()) {
+        Some(ad) => Ok(ClientPaths::new(Path::new(ad).join("anago"))),
+        None => Err(PathError::NoHome),
+    }
+}
+
+/// The platform's server state root. Unix: [`DEFAULT_SERVER_ROOT`].
+/// Windows: `%ProgramData%\anago`.
+pub fn default_server_root() -> PathBuf {
+    #[cfg(windows)]
+    {
+        let pd = env::var("ProgramData").ok();
+        server_root_from_program_data(pd.as_deref())
+    }
+    #[cfg(not(windows))]
+    {
+        PathBuf::from(DEFAULT_SERVER_ROOT)
+    }
+}
+
+/// Where the wg tunnel config lives by default. Unix: `/etc/wireguard`
+/// (wg-quick's convention). Windows: the state root itself — the
+/// official client's tunnel service takes an explicit conf path
+/// (§11.1 결정 2), so anago keeps the conf next to its own state
+/// instead of adopting another program's directory.
+pub fn default_wg_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        default_server_root()
+    }
+    #[cfg(not(windows))]
+    {
+        PathBuf::from(DEFAULT_WG_DIR)
+    }
+}
+
 /// Paths under the server's state directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerPaths {
@@ -210,7 +263,15 @@ pub fn invoking_user(
     Some(InvokingUser { uid, gid, home })
 }
 
+/// Windows has no sudo — there is never an invoking user distinct from
+/// the process owner, so callers can stay platform-blind.
+#[cfg(windows)]
+pub fn invoking_user_from_env() -> Option<InvokingUser> {
+    None
+}
+
 /// [`invoking_user`] against this process's environment.
+#[cfg(unix)]
 pub fn invoking_user_from_env() -> Option<InvokingUser> {
     let uid = env::var("SUDO_UID").ok();
     let gid = env::var("SUDO_GID").ok();
@@ -225,6 +286,7 @@ pub fn invoking_user_from_env() -> Option<InvokingUser> {
 ///
 /// `SUDO_USER`'s home is the right base even when `HOME` says `/root`,
 /// and `getpwuid_r` is the only way to ask.
+#[cfg(unix)]
 fn home_of(uid: u32) -> Option<PathBuf> {
     use std::ffi::CStr;
     use std::os::unix::ffi::OsStrExt;
@@ -283,6 +345,7 @@ pub fn client_config_dir_for(
 }
 
 /// The one place that reads the environment.
+#[cfg(not(windows))]
 pub fn client_config_dir_from_env() -> Result<ClientPaths, PathError> {
     let xdg = env::var("XDG_CONFIG_HOME").ok();
     let home = env::var("HOME").ok();
@@ -291,6 +354,13 @@ pub fn client_config_dir_from_env() -> Result<ClientPaths, PathError> {
         home.as_deref(),
         invoking_user_from_env().as_ref(),
     )
+}
+
+/// The one place that reads the environment (Windows: `%APPDATA%`).
+#[cfg(windows)]
+pub fn client_config_dir_from_env() -> Result<ClientPaths, PathError> {
+    let appdata = env::var("APPDATA").ok();
+    client_config_dir_from_appdata(appdata.as_deref())
 }
 
 /// Why a path could not be resolved.
@@ -485,5 +555,29 @@ mod tests {
             ServerPaths::new("/var/lib/anago/").state_file(),
             Path::new("/var/lib/anago/state.json")
         );
+    }
+
+    #[test]
+    fn windows_server_root_follows_program_data() {
+        assert_eq!(
+            server_root_from_program_data(Some(r"D:\ProgramData")),
+            Path::new(r"D:\ProgramData").join("anago")
+        );
+        // Unset or empty falls back to the stock location.
+        let stock = PathBuf::from(r"C:\ProgramData\anago");
+        assert_eq!(server_root_from_program_data(None), stock);
+        assert_eq!(server_root_from_program_data(Some("")), stock);
+    }
+
+    #[test]
+    fn windows_client_dir_is_appdata_or_an_error() {
+        // Note: on unix `is_absolute` is false for `C:\...`, so feed a
+        // unix-absolute APPDATA here — the *rule* (absolute or error)
+        // is what this test pins; the drive-letter form is exercised on
+        // the Windows CI runner.
+        let got = client_config_dir_from_appdata(Some("/Users/jo/AppData/Roaming")).unwrap();
+        assert_eq!(got.dir(), Path::new("/Users/jo/AppData/Roaming").join("anago"));
+        // Missing APPDATA is an error, not a guess — same rule as HOME.
+        assert!(client_config_dir_from_appdata(None).is_err());
     }
 }

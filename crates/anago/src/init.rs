@@ -1150,6 +1150,7 @@ mod tests {
     use crate::store::Store;
     use anago_core::state::Challenge;
     use anago_core::subnet::Subnet;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::Ordering;
 
@@ -1875,6 +1876,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // exercises unix modes/ownership/symlinks
     fn the_token_lands_beside_the_state_and_only_when_it_is_kept() {
         let dir = TempDir::new();
         let root = dir.path.join("var");

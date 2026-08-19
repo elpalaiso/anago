@@ -77,7 +77,7 @@ fn main() {
         Command::ServerRenew(args) => server_renew(&args),
         Command::ServerRun => server_run(),
         Command::Sync(args) => sync_device(&args),
-        Command::Code => match code::run(std::path::Path::new(paths::DEFAULT_SERVER_ROOT), now()) {
+        Command::Code => match code::run(&paths::default_server_root(), now()) {
             Ok(text) => print!("{text}"),
             Err(e) => {
                 eprintln!("anago: {e}");
@@ -94,8 +94,8 @@ fn main() {
 fn server_init(args: &cli::ServerInit) -> ! {
     match init::run(
         args,
-        std::path::Path::new(paths::DEFAULT_SERVER_ROOT),
-        std::path::Path::new(paths::DEFAULT_WG_DIR),
+        &paths::default_server_root(),
+        &paths::default_wg_dir(),
         now(),
     ) {
         Ok(done) => {
@@ -117,7 +117,7 @@ fn server_init(args: &cli::ServerInit) -> ! {
 /// `anago server renew` — a certificate again, a setting changed, or
 /// the A record pushed. Never touches `wg` (§8).
 fn server_renew(args: &cli::ServerRenew) -> ! {
-    let root = std::path::Path::new(paths::DEFAULT_SERVER_ROOT);
+    let root = &paths::default_server_root();
     let store = store::Store::new(root);
     let server_paths = paths::ServerPaths::new(root);
     let env = std::env::var(cfapi::TOKEN_ENV).ok();
@@ -139,8 +139,8 @@ fn server_renew(args: &cli::ServerRenew) -> ! {
 /// `anago server run` — the process systemd starts.
 fn server_run() -> ! {
     match serve::run(
-        std::path::Path::new(paths::DEFAULT_SERVER_ROOT),
-        std::path::Path::new(paths::DEFAULT_WG_DIR),
+        &paths::default_server_root(),
+        &paths::default_wg_dir(),
     ) {
         // `serve::run` only returns when the listener stops.
         Ok(()) => std::process::exit(0),
@@ -153,7 +153,7 @@ fn server_run() -> ! {
 
 /// `anago sync` — on a device, pull the peer list (§6.3).
 fn sync_device(args: &cli::Sync) -> ! {
-    let wg_config = paths::wg_config(paths::DEFAULT_WG_DIR);
+    let wg_config = paths::wg_config(&paths::default_wg_dir());
     if let Some(timer) = args.timer {
         manage_timer(timer, args.config.as_deref(), &wg_config);
     }
@@ -250,7 +250,7 @@ fn join_device(args: &cli::Join) -> ! {
             std::process::exit(EXIT_FAILED);
         }
     };
-    let wg_config = paths::wg_config(paths::DEFAULT_WG_DIR);
+    let wg_config = paths::wg_config(&paths::default_wg_dir());
 
     match join::run(
         &args.domain,
@@ -371,8 +371,8 @@ fn list_devices() -> ! {
     // state file, and asking for HOME first would break `anago ls` in
     // cron or a bare service environment.
     match ls::run(
-        std::path::Path::new(paths::DEFAULT_SERVER_ROOT),
-        std::path::Path::new(paths::DEFAULT_WG_DIR),
+        &paths::default_server_root(),
+        &paths::default_wg_dir(),
         paths::client_config_dir_from_env,
         now(),
     ) {
@@ -389,11 +389,11 @@ fn list_devices() -> ! {
 
 /// `anago rm <name>` — locally on the hub, over the API on a device.
 fn remove_device(args: &cli::Rm) -> ! {
-    let wg_config = paths::wg_config(paths::DEFAULT_WG_DIR);
+    let wg_config = paths::wg_config(&paths::default_wg_dir());
     match rm::run(
         &args.name,
-        std::path::Path::new(paths::DEFAULT_SERVER_ROOT),
-        std::path::Path::new(paths::DEFAULT_WG_DIR),
+        &paths::default_server_root(),
+        &paths::default_wg_dir(),
         paths::client_config_dir_from_env,
     ) {
         Ok(removed) => {

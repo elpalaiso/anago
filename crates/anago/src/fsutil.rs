@@ -8,14 +8,20 @@
 //! - **0600 from birth**: the mode is set in the open flags, not with a
 //!   `chmod` afterwards — a private key must never exist as
 //!   world-readable, not even for a microsecond.
-//! - **flock**: concurrent joins are rare but real, so the server holds
-//!   an exclusive lock across read-modify-write (§13).
+//! - **locking**: concurrent joins are rare but real, so the server
+//!   holds an exclusive lock across read-modify-write (§13).
 //!
-//! Unix only, which is the M0 target (§13: Windows is out of scope).
+//! Cross-platform since M1.5 (§11.1 결정 4). The unix build keeps its
+//! full threat model — 0600 from birth, `O_NOFOLLOW`, descriptor-rooted
+//! directory work for the sudo handover. Windows has no sudo and no
+//! umask: files inherit the parent directory's ACL (best effort,
+//! documented), and the same public API runs over plain paths.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -259,7 +265,9 @@ fn prepare_private(path: &Path, contents: &[u8]) -> io::Result<PathBuf> {
 /// 0700. Existing directories are left alone apart from that mode.
 pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     fs::create_dir_all(dir)?;
-    fs::set_permissions(dir, fs::Permissions::from_mode(PRIVATE_DIR_MODE))
+    #[cfg(unix)]
+    fs::set_permissions(dir, fs::Permissions::from_mode(PRIVATE_DIR_MODE))?;
+    Ok(())
 }
 
 /// Publishes a *new* file, 0600, refusing to replace an existing one.
@@ -332,14 +340,25 @@ pub fn open_new_private(path: &Path) -> io::Result<File> {
 /// `fchmod` on the descriptor rather than `chmod` on the name, for the
 /// same reason [`give_fd_to`] uses `fchown`.
 fn create_new_with(path: &Path, mode: u32) -> io::Result<File> {
-    let file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
-    let permissions = file.set_permissions(fs::Permissions::from_mode(mode));
-    or_remove(file, path, permissions)
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    // Unix: the mode rides in the open flags and symlinks are refused.
+    // Windows: the file inherits the parent directory's ACL (§11.1
+    // 결정 4 — best effort), and planting a symlink needs admin rights
+    // there to begin with.
+    #[cfg(unix)]
+    opts.mode(mode).custom_flags(libc::O_NOFOLLOW);
+    let file = opts.open(path)?;
+    #[cfg(unix)]
+    {
+        let permissions = file.set_permissions(fs::Permissions::from_mode(mode));
+        or_remove(file, path, permissions)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = mode;
+        Ok(file)
+    }
 }
 
 /// [`create_new_with`], after clearing anything left at that name.
@@ -408,14 +427,9 @@ pub fn create_new_private_owned(
     // `server init` uses for the state file and the wg config, the next
     // run would refuse to start over a stub it cannot use.
     let tmp = unique_temp_sibling(path)?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(PRIVATE_FILE_MODE)
-        // A path under someone's home may be a symlink they placed
-        // there; root following it would write wherever it points.
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&tmp)?;
+    // Unix adds: a path under someone's home may be a symlink they
+    // placed there; root following it would write wherever it points.
+    let mut file = create_new_with(&tmp, PRIVATE_FILE_MODE)?;
     let written = file
         .write_all(contents.as_bytes())
         .and_then(|()| match owner {
@@ -455,6 +469,7 @@ fn unique_temp_sibling(path: &Path) -> io::Result<PathBuf> {
 }
 
 /// `fchown` on an open file.
+#[cfg(unix)]
 pub fn give_fd_to(file: &File, uid: u32, gid: u32) -> io::Result<()> {
     // SAFETY: the descriptor is owned by `file` and valid for the call.
     let result = unsafe { libc::fchown(file.as_raw_fd(), uid, gid) };
@@ -463,6 +478,13 @@ pub fn give_fd_to(file: &File, uid: u32, gid: u32) -> io::Result<()> {
     } else {
         Err(io::Error::last_os_error())
     }
+}
+
+/// Windows: there is no sudo, so there is never anyone to hand a file
+/// back to — the process owner is the owner.
+#[cfg(windows)]
+pub fn give_fd_to(_file: &File, _uid: u32, _gid: u32) -> io::Result<()> {
+    Ok(())
 }
 
 /// A directory, opened once and held open.
@@ -475,12 +497,14 @@ pub fn give_fd_to(file: &File, uid: u32, gid: u32) -> io::Result<()> {
 /// and friends resolve relative to the inode this handle already holds,
 /// so the check and the work are about the same directory by
 /// construction.
+#[cfg(unix)]
 #[derive(Debug)]
 pub struct DirHandle {
     fd: OwnedFd,
     path: PathBuf,
 }
 
+#[cfg(unix)]
 impl DirHandle {
     /// Opens `path`, refusing symlinks, and confirms `uid` owns it.
     ///
@@ -653,10 +677,10 @@ impl DirHandle {
             }
             Err(e) => return Err(e),
         };
-        match flock(&file, libc::LOCK_EX | libc::LOCK_NB) {
+        match file.try_lock() {
             Ok(()) => Ok(Some(FileLock { file })),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
-            Err(e) => Err(e),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => Err(e),
         }
     }
 
@@ -769,6 +793,7 @@ fn ignore_missing(e: io::Error) -> io::Result<()> {
     }
 }
 
+#[cfg(unix)]
 fn c_path(path: &Path) -> io::Result<std::ffi::CString> {
     std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL"))
@@ -776,18 +801,122 @@ fn c_path(path: &Path) -> io::Result<std::ffi::CString> {
 
 /// A single path component — no separators, so it cannot escape the
 /// directory the handle holds.
-fn c_name(name: &str) -> io::Result<std::ffi::CString> {
-    if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+fn valid_name(name: &str) -> io::Result<&str> {
+    if name.is_empty() || name.contains('/') || name.contains('\\') || name == "." || name == ".." {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("{name:?} is not a file name"),
         ));
     }
-    std::ffi::CString::new(name)
+    Ok(name)
+}
+
+#[cfg(unix)]
+fn c_name(name: &str) -> io::Result<std::ffi::CString> {
+    std::ffi::CString::new(valid_name(name)?)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "name contains a NUL"))
 }
 
-/// An exclusive `flock(2)` on a lock file, released when dropped.
+/// Windows: the same API over plain paths.
+///
+/// The unix version guards a *root* process against the directory's
+/// owner swapping it for a symlink mid-operation (§9's sudo handover).
+/// Windows has no sudo — anago only works in the invoking user's own
+/// `%APPDATA%` or the admin-owned `%ProgramData%` — so the descriptor
+/// machinery has nothing to defend against, and ownership questions
+/// answer with the process owner (uid 0 by convention here).
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct DirHandle {
+    path: PathBuf,
+}
+
+#[cfg(windows)]
+impl DirHandle {
+    /// Opens `path`; the owner check is a no-op (see the type docs).
+    pub fn open_owned(path: &Path, _uid: u32) -> io::Result<DirHandle> {
+        DirHandle::open(path)
+    }
+
+    pub fn open(path: &Path) -> io::Result<DirHandle> {
+        if !fs::metadata(path)?.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is not a directory", path.display()),
+            ));
+        }
+        Ok(DirHandle { path: path.to_path_buf() })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The process owner, by convention (see the type docs).
+    pub fn owner(&self) -> io::Result<u32> {
+        Ok(0)
+    }
+
+    pub fn exists(&self, name: &str) -> io::Result<bool> {
+        let name = valid_name(name)?;
+        match fs::symlink_metadata(self.path.join(name)) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Missing files still answer `NotFound`, like the unix version;
+    /// an existing file belongs to the process owner by convention.
+    pub fn owner_of(&self, name: &str) -> io::Result<(u32, u32)> {
+        let name = valid_name(name)?;
+        fs::symlink_metadata(self.path.join(name))?;
+        Ok((0, 0))
+    }
+
+    pub fn read_to_string(&self, name: &str) -> io::Result<String> {
+        let name = valid_name(name)?;
+        fs::read_to_string(self.path.join(name))
+    }
+
+    /// Complete-then-publish, like the unix version — the shared
+    /// [`create_new_private_owned`] already writes a temp sibling and
+    /// hard-links it into place, which NTFS supports.
+    pub fn create_new_private(
+        &self,
+        name: &str,
+        contents: &str,
+        owner: Option<(u32, u32)>,
+    ) -> io::Result<()> {
+        let name = valid_name(name)?;
+        create_new_private_owned(&self.path.join(name), contents, owner)
+    }
+
+    pub fn write_private(
+        &self,
+        name: &str,
+        contents: &str,
+        owner: Option<(u32, u32)>,
+    ) -> io::Result<()> {
+        let name = valid_name(name)?;
+        write_private_owned(&self.path.join(name), contents.as_bytes(), owner)
+    }
+
+    /// Takes an exclusive lock on `name`, creating it if needed.
+    pub fn try_lock(&self, name: &str, owner: Option<(u32, u32)>) -> io::Result<Option<FileLock>> {
+        let name = valid_name(name)?;
+        let _ = owner; // no sudo handover on Windows
+        FileLock::try_acquire(&self.path.join(name))
+    }
+
+    pub fn remove(&self, name: &str) -> io::Result<()> {
+        let name = valid_name(name)?;
+        fs::remove_file(self.path.join(name))
+    }
+}
+
+/// An exclusive lock on a lock file, released when dropped — `flock`
+/// on unix, `LockFileEx` on Windows (both via std's file locks).
 ///
 /// Held around the server's read-modify-write of the state file so two
 /// simultaneous joins cannot both allocate `.2` (§13). The lock lives
@@ -802,7 +931,7 @@ impl FileLock {
     /// Waits for the lock.
     pub fn acquire(path: &Path) -> io::Result<FileLock> {
         let file = lock_file(path)?;
-        flock(&file, libc::LOCK_EX)?;
+        file.lock()?;
         Ok(FileLock { file })
     }
 
@@ -816,19 +945,19 @@ impl FileLock {
     /// exactly what a timer is for.
     pub fn try_acquire(path: &Path) -> io::Result<Option<FileLock>> {
         let file = lock_file(path)?;
-        match flock(&file, libc::LOCK_EX | libc::LOCK_NB) {
+        match file.try_lock() {
             Ok(()) => Ok(Some(FileLock { file })),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
-            Err(e) => Err(e),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => Err(e),
         }
     }
 }
 
 impl Drop for FileLock {
     fn drop(&mut self) {
-        // Closing the descriptor would release it anyway; unlocking
+        // Closing the handle would release it anyway; unlocking
         // explicitly keeps the release at a point we chose.
-        let _ = flock(&self.file, libc::LOCK_UN);
+        let _ = self.file.unlock();
     }
 }
 
@@ -838,34 +967,20 @@ impl Drop for FileLock {
 /// `join.lock` symlinked to `/etc/passwd` would otherwise have root
 /// write to that file instead.
 fn lock_file(path: &Path) -> io::Result<File> {
-    match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(PRIVATE_FILE_MODE)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-    {
+    match create_new_with(path, PRIVATE_FILE_MODE) {
         Ok(file) => Ok(file),
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => OpenOptions::new()
-            .write(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            let mut opts = OpenOptions::new();
+            opts.write(true);
+            #[cfg(unix)]
+            opts.custom_flags(libc::O_NOFOLLOW);
+            opts.open(path)
+        }
         Err(e) => Err(e),
     }
 }
 
-fn flock(file: &File, operation: i32) -> io::Result<()> {
-    // SAFETY: `file` owns a valid descriptor for the duration of the
-    // call, and `operation` is one of libc's LOCK_* constants.
-    let result = unsafe { libc::flock(file.as_raw_fd(), operation) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -1317,5 +1432,110 @@ mod tests {
         drop(held);
         assert_eq!(fs::read_to_string(&state).unwrap(), "second");
         assert!(FileLock::try_acquire(&lock).unwrap().is_some());
+    }
+}
+
+/// Behavior every platform must share — this is the suite the Windows
+/// CI runner exercises against the plain-path `DirHandle` and std's
+/// file locks (§11.1 결정 4).
+#[cfg(test)]
+mod portable_tests {
+    use super::*;
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new() -> TempDir {
+            let path = std::env::temp_dir().join(format!(
+                "anago-fsutil-portable-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            fs::create_dir_all(&path).expect("temp dir");
+            TempDir { path }
+        }
+
+        fn join(&self, name: &str) -> PathBuf {
+            self.path.join(name)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn a_private_write_replaces_and_reads_back() {
+        let dir = TempDir::new();
+        let path = dir.join("state.json");
+        write_private(&path, "one").unwrap();
+        write_private(&path, "two").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "two");
+        // No temp litter beside the target.
+        let names: Vec<_> = fs::read_dir(dir.path.as_path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names.len(), 1, "only the target remains: {names:?}");
+    }
+
+    #[test]
+    fn a_new_file_refuses_to_clobber() {
+        let dir = TempDir::new();
+        let path = dir.join("phone.conf");
+        create_new_private(&path, "first").unwrap();
+        let e = create_new_private(&path, "second").unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "first");
+    }
+
+    #[test]
+    fn a_held_lock_excludes_and_release_readmits() {
+        let dir = TempDir::new();
+        let path = dir.join("state.lock");
+        let held = FileLock::acquire(&path).unwrap();
+        assert!(
+            FileLock::try_acquire(&path).unwrap().is_none(),
+            "second taker must be told to wait"
+        );
+        drop(held);
+        assert!(FileLock::try_acquire(&path).unwrap().is_some());
+    }
+
+    #[test]
+    fn names_with_separators_cannot_escape_a_handle() {
+        for bad in ["", ".", "..", "a/b", "a\\b"] {
+            assert!(valid_name(bad).is_err(), "{bad:?} must be refused");
+        }
+        assert_eq!(valid_name("device.json").unwrap(), "device.json");
+    }
+
+    #[test]
+    fn a_dir_handle_round_trips_on_every_platform() {
+        let dir = TempDir::new();
+        let handle = DirHandle::open(dir.path.as_path()).unwrap();
+
+        assert!(!handle.exists("device.json").unwrap());
+        handle.create_new_private("device.json", "{}", None).unwrap();
+        assert!(handle.exists("device.json").unwrap());
+        assert_eq!(handle.read_to_string("device.json").unwrap(), "{}");
+
+        // Creating again refuses; rewriting replaces.
+        assert!(handle.create_new_private("device.json", "x", None).is_err());
+        handle.write_private("device.json", "{\"v\":2}", None).unwrap();
+        assert_eq!(handle.read_to_string("device.json").unwrap(), "{\"v\":2}");
+
+        // The lock lives beside the file and excludes a second taker.
+        let lock = handle.try_lock("join.lock", None).unwrap();
+        assert!(lock.is_some());
+        assert!(handle.try_lock("join.lock", None).unwrap().is_none());
+        drop(lock);
+
+        handle.remove("device.json").unwrap();
+        assert!(!handle.exists("device.json").unwrap());
     }
 }

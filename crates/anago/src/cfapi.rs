@@ -202,6 +202,7 @@ fn from_file(contents: &str, path: &Path, mode: Option<u32>) -> Result<Loaded, C
 
 #[cfg(unix)]
 fn file_mode(path: &Path) -> Option<u32> {
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path)
         .ok()
@@ -1481,6 +1482,7 @@ mod tests {
     }
 
     fn set_mode(path: &Path, mode: u32) {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
     }

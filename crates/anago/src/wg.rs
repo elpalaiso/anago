@@ -15,7 +15,6 @@
 use std::ffi::OsStr;
 use std::fmt;
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -218,11 +217,21 @@ pub fn find_in_path(path_var: &str, program: &str) -> Option<PathBuf> {
         .find(|candidate| is_executable_file(candidate))
 }
 
+#[cfg(unix)]
 fn is_executable_file(path: &Path) -> bool {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     match std::fs::metadata(path) {
         Ok(meta) => meta.is_file() && meta.permissions().mode() & 0o111 != 0,
         Err(_) => false,
     }
+}
+
+/// Windows: executability is the extension's job, and the search below
+/// already asks for the exact file name — existing is enough.
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    std::fs::metadata(path).map(|m| m.is_file()).unwrap_or(false)
 }
 
 /// Checks that both tools are present, naming the missing one and how
@@ -393,7 +402,13 @@ mod tests {
         fn tool(&self, name: &str, mode: u32) -> &Path {
             let path = self.path.join(name);
             fs::write(&path, "#!/bin/sh\n").expect("write");
-            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).expect("chmod");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(mode)).expect("chmod");
+            }
+            #[cfg(not(unix))]
+            let _ = mode; // on Windows existence is executability here
             &self.path
         }
     }

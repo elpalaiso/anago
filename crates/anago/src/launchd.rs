@@ -513,7 +513,9 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // exercises unix modes/ownership/symlinks
     fn a_path_that_is_not_text_is_refused() {
+        #[cfg(unix)]
         use std::os::unix::ffi::OsStrExt;
 
         // The file declares itself UTF-8 in its first line, and

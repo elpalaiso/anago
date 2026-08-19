@@ -255,6 +255,7 @@ mod tests {
     use super::*;
     use std::fs;
     use std::net::Ipv4Addr;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -314,6 +315,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // exercises unix modes/ownership/symlinks
     fn the_config_is_written_from_the_state() {
         let dir = TempDir::new();
         let path = dir.path.join("anago.conf");

@@ -734,6 +734,7 @@ mod tests {
     use super::*;
     use anago_core::proto::{HubInfo, PeerInfo};
     use anago_core::sync::Changes;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
 
@@ -1180,6 +1181,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // exercises unix modes/ownership/symlinks
     fn the_device_file_goes_back_to_whoever_owned_it() {
         // sync runs as root and `device.json` is in somebody's home.
         // Writing it the ordinary way would create the replacement as
@@ -1245,6 +1247,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // exercises unix modes/ownership/symlinks
     fn a_device_file_that_is_a_symlink_is_not_followed() {
         // The other half of the same race: swapping the file rather
         // than the directory. Root reading — or worse, replacing —
@@ -1555,6 +1558,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // exercises unix modes/ownership/symlinks
     fn the_stripped_config_never_outlives_the_command() {
         // It holds the same private key as the config beside it, and
         // it exists only because `wg syncconf` takes a filename.
