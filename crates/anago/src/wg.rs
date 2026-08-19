@@ -26,6 +26,9 @@ pub const WG: &str = "wg";
 pub const WG_QUICK: &str = "wg-quick";
 
 /// A command line, assembled but not run.
+///
+/// Not only wg's: `launchd` builds its `launchctl` lines with the same
+/// type, so "what would this run?" has one answer and one `display`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cmd {
     pub program: String,
@@ -33,14 +36,14 @@ pub struct Cmd {
 }
 
 impl Cmd {
-    fn new(program: &str, args: &[&str]) -> Cmd {
+    pub(crate) fn new(program: &str, args: &[&str]) -> Cmd {
         Cmd {
             program: program.to_string(),
             args: args.iter().map(|arg| arg.to_string()).collect(),
         }
     }
 
-    fn with_path(program: &str, args: &[&str], path: &Path) -> Cmd {
+    pub(crate) fn with_path(program: &str, args: &[&str], path: &Path) -> Cmd {
         let mut cmd = Cmd::new(program, args);
         cmd.args.push(path.to_string_lossy().into_owned());
         cmd

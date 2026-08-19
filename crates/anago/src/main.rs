@@ -30,6 +30,11 @@ mod dnsprobe;
 mod fsutil;
 mod init;
 mod join;
+// The mac half of the sync timer: the property list and the two
+// `launchctl` lines. Written and tested here; the command that installs
+// them lands next, alongside systemd's.
+#[allow(dead_code)]
+mod launchd;
 mod ls;
 mod paths;
 mod renew;
