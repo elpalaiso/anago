@@ -1533,6 +1533,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // asserts unix path strings
     fn a_manual_hub_switched_to_acme_points_at_anagos_own_files() {
         // The operator's certificate is left exactly where it is, so
         // undoing this is putting the two old paths back (§8).

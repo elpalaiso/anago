@@ -1661,6 +1661,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // identity check is dev/ino — Windows uses existence (§11.1)
     fn a_name_that_stopped_meaning_our_file_is_not_written_off_as_success() {
         // Between the claim and the answer, anybody with write access
         // to that directory — `/tmp` is the ordinary case — can rename

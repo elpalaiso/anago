@@ -1988,6 +1988,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // unix path semantics (absolute-ness, separators)
     fn the_timer_form_is_the_one_the_unit_file_carries() {
         // §8 fixes the installed command line as
         // `anago sync --quiet --config <absolute path>`, so both have
@@ -2002,6 +2003,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // unix path semantics (absolute-ness, separators)
     fn a_relative_config_path_is_refused() {
         // The flag exists because a timer has no working directory a
         // person would recognise: it runs as root, outside the
@@ -2109,6 +2111,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // unix path semantics (absolute-ness, separators)
     fn a_flag_that_would_be_ignored_is_refused_instead() {
         // The failure this prevents is silent: a flag accepted and
         // dropped looks exactly like a flag that worked.

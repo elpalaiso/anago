@@ -1339,6 +1339,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // asserts unix path strings
     fn an_acme_hub_records_what_a_renewal_will_need() {
         // The state is built before the CA is called, so everything a
         // renewal reads has to be in it already — except what only the
@@ -1369,6 +1370,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // asserts unix path strings
     fn the_token_is_only_kept_when_a_renewal_will_need_it() {
         // §9.1: the secret that can be got rid of is got rid of. A hub
         // that used the token for the A record and took its

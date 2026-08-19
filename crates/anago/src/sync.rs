@@ -1214,6 +1214,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // guards the sudo threat model — no sudo on Windows
     fn the_directory_cannot_be_swapped_out_from_under_the_run() {
         // The race a root timer walking a user-controlled path loses
         // if it works by path: rename the directory between the read

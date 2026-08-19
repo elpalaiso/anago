@@ -538,7 +538,7 @@ impl fmt::Display for SystemdError {
 
 impl std::error::Error for SystemdError {}
 
-#[cfg(test)]
+#[cfg(all(test, unix))] // systemd units only ever run on Linux; path semantics differ on Windows
 mod tests {
     use super::*;
 

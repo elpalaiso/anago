@@ -701,6 +701,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // mode warnings are a unix concept
     fn a_world_readable_key_is_a_warning_not_a_refusal() {
         // The file may belong to certbot or a Cloudflare origin-cert
         // layout anago does not own, so it says so and serves anyway.

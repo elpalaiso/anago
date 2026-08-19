@@ -321,7 +321,7 @@ fn shown(path: &Path) -> String {
     path.to_string_lossy().escape_debug().to_string()
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))] // launchd only ever runs on macOS; path semantics differ on Windows
 mod tests {
     use super::*;
 

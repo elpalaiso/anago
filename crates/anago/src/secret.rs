@@ -1,7 +1,8 @@
 //! Secrets the server mints: device tokens and their hashes
 //! (DESIGN.md §7.1).
 //!
-//! Randomness comes from `/dev/urandom` — no crate, no fallback. If the
+//! Randomness comes straight from the OS CSPRNG — `/dev/urandom` on
+//! unix, `BCryptGenRandom` on Windows — no crate, no fallback. If the
 //! kernel cannot give us 32 bytes, the join fails rather than
 //! proceeding with something weaker.
 //!
@@ -10,17 +11,57 @@
 //! so verification is one hash of the header value with nothing to get
 //! wrong about encoding.
 
+#[cfg(unix)]
 use std::fs::File;
-use std::io::{self, Read};
+use std::io;
+#[cfg(unix)]
+use std::io::Read;
 
 use anago_core::code::{self, JoinCode};
 use anago_core::token::{DeviceToken, TokenHash, TOKEN_BYTES};
 use sha2::{Digest, Sha256};
 
 /// Reads `N` bytes from the kernel's CSPRNG.
+#[cfg(unix)]
 pub fn random_bytes<const N: usize>() -> io::Result<[u8; N]> {
     let mut bytes = [0u8; N];
     File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// Reads `N` bytes from the kernel's CSPRNG — Windows keeps it behind
+/// `BCryptGenRandom`, linked directly so the no-crate stance holds.
+#[cfg(windows)]
+pub fn random_bytes<const N: usize>() -> io::Result<[u8; N]> {
+    #[link(name = "bcrypt")]
+    extern "system" {
+        fn BCryptGenRandom(
+            algorithm: *mut core::ffi::c_void,
+            buffer: *mut u8,
+            length: u32,
+            flags: u32,
+        ) -> i32; // NTSTATUS
+    }
+    /// "Use the system-preferred RNG" — the documented way to call it
+    /// with no algorithm handle to manage.
+    const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
+
+    let mut bytes = [0u8; N];
+    // SAFETY: the buffer is valid for `N` bytes for the whole call, and
+    // a null handle with the flag above is the documented calling form.
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            bytes.as_mut_ptr(),
+            N as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::other(format!(
+            "BCryptGenRandom failed (NTSTATUS {status:#x}) — cannot mint a credential"
+        )));
+    }
     Ok(bytes)
 }
 

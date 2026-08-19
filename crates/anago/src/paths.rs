@@ -435,6 +435,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // unix-absolute paths are not absolute on Windows
     fn xdg_config_home_wins_when_it_is_absolute() {
         let paths = client_config_dir(Some("/home/jo/.config"), Some("/home/jo")).unwrap();
         assert_eq!(paths.dir(), Path::new("/home/jo/.config/anago"));
@@ -464,6 +465,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // unix-absolute paths are not absolute on Windows
     fn home_is_the_fallback() {
         let paths = client_config_dir(None, Some("/home/jo")).unwrap();
         assert_eq!(paths.dir(), Path::new("/home/jo/.config/anago"));
@@ -474,6 +476,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // unix-absolute paths are not absolute on Windows
     fn sudo_and_plain_runs_land_in_the_same_directory() {
         // The device file is written by `sudo anago join` and read by a
         // plain `anago ls`: the two have to agree, or the token is
@@ -523,6 +526,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // unix-absolute paths are not absolute on Windows
     fn a_relative_xdg_value_is_ignored_not_resolved() {
         // Resolving it would drop a device's token wherever the user
         // happened to be standing.
@@ -548,6 +552,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // unix-absolute paths are not absolute on Windows
     fn trailing_slashes_do_not_double_up() {
         let paths = client_config_dir(Some("/home/jo/.config/"), None).unwrap();
         assert_eq!(paths.dir(), Path::new("/home/jo/.config/anago"));
@@ -571,12 +576,16 @@ mod tests {
 
     #[test]
     fn windows_client_dir_is_appdata_or_an_error() {
-        // Note: on unix `is_absolute` is false for `C:\...`, so feed a
-        // unix-absolute APPDATA here — the *rule* (absolute or error)
-        // is what this test pins; the drive-letter form is exercised on
-        // the Windows CI runner.
-        let got = client_config_dir_from_appdata(Some("/Users/jo/AppData/Roaming")).unwrap();
-        assert_eq!(got.dir(), Path::new("/Users/jo/AppData/Roaming").join("anago"));
+        // `is_absolute` is platform truth — a drive path on Windows, a
+        // rooted path elsewhere — so the sample follows the platform;
+        // the *rule* (absolute or error) is what this test pins.
+        let sample = if cfg!(windows) {
+            r"C:\Users\jo\AppData\Roaming"
+        } else {
+            "/Users/jo/AppData/Roaming"
+        };
+        let got = client_config_dir_from_appdata(Some(sample)).unwrap();
+        assert_eq!(got.dir(), Path::new(sample).join("anago"));
         // Missing APPDATA is an error, not a guess — same rule as HOME.
         assert!(client_config_dir_from_appdata(None).is_err());
     }
