@@ -8,15 +8,17 @@
 //! `code`, `join`, `ls`, `rm`.
 
 mod activate;
-// Which way the hub gets its certificate. `server init` and
-// `server renew` wire it in a later slice.
+// Which way the hub gets its certificate. `server init` routes the
+// flags and `serve` renews; the issuance itself is wired in as the
+// commands that order one land.
 #[allow(dead_code)]
 mod acme;
 mod api;
 mod args;
 // Cloudflare: where the token comes from, which zone the domain lives
-// in, and the hub's A record. `server init` wires all of it in a later
-// slice, so the module is briefly ahead of its caller.
+// in, and the hub's A record. `server init` takes the token flags; the
+// zone and record calls are wired in a later slice, so part of the
+// module is still ahead of its caller.
 #[allow(dead_code)]
 mod cfapi;
 mod cli;

@@ -12,10 +12,13 @@
 
 use anago_core::code::JoinCode;
 use anago_core::name::DeviceName;
+use anago_core::state::Challenge;
 use anago_core::subnet::Subnet;
 use std::fmt;
 
+use crate::acme::{self, PlanError};
 use crate::args::{ArgError, Flag, ParsedArgs};
+use crate::cfapi::{self, CfError, Source, Token};
 
 /// Defaults from §5 and §8, applied when the flag is absent.
 pub const DEFAULT_SUBNET: &str = "10.100.0.0/24";
@@ -39,12 +42,34 @@ pub enum Command {
     Version,
 }
 
-/// `anago server init` (§8, M0: manual DNS, existing certificate).
+/// `anago server init` (§8).
+///
+/// The certificate flags are optional in M1 and that is the whole
+/// fork: given, this is M0's manual path and ACME never runs; left out,
+/// anago orders and renews the certificate itself. Routing keeps them
+/// as they were typed rather than resolving the fork, because the
+/// answer also depends on the environment — see [`check_combination`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerInit {
     pub domain: String,
-    pub tls_cert: String,
-    pub tls_key: String,
+    /// `--tls-cert`/`--tls-key`. Both or neither.
+    pub tls_cert: Option<String>,
+    pub tls_key: Option<String>,
+    /// `--acme-email` — the address the CA warns before an expiry, and
+    /// the only alarm that reaches a person when renewal has quietly
+    /// stopped working (§8).
+    pub acme_email: Option<String>,
+    /// `--acme-staging`: order from Let's Encrypt's staging CA, whose
+    /// certificates are not publicly trusted.
+    pub acme_staging: bool,
+    /// `--acme-challenge`. `None` means "decide from whether there is
+    /// a token", which routing cannot know.
+    pub acme_challenge: Option<Challenge>,
+    /// `--cf-token`. Parsed here so a truncated paste is caught before
+    /// anything is generated, and redacted in `Debug` (§13).
+    pub cf_token: Option<Token>,
+    /// `--cf-token-file`, the form that keeps the secret out of argv.
+    pub cf_token_file: Option<String>,
     pub subnet: Subnet,
     pub listen_port: u16,
     pub api_port: u16,
@@ -163,21 +188,15 @@ fn server_init(argv: &[String]) -> Result<Command, CliError> {
         Flag::value("port"),
         Flag::value("api-port"),
         Flag::boolean("no-systemd"),
-        // Routed so the M1 answer is specific; §8 keeps it out of M0.
+        Flag::value("acme-email"),
+        Flag::boolean("acme-staging"),
+        Flag::value("acme-challenge"),
         Flag::value("cf-token"),
+        Flag::value("cf-token-file"),
     ];
     let parsed = ParsedArgs::parse(argv, &spec)?;
     reject_extra_positionals(&parsed, "server init")?;
 
-    if parsed.is_set("cf-token") {
-        return Err(CliError::NotYet {
-            what: "--cf-token",
-            milestone: "M1",
-            because: "M0 asks you to add the DNS record and pass --tls-cert/--tls-key yourself",
-        });
-    }
-
-    let domain = domain(parsed.require("domain")?)?;
     let subnet = match parsed.value("subnet") {
         Some(text) => text,
         None => DEFAULT_SUBNET,
@@ -187,15 +206,100 @@ fn server_init(argv: &[String]) -> Result<Command, CliError> {
         message: e.to_string(),
     })?;
 
-    Ok(Command::ServerInit(ServerInit {
-        domain,
-        tls_cert: parsed.require("tls-cert")?.to_string(),
-        tls_key: parsed.require("tls-key")?.to_string(),
+    let init = ServerInit {
+        domain: domain(parsed.require("domain")?)?,
+        tls_cert: parsed.value("tls-cert").map(str::to_string),
+        tls_key: parsed.value("tls-key").map(str::to_string),
+        acme_email: parsed.value("acme-email").map(str::to_string),
+        acme_staging: parsed.is_set("acme-staging"),
+        acme_challenge: challenge(&parsed)?,
+        cf_token: token(&parsed)?,
+        cf_token_file: parsed.value("cf-token-file").map(str::to_string),
         subnet,
         listen_port: port(&parsed, "port", DEFAULT_LISTEN_PORT)?,
         api_port: port(&parsed, "api-port", DEFAULT_API_PORT)?,
         systemd: !parsed.is_set("no-systemd"),
-    }))
+    };
+    check_combination(&init)?;
+    Ok(Command::ServerInit(init))
+}
+
+/// `--acme-challenge http-01|dns-01`.
+///
+/// The spelling is the one the state file uses, so what a person types
+/// and what `anago server status` will print are the same string.
+fn challenge(parsed: &ParsedArgs) -> Result<Option<Challenge>, CliError> {
+    match parsed.value("acme-challenge") {
+        None => Ok(None),
+        Some(text) => match Challenge::parse(text) {
+            Some(challenge) => Ok(Some(challenge)),
+            None => Err(CliError::BadValue {
+                flag: "acme-challenge",
+                message: format!(
+                    "{text:?} is not a challenge — expected {} or {}",
+                    Challenge::Http01.as_str(),
+                    Challenge::Dns01.as_str()
+                ),
+            }),
+        },
+    }
+}
+
+/// `--cf-token <t>`, checked here rather than at first use.
+///
+/// A token truncated by a copy-paste is a command line that is wrong
+/// the moment it is typed, and the alternative is finding out from a
+/// 401 halfway through a setup — which reads as a permissions problem
+/// rather than a typo.
+fn token(parsed: &ParsedArgs) -> Result<Option<Token>, CliError> {
+    match parsed.value("cf-token") {
+        None => Ok(None),
+        Some(text) => Token::parse(text, Source::Flag)
+            .map(Some)
+            .map_err(CliError::Token),
+    }
+}
+
+/// The combination rules for `server init` (§8) that argv can settle.
+///
+/// **Not one of them is written out here.** They belong to the two pure
+/// functions that already own them and are already tested against the
+/// design — [`cfapi::choose`] for the two token flags, [`acme::plan`]
+/// for the fork between a certificate you have and one anago orders.
+/// Routing calls those so that a combination which cannot work is
+/// refused before anything is generated, and so that the sentence a
+/// person reads is the same wherever the check happens to run.
+///
+/// The plan itself is thrown away: `init` makes it again with the
+/// environment in hand, and that is the copy that decides anything.
+/// This call is here for the refusals.
+///
+/// One rule is deliberately **not** settled here. `--acme-challenge
+/// dns-01` needs a Cloudflare token, and a token can still arrive from
+/// `CLOUDFLARE_API_TOKEN` — which routing does not read, because not
+/// reading it is what keeps every rule in this module a unit test. So
+/// that verdict is left to `init`, which has the environment and runs
+/// the same function.
+fn check_combination(init: &ServerInit) -> Result<(), CliError> {
+    let token = cfapi::choose(
+        init.cf_token_file.as_deref(),
+        init.cf_token.as_ref().map(Token::expose),
+        None,
+    )
+    .map_err(CliError::Token)?;
+
+    match acme::plan(&acme::Request {
+        tls_cert: init.tls_cert.as_deref(),
+        tls_key: init.tls_key.as_deref(),
+        acme_email: init.acme_email.as_deref(),
+        staging: init.acme_staging,
+        challenge: init.acme_challenge,
+        token: token.as_ref(),
+    }) {
+        Ok(_) => Ok(()),
+        Err(PlanError::Dns01WithoutToken) => Ok(()),
+        Err(e) => Err(CliError::Plan(e)),
+    }
 }
 
 fn join(argv: &[String]) -> Result<Command, CliError> {
@@ -341,6 +445,11 @@ pub enum CliError {
         what: &'static str,
         message: String,
     },
+    /// Flags that do not together describe a hub anago can set up
+    /// ([`acme::plan`]).
+    Plan(PlanError),
+    /// A Cloudflare token flag that anago cannot use ([`cfapi`]).
+    Token(CfError),
     /// Real, designed, and not in this milestone.
     NotYet {
         what: &'static str,
@@ -370,6 +479,10 @@ impl fmt::Display for CliError {
                 write!(f, "`anago {command}` got more arguments than it takes")
             }
             CliError::BadValue { flag, message } => write!(f, "--{flag}: {message}"),
+            // Both already name the flags they are about, so adding a
+            // prefix here would say one of them twice.
+            CliError::Plan(e) => write!(f, "{e}"),
+            CliError::Token(e) => write!(f, "{e}"),
             CliError::BadArgument { what, message } => write!(f, "{what}: {message}"),
             CliError::NotYet {
                 what,
@@ -398,7 +511,11 @@ pub fn help(topic: Option<&str>) -> String {
     match topic {
         Some("server") | Some("init") => format!(
             "\
-usage: anago server init --domain <d> --tls-cert <path> --tls-key <path>
+usage: anago server init --domain <d>
+                        [--tls-cert <path> --tls-key <path>]
+                        [--acme-email <address>] [--acme-staging]
+                        [--acme-challenge http-01|dns-01]
+                        [--cf-token <token> | --cf-token-file <path>]
                         [--subnet {DEFAULT_SUBNET}] [--port {DEFAULT_LISTEN_PORT}]
                         [--api-port {DEFAULT_API_PORT}] [--no-systemd]
 
@@ -406,8 +523,22 @@ Sets up the hub on this machine: generates its wg keypair, writes the
 state file, prints the DNS record to add and the ports to open, then
 issues the first join code.
 
-M0 takes an existing certificate; ACME and Cloudflare DNS arrive in M1.
-"
+The certificate pair decides everything else. Give both and anago
+serves the certificate you already have and never renews it. Leave both
+out and anago orders one from Let's Encrypt and renews it — which needs
+--acme-email, the address the CA writes to before an expiry.
+
+--acme-challenge defaults to dns-01 when there is a Cloudflare token
+and http-01 when there is not. http-01 needs port 80 reachable; dns-01
+needs the token, which is also what lets anago add the A record for
+you. The token can come from --cf-token-file (safest), --cf-token
+(visible to `ps` and in shell history), or {env}.
+
+--acme-staging orders from Let's Encrypt's staging CA. Nothing trusts
+those certificates, so `anago join` will refuse them — it is for
+checking the wiring without spending a rate limit.
+",
+            env = cfapi::TOKEN_ENV
         ),
         Some("join") => format!(
             "\
@@ -451,7 +582,7 @@ working immediately.
 anago {version} — self-hosted WireGuard private network
 
 usage:
-  anago server init --domain <d> --tls-cert <path> --tls-key <path>
+  anago server init --domain <d>    set this machine up as the hub
   anago server run                  run the hub (systemd does this for you)
   anago code                        issue a join code (on the server)
   anago join <domain> <code>        register this device
@@ -461,7 +592,7 @@ usage:
   -h, --help                        show this, or `anago help <command>`
   -V, --version                     show the version
 
-Later milestones: `anago sync` (M1), `--export qr|conf` (M1),
+Later milestones: `anago sync` and `--export qr|conf` (M1),
 `anago ping` and `anago server status` (M3).
 "
         ),
@@ -505,8 +636,11 @@ mod tests {
     fn server_init_fills_in_the_documented_defaults() {
         let init = init(&required_init()).unwrap();
         assert_eq!(init.domain, "net.example.com");
-        assert_eq!(init.tls_cert, "/etc/ssl/anago/fullchain.pem");
-        assert_eq!(init.tls_key, "/etc/ssl/anago/privkey.pem");
+        assert_eq!(
+            init.tls_cert.as_deref(),
+            Some("/etc/ssl/anago/fullchain.pem")
+        );
+        assert_eq!(init.tls_key.as_deref(), Some("/etc/ssl/anago/privkey.pem"));
         assert_eq!(init.subnet, Subnet::parse(DEFAULT_SUBNET).unwrap());
         assert_eq!(init.listen_port, 51820);
         assert_eq!(init.api_port, 443);
@@ -533,27 +667,28 @@ mod tests {
     }
 
     #[test]
-    fn server_init_insists_on_what_m0_cannot_invent() {
-        // No ACME yet, so the certificate paths are not optional.
+    fn server_init_insists_on_what_it_cannot_invent() {
+        // The domain is the one thing with no default and no other
+        // way in: it is the DNS name, the certificate's subject, and
+        // what `anago join` is typed against.
         assert_eq!(
             parse_args(&["server", "init"]),
             Err(CliError::Arg(ArgError::Required("domain")))
         );
-        assert_eq!(
-            parse_args(&["server", "init", "--domain", "net.example.com"]),
-            Err(CliError::Arg(ArgError::Required("tls-cert")))
-        );
-        assert_eq!(
-            parse_args(&[
-                "server",
-                "init",
-                "--domain",
-                "net.example.com",
-                "--tls-cert",
-                "/c.pem"
-            ]),
-            Err(CliError::Arg(ArgError::Required("tls-key")))
-        );
+
+        // The certificate pair is not required any more — leaving it
+        // out is how a person asks anago to get one (§8).
+        let init = init(&[
+            "server",
+            "init",
+            "--domain",
+            "net.example.com",
+            "--acme-email",
+            "jo@example.com",
+        ])
+        .unwrap();
+        assert_eq!(init.tls_cert, None);
+        assert_eq!(init.tls_key, None);
     }
 
     #[test]
@@ -758,14 +893,276 @@ mod tests {
 
     #[test]
     fn later_flags_answer_the_same_way() {
-        let mut args = required_init();
-        args.extend(["--cf-token", "secret"]);
-        let e = parse_args(&args).unwrap_err();
-        assert!(e.to_string().starts_with("--cf-token arrives in M1"), "{e}");
-
         let e =
             parse_args(&["join", "net.example.com", "7QX4-M2KD", "--export", "qr"]).unwrap_err();
         assert!(e.to_string().starts_with("--export arrives in M1"), "{e}");
+    }
+
+    #[test]
+    fn leaving_the_certificate_out_is_how_acme_is_asked_for() {
+        let asked = init(&[
+            "server",
+            "init",
+            "--domain",
+            "net.example.com",
+            "--acme-email",
+            "jo@example.com",
+            "--acme-staging",
+            "--acme-challenge",
+            "dns-01",
+            "--cf-token",
+            "cf-secret-value",
+        ])
+        .unwrap();
+        assert_eq!(asked.tls_cert, None);
+        assert_eq!(asked.acme_email.as_deref(), Some("jo@example.com"));
+        assert!(asked.acme_staging);
+        assert_eq!(asked.acme_challenge, Some(Challenge::Dns01));
+        assert_eq!(
+            asked.cf_token.map(|t| t.expose().to_string()).as_deref(),
+            Some("cf-secret-value")
+        );
+        assert_eq!(asked.cf_token_file, None);
+
+        // Nothing but the domain: the challenge is left undecided,
+        // because whether there is a token is not argv's to know.
+        let bare = init(&[
+            "server",
+            "init",
+            "--domain",
+            "net.example.com",
+            "--acme-email",
+            "jo@example.com",
+        ])
+        .unwrap();
+        assert_eq!(bare.acme_challenge, None);
+        assert!(!bare.acme_staging);
+        assert_eq!(bare.cf_token, None);
+    }
+
+    #[test]
+    fn the_certificate_flags_come_as_a_pair() {
+        // Half a pair is a person meaning one of two different things,
+        // and neither is safe to pick: with the pair anago serves what
+        // it is given and never renews, without it anago orders one.
+        let e = init(&[
+            "server",
+            "init",
+            "--domain",
+            "net.example.com",
+            "--tls-cert",
+            "/c.pem",
+        ])
+        .unwrap_err();
+        assert_eq!(
+            e,
+            CliError::Plan(PlanError::HalfAPair {
+                given: "--tls-cert",
+                missing: "--tls-key",
+            })
+        );
+        assert!(e.to_string().contains("--tls-key"), "{e}");
+
+        let e = init(&[
+            "server",
+            "init",
+            "--domain",
+            "net.example.com",
+            "--tls-key",
+            "/k.pem",
+        ])
+        .unwrap_err();
+        assert_eq!(
+            e,
+            CliError::Plan(PlanError::HalfAPair {
+                given: "--tls-key",
+                missing: "--tls-cert",
+            })
+        );
+    }
+
+    #[test]
+    fn acme_flags_beside_a_certificate_are_refused_not_ignored() {
+        // The failure this prevents is silent: the pair means anago
+        // never orders anything, so an --acme-* flag that was quietly
+        // dropped leaves a person believing renewal is automatic, and
+        // they find out when the certificate expires.
+        let mut args = required_init();
+        args.extend(["--acme-email", "jo@example.com"]);
+        let e = parse_args(&args).unwrap_err();
+        assert_eq!(
+            e,
+            CliError::Plan(PlanError::AcmeFlagsWithCertificate(vec!["--acme-email"]))
+        );
+        assert!(e.to_string().contains("nothing here would renew"), "{e}");
+
+        // Every one of them is named, so the fix does not have to be
+        // guessed at one flag per attempt.
+        let mut args = required_init();
+        args.extend([
+            "--acme-email",
+            "jo@example.com",
+            "--acme-staging",
+            "--acme-challenge",
+            "http-01",
+        ]);
+        let e = parse_args(&args).unwrap_err();
+        let message = e.to_string();
+        for flag in ["--acme-email", "--acme-staging", "--acme-challenge"] {
+            assert!(message.contains(flag), "{flag} is missing from {message}");
+        }
+
+        // A Cloudflare token is the exception (§8): what it does — the
+        // A record — has nothing to do with where the certificate came
+        // from, and refusing it would tie two unrelated features
+        // together.
+        let mut args = required_init();
+        args.extend(["--cf-token", "cf-secret-value"]);
+        let init = match parse_args(&args).unwrap() {
+            Command::ServerInit(init) => init,
+            other => panic!("{other:?}"),
+        };
+        assert!(init.cf_token.is_some());
+        assert!(init.tls_cert.is_some());
+    }
+
+    #[test]
+    fn ordering_a_certificate_needs_an_address_to_warn() {
+        // Let's Encrypt will make an account without one. The expiry
+        // mail is the only alarm that reaches a person when automatic
+        // renewal has quietly stopped, and "set it up and forget it"
+        // is not worth trading for one flag (§8).
+        let e = init(&["server", "init", "--domain", "net.example.com"]).unwrap_err();
+        assert_eq!(e, CliError::Plan(PlanError::NoContact));
+        assert!(e.to_string().contains("about to expire"), "{e}");
+    }
+
+    #[test]
+    fn the_two_token_flags_are_one_question_asked_twice() {
+        let mut args = required_init();
+        args.extend([
+            "--cf-token",
+            "cf-secret-value",
+            "--cf-token-file",
+            "/root/cf",
+        ]);
+        let e = parse_args(&args).unwrap_err();
+        assert_eq!(e, CliError::Token(CfError::BothFlags));
+        // And it says which one to keep rather than just refusing.
+        assert!(e.to_string().contains("the safer of the two"), "{e}");
+    }
+
+    #[test]
+    fn a_truncated_token_is_caught_where_it_was_typed() {
+        // A token with whitespace in it is a copy-paste that lost its
+        // tail. Sending it produces a 401, which reads as a
+        // permissions problem rather than a typo — so it is refused
+        // here, before anything is generated.
+        let mut args = required_init();
+        args.extend(["--cf-token", "half a token"]);
+        let e = parse_args(&args).unwrap_err();
+        assert_eq!(e, CliError::Token(CfError::Malformed(Source::Flag)));
+        assert!(e.to_string().contains("--cf-token"), "{e}");
+
+        // Empty is the parser's own complaint, and comes first.
+        let mut args = required_init();
+        args.extend(["--cf-token="]);
+        assert_eq!(
+            parse_args(&args),
+            Err(CliError::Arg(ArgError::EmptyValue("cf-token")))
+        );
+    }
+
+    #[test]
+    fn the_challenge_is_spelled_the_way_the_state_file_spells_it() {
+        let mut args = required_init();
+        args.extend(["--acme-challenge", "dns"]);
+        let e = parse_args(&args).unwrap_err();
+        assert_eq!(
+            e,
+            CliError::BadValue {
+                flag: "acme-challenge",
+                message: "\"dns\" is not a challenge — expected http-01 or dns-01".to_string(),
+            }
+        );
+
+        for (text, expected) in [("http-01", Challenge::Http01), ("dns-01", Challenge::Dns01)] {
+            let init = init(&[
+                "server",
+                "init",
+                "--domain",
+                "net.example.com",
+                "--acme-email",
+                "jo@example.com",
+                "--acme-challenge",
+                text,
+                "--cf-token",
+                "cf-secret-value",
+            ])
+            .unwrap();
+            assert_eq!(init.acme_challenge, Some(expected));
+        }
+    }
+
+    #[test]
+    fn dns01_without_a_token_is_left_for_init_to_answer() {
+        // Routing does not read CLOUDFLARE_API_TOKEN — not reading it
+        // is what keeps every rule in this module a unit test — so it
+        // cannot know there is no token. Refusing here would break the
+        // documented third way of passing one; `init` runs the same
+        // check with the environment in hand.
+        let init = init(&[
+            "server",
+            "init",
+            "--domain",
+            "net.example.com",
+            "--acme-email",
+            "jo@example.com",
+            "--acme-challenge",
+            "dns-01",
+        ])
+        .unwrap();
+        assert_eq!(init.acme_challenge, Some(Challenge::Dns01));
+        assert_eq!(init.cf_token, None);
+        assert_eq!(init.cf_token_file, None);
+
+        // With a token flag the same line is settled here, and passes.
+        let mut with_file = vec![
+            "server",
+            "init",
+            "--domain",
+            "net.example.com",
+            "--acme-email",
+            "jo@example.com",
+            "--acme-challenge",
+            "dns-01",
+        ];
+        with_file.extend(["--cf-token-file", "/root/cf-token"]);
+        assert!(parse_args(&with_file).is_ok());
+    }
+
+    #[test]
+    fn a_token_never_prints_itself() {
+        // §13: `Debug` on a command is the sort of thing that ends up
+        // in a log, and argv being visible to `ps` already is no
+        // reason for anago to repeat it.
+        let mut args = required_init();
+        args.extend(["--cf-token", "cf-secret-value"]);
+        let printed = format!("{:?}", parse_args(&args).unwrap());
+        assert!(!printed.contains("cf-secret-value"), "{printed}");
+        assert!(printed.contains("redacted"), "{printed}");
+    }
+
+    #[test]
+    fn a_bad_combination_is_a_usage_error() {
+        // Exit 2 is "did not understand"; 1 is "understood, cannot do
+        // it". Flags that contradict each other are the former, and a
+        // script can tell them apart.
+        let e = init(&["server", "init", "--domain", "net.example.com"]).unwrap_err();
+        assert_eq!(exit_code(&e), 2);
+        let mut args = required_init();
+        args.extend(["--cf-token", "a", "--cf-token-file", "/b"]);
+        assert_eq!(exit_code(&parse_args(&args).unwrap_err()), 2);
     }
 
     #[test]
@@ -907,6 +1304,45 @@ mod tests {
         // An unknown topic falls back to the overview rather than
         // printing nothing.
         assert_eq!(help(Some("nope")), general);
+    }
+
+    #[test]
+    fn the_help_for_server_init_names_every_flag_it_accepts() {
+        // Help that has drifted from the parser is worse than none:
+        // the flag a person copies out of it fails as unknown. This
+        // pins the two together.
+        let text = help(Some("init"));
+        for flag in [
+            "--domain",
+            "--tls-cert",
+            "--tls-key",
+            "--acme-email",
+            "--acme-staging",
+            "--acme-challenge",
+            "--cf-token",
+            "--cf-token-file",
+            "--subnet",
+            "--port",
+            "--api-port",
+            "--no-systemd",
+        ] {
+            assert!(text.contains(flag), "the help for server init omits {flag}");
+            // And every one of them parses, so the help is not
+            // advertising something the parser would refuse.
+            let e = parse_args(&["server", "init", flag]);
+            assert_ne!(
+                e,
+                Err(CliError::Arg(ArgError::Unknown(flag.to_string()))),
+                "{flag} is in the help but not in the spec"
+            );
+        }
+
+        // The two things a person has to be told rather than discover:
+        // staging certificates are not trusted, and a token in argv is
+        // visible to other users.
+        assert!(text.contains("Nothing trusts"), "{text}");
+        assert!(text.contains("`ps`"), "{text}");
+        assert!(text.contains(cfapi::TOKEN_ENV), "{text}");
     }
 
     #[test]

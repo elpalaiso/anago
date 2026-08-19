@@ -1285,7 +1285,7 @@ pub fn fallback_notice(error: &CfError) -> String {
 }
 
 /// What can go wrong before anago has a usable token.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CfError {
     /// `--cf-token` and `--cf-token-file` together.
     BothFlags,

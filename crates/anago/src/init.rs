@@ -17,6 +17,8 @@ use anago_core::code::{IssuedCode, JoinCode, DEFAULT_TTL_SECS};
 use anago_core::state::{PrivateKey, ServerKeys, ServerState, Tls};
 use anago_core::wgconf;
 
+use crate::acme;
+use crate::cfapi;
 use crate::cli::ServerInit;
 use crate::fsutil;
 use crate::paths::{self, ServerPaths};
@@ -28,6 +30,7 @@ use crate::wg::{self, WgError};
 /// come from the caller.
 pub fn build_state(
     args: &ServerInit,
+    certificate: &Certificate,
     keys: (PrivateKey, String),
     code: JoinCode,
     now: i64,
@@ -38,7 +41,7 @@ pub fn build_state(
         subnet: args.subnet,
         listen_port: args.listen_port,
         api_port: args.api_port,
-        tls: Tls::manual(args.tls_cert.clone(), args.tls_key.clone()),
+        tls: Tls::manual(certificate.cert.clone(), certificate.key.clone()),
         cloudflare: None,
         server: ServerKeys {
             private_key,
@@ -157,6 +160,49 @@ pub struct Initialized {
     pub warnings: Vec<String>,
 }
 
+/// The certificate files this hub will serve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Certificate {
+    pub cert: String,
+    pub key: String,
+}
+
+/// Settles which TLS path `server init` takes (§8).
+///
+/// The environment is a parameter rather than something read here, so
+/// the precedence between the three ways a Cloudflare token arrives is
+/// a unit test — and the rules themselves belong to [`cfapi::choose`]
+/// and [`acme::plan`], which own them. `cli` already ran the same two
+/// checks over argv alone; this is the run that can also see
+/// `CLOUDFLARE_API_TOKEN`, and so the one that decides.
+pub fn certificate_plan(args: &ServerInit, env: Option<&str>) -> Result<Certificate, InitError> {
+    let token = cfapi::choose(
+        args.cf_token_file.as_deref(),
+        args.cf_token.as_ref().map(cfapi::Token::expose),
+        env,
+    )
+    .map_err(InitError::Cloudflare)?;
+
+    let plan = acme::plan(&acme::Request {
+        tls_cert: args.tls_cert.as_deref(),
+        tls_key: args.tls_key.as_deref(),
+        acme_email: args.acme_email.as_deref(),
+        staging: args.acme_staging,
+        challenge: args.acme_challenge,
+        token: token.as_ref(),
+    })
+    .map_err(InitError::Plan)?;
+
+    match plan {
+        acme::Plan::Manual { cert, key } => Ok(Certificate { cert, key }),
+        // Routing accepts these flags and the plan above is the real
+        // decision; what is missing is the rest of this command —
+        // ordering the certificate, writing the A record, and saying
+        // what happened. Refusing plainly beats half-doing it.
+        acme::Plan::Acme { .. } => Err(InitError::AcmeNotAssembled),
+    }
+}
+
 /// Runs the command: check, validate, generate, publish, explain.
 ///
 /// The order is the point. Everything that can refuse — an existing
@@ -175,11 +221,15 @@ pub fn run(
 ) -> Result<Initialized, InitError> {
     check_not_initialized(root, wg_dir)?;
 
-    // Before anything permanent: M0 serves with a certificate the
-    // operator already has, so a bad path or a mismatched pair is a
-    // refusal, not something to discover at first start — by which
-    // time a half-made hub would block the retry.
-    let loaded = crate::tls::load(Path::new(&args.tls_cert), Path::new(&args.tls_key))
+    // The full verdict on the flags, environment included — routing
+    // settled everything argv could settle on its own (§8).
+    let certificate = certificate_plan(args, std::env::var(cfapi::TOKEN_ENV).ok().as_deref())?;
+
+    // Before anything permanent: a hub that serves a certificate the
+    // operator already has must fail on a bad path or a mismatched
+    // pair now, not at first start — by which time a half-made hub
+    // would block the retry.
+    let loaded = crate::tls::load(Path::new(&certificate.cert), Path::new(&certificate.key))
         .map_err(InitError::Tls)?;
 
     wg::check_tools_from_env().map_err(InitError::Wg)?;
@@ -189,7 +239,7 @@ pub fn run(
         kind: e.kind(),
         source: e.to_string(),
     })?;
-    let state = build_state(args, keys, code, now);
+    let state = build_state(args, &certificate, keys, code, now);
 
     publish_once(&state, root, wg_dir)?;
 
@@ -201,8 +251,8 @@ pub fn run(
             &std::env::current_exe().unwrap_or_else(|_| PathBuf::from("anago")),
             root,
             wg_dir,
-            Path::new(&args.tls_cert),
-            Path::new(&args.tls_key),
+            Path::new(&certificate.cert),
+            Path::new(&certificate.key),
             Path::new(systemd::UNIT_DIR),
         ) {
             Ok(path) => systemd_note(&path),
@@ -362,6 +412,13 @@ pub enum InitError {
     ConfigExists(String),
     /// The certificate and key could not be loaded.
     Tls(crate::tls::TlsError),
+    /// The flags do not describe a hub anago can set up.
+    Plan(acme::PlanError),
+    /// The Cloudflare token could not be settled on.
+    Cloudflare(cfapi::CfError),
+    /// The flags asked anago to order a certificate, which this
+    /// command cannot do yet.
+    AcmeNotAssembled,
     /// The WireGuard tools are missing, or one of them failed.
     Wg(WgError),
     Io {
@@ -386,6 +443,13 @@ impl fmt::Display for InitError {
                  config it did not write. Move it aside first"
             ),
             InitError::Tls(e) => write!(f, "{e}"),
+            InitError::Plan(e) => write!(f, "{e}"),
+            InitError::Cloudflare(e) => write!(f, "{e}"),
+            InitError::AcmeNotAssembled => f.write_str(
+                "ordering a certificate is not wired into `server init` yet — pass \
+                 --tls-cert and --tls-key to set the hub up with a certificate you \
+                 already have",
+            ),
             InitError::Wg(e) => write!(f, "{e}"),
             InitError::Io { what, kind, source } => f.write_str(&crate::diagnostics::with_advice(
                 format!("could not {what}: {source}"),
@@ -401,6 +465,7 @@ impl std::error::Error for InitError {}
 mod tests {
     use super::*;
     use crate::store::Store;
+    use anago_core::state::Challenge;
     use anago_core::subnet::Subnet;
 
     const NOW: i64 = 1_755_500_000;
@@ -408,12 +473,24 @@ mod tests {
     fn args() -> ServerInit {
         ServerInit {
             domain: "net.example.com".to_string(),
-            tls_cert: "/etc/ssl/anago/fullchain.pem".to_string(),
-            tls_key: "/etc/ssl/anago/privkey.pem".to_string(),
+            tls_cert: Some("/etc/ssl/anago/fullchain.pem".to_string()),
+            tls_key: Some("/etc/ssl/anago/privkey.pem".to_string()),
+            acme_email: None,
+            acme_staging: false,
+            acme_challenge: None,
+            cf_token: None,
+            cf_token_file: None,
             subnet: Subnet::parse("10.100.0.0/24").unwrap(),
             listen_port: 51820,
             api_port: 443,
             systemd: true,
+        }
+    }
+
+    fn certificate() -> Certificate {
+        Certificate {
+            cert: "/etc/ssl/anago/fullchain.pem".to_string(),
+            key: "/etc/ssl/anago/privkey.pem".to_string(),
         }
     }
 
@@ -425,7 +502,95 @@ mod tests {
     }
 
     fn state_from(args: &ServerInit) -> ServerState {
-        build_state(args, keys(), JoinCode::parse("7QX4-M2KD").unwrap(), NOW)
+        build_state(
+            args,
+            &certificate(),
+            keys(),
+            JoinCode::parse("7QX4-M2KD").unwrap(),
+            NOW,
+        )
+    }
+
+    /// `server init` with no certificate pair — the ACME fork.
+    fn ordering() -> ServerInit {
+        ServerInit {
+            tls_cert: None,
+            tls_key: None,
+            acme_email: Some("jo@example.com".to_string()),
+            ..args()
+        }
+    }
+
+    #[test]
+    fn the_certificate_pair_is_taken_as_given() {
+        // The M0 path, unchanged: both flags, and the files named are
+        // the files the hub will serve.
+        assert_eq!(
+            certificate_plan(&args(), None).unwrap(),
+            Certificate {
+                cert: "/etc/ssl/anago/fullchain.pem".to_string(),
+                key: "/etc/ssl/anago/privkey.pem".to_string(),
+            }
+        );
+        // And an environment token does not change that — what it is
+        // for is the A record, not the certificate (§8).
+        assert!(certificate_plan(&args(), Some("cf-secret-value")).is_ok());
+    }
+
+    #[test]
+    fn a_token_in_the_environment_answers_what_routing_could_not() {
+        // `cli` lets `--acme-challenge dns-01` through with no token
+        // flag, because CLOUDFLARE_API_TOKEN is a documented third way
+        // in and routing does not read the environment. This is where
+        // that verdict is actually reached.
+        let asked = ServerInit {
+            acme_challenge: Some(Challenge::Dns01),
+            ..ordering()
+        };
+        assert_eq!(
+            certificate_plan(&asked, None),
+            Err(InitError::Plan(acme::PlanError::Dns01WithoutToken))
+        );
+        assert!(certificate_plan(&asked, None)
+            .unwrap_err()
+            .to_string()
+            .contains("needs a Cloudflare token"));
+
+        // With the variable set, the same command line is a plan — and
+        // an empty variable is how a shell spells "unset", so it is
+        // not one.
+        assert_eq!(
+            certificate_plan(&asked, Some("cf-secret-value")),
+            Err(InitError::AcmeNotAssembled)
+        );
+        assert_eq!(
+            certificate_plan(&asked, Some("   ")),
+            Err(InitError::Plan(acme::PlanError::Dns01WithoutToken))
+        );
+    }
+
+    #[test]
+    fn ordering_a_certificate_is_refused_plainly_until_it_is_wired() {
+        // Routing accepts the flags and the decision above is real;
+        // what is missing is the rest of the command. Saying so beats
+        // half-doing it, and the message says what works today.
+        let e = certificate_plan(&ordering(), None).unwrap_err();
+        assert_eq!(e, InitError::AcmeNotAssembled);
+        assert!(e.to_string().contains("--tls-cert"), "{e}");
+        assert!(e.to_string().contains("not wired"), "{e}");
+    }
+
+    #[test]
+    fn the_two_token_flags_are_settled_before_anything_is_written() {
+        let both = ServerInit {
+            cf_token: Some(cfapi::Token::parse("cf-secret-value", cfapi::Source::Flag).unwrap()),
+            cf_token_file: Some("/root/cf-token".to_string()),
+            ..args()
+        };
+        assert_eq!(
+            certificate_plan(&both, None),
+            Err(InitError::Cloudflare(cfapi::CfError::BothFlags))
+        );
     }
 
     #[test]
