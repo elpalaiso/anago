@@ -72,6 +72,7 @@ fn main() {
         Command::ServerInit(args) => server_init(&args),
         Command::ServerRenew(args) => server_renew(&args),
         Command::ServerRun => server_run(),
+        Command::Sync(args) => sync_device(&args),
         Command::Code => match code::run(std::path::Path::new(paths::DEFAULT_SERVER_ROOT), now()) {
             Ok(text) => print!("{text}"),
             Err(e) => {
@@ -144,6 +145,26 @@ fn server_run() -> ! {
             std::process::exit(EXIT_FAILED);
         }
     }
+}
+
+/// `anago sync` — on a device, pull the peer list.
+///
+/// Routing is complete; what the command then *does* — the API call,
+/// the wg reconfigure, installing the timer — lands in the slice after
+/// this one. Saying so beats accepting the command and doing nothing.
+fn sync_device(args: &cli::Sync) -> ! {
+    let asked = match args.timer {
+        Some(cli::Timer::Install { interval }) => {
+            format!("install a timer every {}s", interval.as_secs())
+        }
+        Some(cli::Timer::Uninstall) => "remove the timer".to_string(),
+        None => "sync now".to_string(),
+    };
+    eprintln!("anago: `anago sync` is not wired up yet — the flags are understood ({asked}),");
+    eprintln!("       but the run itself lands next. Nothing is unreachable meanwhile: the");
+    eprintln!("       hub knows every peer, and syncing is how this device hears about the");
+    eprintln!("       others (§6.3).");
+    std::process::exit(EXIT_FAILED);
 }
 
 /// `anago join <domain> <code>`.

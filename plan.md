@@ -64,7 +64,7 @@ M0의 수동 경로는 **그대로 남긴다** — `--tls-cert/--tls-key`로 기
 
 ## F. sync 와 주기 실행(timer / launchd)
 
-- [ ] `cli.rs`: `anago sync` 라우팅 추가(M0의 "M1에서 들어옴" 안내 제거) + 플래그 파싱 + 유닛 테스트
+- [x] `cli.rs`: `anago sync` 라우팅 추가(M0의 "M1에서 들어옴" 안내 제거) + 플래그 파싱 + 유닛 테스트
 - [ ] `sync.rs`(bin): 본체 — device.json 로드 → `/api/v1/peers` 호출 → 코어 판정 → 필요할 때만 wg 설정 재작성 + `wg syncconf` 적용. 변경 없으면 조용히 종료
 - [ ] `sync.rs`(bin): 실패 처리 — 401(제거된 기기)일 때의 정리 안내, 네트워크 실패 시 타이머가 스팸하지 않도록 하는 종료 코드·로그 규약, 동시 실행 방지 잠금 + 유닛 테스트
 - [ ] `systemd.rs`: `anago-sync.service` + `anago-sync.timer` 텍스트 생성 순수 함수(기본 주기, 사용자 단위 여부, 샌드박스 설정) + 유닛 테스트

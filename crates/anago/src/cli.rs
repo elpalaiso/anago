@@ -10,6 +10,9 @@
 //! `anago sync` deserves "M1, and here is why you do not need it yet"
 //! rather than "unknown command".
 
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
 use anago_core::code::JoinCode;
 use anago_core::name::DeviceName;
 use anago_core::state::Challenge;
@@ -35,6 +38,9 @@ pub enum Command {
     /// The resident process (§8). systemd runs this; a person only
     /// types it after `server init --no-systemd`.
     ServerRun,
+    /// `anago sync` (§8): on a device, pull the peer list — or install
+    /// the timer that does.
+    Sync(Sync),
     Code,
     Join(Join),
     Ls,
@@ -108,6 +114,44 @@ pub enum Ca {
     Production,
 }
 
+/// `anago sync` (§8, §6.3).
+///
+/// Three shapes in one command: sync now, install the timer that syncs,
+/// or take that timer away. `timer` is what tells them apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sync {
+    /// `--quiet` — for the timer, which is why it is on the unit's
+    /// command line rather than sniffed from a tty (§8). Reading a
+    /// unit file should say why it is quiet.
+    pub quiet: bool,
+    /// `--config <path>`, the escape hatch from §9's XDG/`SUDO_UID`
+    /// rules — and the reason a timer can exist at all, since a unit
+    /// runs as root outside any user session.
+    pub config: Option<PathBuf>,
+    pub timer: Option<Timer>,
+}
+
+/// What to do about periodic runs (§8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Timer {
+    Install { interval: Duration },
+    Uninstall,
+}
+
+/// The default period (§6.3): most changes ask nothing of a client,
+/// and a removed device stops being routed the moment the hub drops the
+/// peer — so a late sync is late *news*, not late traffic.
+pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// Below this a timer costs more than it delivers and hammers the hub's
+/// API for nothing.
+pub const MIN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Above this the timer stops being a timer. A device that syncs once a
+/// day is one whose peer list is a day stale, and §6.3's promise is
+/// that the list is roughly current.
+pub const MAX_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// `anago join <domain> <code>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Join {
@@ -140,11 +184,7 @@ pub fn parse(argv: &[String]) -> Result<Command, CliError> {
         "ls" => no_args("ls", rest),
         "rm" => rm(rest),
         "help" => Ok(Command::Help(rest.first().cloned())),
-        "sync" => Err(CliError::NotYet {
-            what: "anago sync",
-            milestone: "M1",
-            because: "the hub already knows every peer, so M0 devices stay reachable without it",
-        }),
+        "sync" => sync(rest),
         "ping" => Err(CliError::NotYet {
             what: "anago ping",
             milestone: "M3",
@@ -452,6 +492,138 @@ fn join(argv: &[String]) -> Result<Command, CliError> {
     }))
 }
 
+fn sync(argv: &[String]) -> Result<Command, CliError> {
+    let spec = [
+        Flag::boolean("quiet"),
+        Flag::value("config"),
+        Flag::boolean("install-timer"),
+        Flag::boolean("uninstall-timer"),
+        Flag::value("interval"),
+    ];
+    let parsed = ParsedArgs::parse(argv, &spec)?;
+    reject_extra_positionals(&parsed, "sync")?;
+
+    let timer = match (
+        parsed.is_set("install-timer"),
+        parsed.is_set("uninstall-timer"),
+    ) {
+        (true, true) => {
+            return Err(CliError::Contradiction(
+                "--install-timer",
+                "--uninstall-timer",
+            ))
+        }
+        (true, false) => Some(Timer::Install {
+            interval: interval(&parsed)?,
+        }),
+        (false, true) => Some(Timer::Uninstall),
+        (false, false) => None,
+    };
+
+    // `--interval` belongs to installing a timer and to nothing else.
+    // Beside a run it looks like it changed a schedule and changed
+    // nothing; beside `--uninstall-timer` it is a period for a timer
+    // that is about to stop existing (§8).
+    if parsed.is_set("interval") && !matches!(timer, Some(Timer::Install { .. })) {
+        return Err(CliError::Orphan {
+            flag: "--interval",
+            needs: "--install-timer",
+        });
+    }
+
+    // The two flags that belong to a run, not to managing the timer.
+    // A quiet install would swallow the lines that say how to check
+    // the timer, which are the point of installing one.
+    if timer.is_some() && parsed.is_set("quiet") {
+        return Err(CliError::Orphan {
+            flag: "--quiet",
+            needs: "a sync run — the installed timer is quiet already",
+        });
+    }
+    if timer == Some(Timer::Uninstall) && parsed.is_set("config") {
+        return Err(CliError::Orphan {
+            flag: "--config",
+            needs: "a sync run or --install-timer — removing the timer reads no device file",
+        });
+    }
+
+    Ok(Command::Sync(Sync {
+        quiet: parsed.is_set("quiet"),
+        config: config(&parsed)?,
+        timer,
+    }))
+}
+
+/// `--config <path>`, which has to be absolute.
+///
+/// A relative path is resolved against the working directory, and the
+/// whole reason this flag exists is that a timer unit has no working
+/// directory a person would recognise — it runs as root, outside the
+/// session, from `/`. Baking `device.json` into a unit is only useful
+/// if it names the file from the root down (§8).
+fn config(parsed: &ParsedArgs) -> Result<Option<PathBuf>, CliError> {
+    let Some(text) = parsed.value("config") else {
+        return Ok(None);
+    };
+    let path = Path::new(text);
+    if !path.is_absolute() {
+        return Err(CliError::BadValue {
+            flag: "config",
+            message: format!(
+                "{text:?} is a relative path — give the full path from /, because the \
+                 timer that reads it runs from somewhere else entirely"
+            ),
+        });
+    }
+    Ok(Some(path.to_path_buf()))
+}
+
+/// `--interval 5m`.
+///
+/// A unit is required. A bare number would have to mean seconds by
+/// convention, and `--interval 5` meaning five *seconds* on a command
+/// whose default is five minutes is a mistake nobody would catch until
+/// the hub's API was being polled twelve times a minute.
+fn interval(parsed: &ParsedArgs) -> Result<Duration, CliError> {
+    let Some(text) = parsed.value("interval") else {
+        return Ok(DEFAULT_INTERVAL);
+    };
+    let bad = |message: String| CliError::BadValue {
+        flag: "interval",
+        message,
+    };
+
+    // `strip_suffix` takes a character, so a value that is not ASCII
+    // — `5분`, say — falls out here as "no unit" rather than splitting
+    // a byte index inside a character and panicking.
+    let Some((digits, seconds)) = [("s", 1), ("m", 60), ("h", 60 * 60)]
+        .into_iter()
+        .find_map(|(unit, seconds)| text.strip_suffix(unit).map(|digits| (digits, seconds)))
+    else {
+        return Err(bad(format!(
+            "{text:?} has no unit — write it as 90s, 5m or 1h"
+        )));
+    };
+    let count: u64 = digits
+        .parse()
+        .map_err(|_| bad(format!("{text:?} is not a length of time — try 5m")))?;
+    let interval = Duration::from_secs(count.saturating_mul(seconds));
+
+    if interval < MIN_INTERVAL {
+        return Err(bad(format!(
+            "{text:?} is shorter than a minute. Most changes ask nothing of a device, \
+             so syncing that often only polls the hub"
+        )));
+    }
+    if interval > MAX_INTERVAL {
+        return Err(bad(format!(
+            "{text:?} is longer than a day, which is not a timer any more — the peer \
+             list would be a day stale"
+        )));
+    }
+    Ok(interval)
+}
+
 fn rm(argv: &[String]) -> Result<Command, CliError> {
     let parsed = ParsedArgs::parse(argv, &[])?;
     let name = match parsed.positionals() {
@@ -553,6 +725,11 @@ pub enum CliError {
     },
     /// Two flags that cannot both be meant.
     Contradiction(&'static str, &'static str),
+    /// A flag that only means something beside another one.
+    Orphan {
+        flag: &'static str,
+        needs: &'static str,
+    },
     /// Flags that do not together describe a hub anago can set up
     /// ([`acme::plan`]).
     Plan(PlanError),
@@ -593,6 +770,9 @@ impl fmt::Display for CliError {
                 f,
                 "{one} and {other} cannot both be given; pass one and run it again"
             ),
+            CliError::Orphan { flag, needs } => {
+                write!(f, "{flag} only means something with {needs}")
+            }
             CliError::Plan(e) => write!(f, "{e}"),
             CliError::Token(e) => write!(f, "{e}"),
             CliError::BadArgument { what, message } => write!(f, "{what}: {message}"),
@@ -698,6 +878,33 @@ Join codes are single use and expire; ask the server for another with
 ",
             code = "XXXX-XXXX"
         ),
+        Some("sync") => format!(
+            "\
+usage: anago sync [--quiet] [--config <path>]
+       anago sync --install-timer [--interval {default}] [--config <path>]
+       anago sync --uninstall-timer
+
+Run on a device, as root. Asks the hub for the peer list and rewrites
+the WireGuard config only if something changed.
+
+Nothing here is needed to reach the hub — it already knows every
+device. Syncing is how *this* device hears about the others.
+
+--config gives the full path to device.json, from / down. Without it
+anago works the path out the way `ls` and `rm` do, which needs your
+user session; a timer has none, so the installed unit carries the path
+on its command line. --quiet goes on that command line too, so opening
+the unit file says why it is silent.
+
+--install-timer writes the unit and starts it: a systemd timer on
+Linux, a LaunchDaemon on macOS. Where neither exists, it prints a cron
+line instead of pretending. --interval takes 90s, 5m or 1h — between
+{min} and {max}.
+",
+            default = "5m",
+            min = "1m",
+            max = "24h"
+        ),
         Some("code") => "\
 usage: anago code
 
@@ -729,14 +936,15 @@ usage:
   anago server run                  run the hub (systemd does this for you)
   anago code                        issue a join code (on the server)
   anago join <domain> <code>        register this device
+  anago sync                        pull the peer list (on a device)
   anago ls                          list devices
   anago rm <name>                   remove a device
 
   -h, --help                        show this, or `anago help <command>`
   -V, --version                     show the version
 
-Later milestones: `anago sync` and `--export qr|conf` (M1),
-`anago ping` and `anago server status` (M3).
+Later milestones: `--export qr|conf` (M1), `anago ping` and
+`anago server status` (M3).
 "
         ),
     }
@@ -1016,7 +1224,6 @@ mod tests {
     #[test]
     fn later_milestones_answer_with_their_milestone() {
         for (args, what, milestone) in [
-            (vec!["sync"], "anago sync", "M1"),
             (vec!["ping", "macbook"], "anago ping", "M3"),
             (vec!["server", "status"], "anago server status", "M3"),
         ] {
@@ -1478,6 +1685,231 @@ mod tests {
         assert!(text.contains("no tunnel drops"), "{text}");
     }
 
+    fn sync(args: &[&str]) -> Result<Sync, CliError> {
+        let mut argv = vec!["sync"];
+        argv.extend_from_slice(args);
+        match parse_args(&argv)? {
+            Command::Sync(sync) => Ok(sync),
+            other => panic!("expected sync, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_is_a_command_now_and_not_a_promise() {
+        // M0 answered `anago sync` with "arrives in M1". It has.
+        let asked = sync(&[]).unwrap();
+        assert!(!asked.quiet);
+        assert_eq!(asked.config, None);
+        assert_eq!(asked.timer, None);
+    }
+
+    #[test]
+    fn the_timer_form_is_the_one_the_unit_file_carries() {
+        // §8 fixes the installed command line as
+        // `anago sync --quiet --config <absolute path>`, so both have
+        // to parse exactly as the unit writes them.
+        let asked = sync(&["--quiet", "--config", "/home/jo/.config/anago/device.json"]).unwrap();
+        assert!(asked.quiet);
+        assert_eq!(
+            asked.config,
+            Some(PathBuf::from("/home/jo/.config/anago/device.json"))
+        );
+        assert_eq!(asked.timer, None);
+    }
+
+    #[test]
+    fn a_relative_config_path_is_refused() {
+        // The flag exists because a timer has no working directory a
+        // person would recognise: it runs as root, outside the
+        // session, from `/`. A relative path in a unit file is the
+        // failure this flag was added to avoid.
+        for path in ["device.json", "./device.json", "../anago/device.json"] {
+            let e = sync(&["--config", path]).unwrap_err();
+            assert!(
+                matches!(e, CliError::BadValue { flag: "config", .. }),
+                "{path}: {e:?}"
+            );
+            assert!(e.to_string().contains("full path from /"), "{e}");
+        }
+        assert!(sync(&["--config", "/root/device.json"]).is_ok());
+    }
+
+    #[test]
+    fn installing_and_uninstalling_are_not_both_meant() {
+        assert_eq!(
+            sync(&["--install-timer"]).unwrap().timer,
+            Some(Timer::Install {
+                interval: DEFAULT_INTERVAL
+            })
+        );
+        assert_eq!(
+            sync(&["--uninstall-timer"]).unwrap().timer,
+            Some(Timer::Uninstall)
+        );
+        assert_eq!(
+            sync(&["--install-timer", "--uninstall-timer"]),
+            Err(CliError::Contradiction(
+                "--install-timer",
+                "--uninstall-timer"
+            ))
+        );
+    }
+
+    #[test]
+    fn the_interval_needs_a_unit_and_stays_in_range() {
+        let interval =
+            |text: &str| sync(&["--install-timer", "--interval", text]).map(|asked| asked.timer);
+        let every = |seconds| {
+            Some(Timer::Install {
+                interval: Duration::from_secs(seconds),
+            })
+        };
+        assert_eq!(interval("90s").unwrap(), every(90));
+        assert_eq!(interval("5m").unwrap(), every(5 * 60));
+        assert_eq!(interval("1h").unwrap(), every(60 * 60));
+        // And left out, the default §6.3 argues for.
+        assert_eq!(
+            sync(&["--install-timer"]).unwrap().timer,
+            every(DEFAULT_INTERVAL.as_secs())
+        );
+
+        // A bare number would have to mean seconds by convention, and
+        // `--interval 5` meaning five *seconds* on a command whose
+        // default is five minutes is a mistake nobody catches until
+        // the hub is being polled twelve times a minute.
+        let e = interval("5").unwrap_err();
+        assert!(e.to_string().contains("no unit"), "{e}");
+        assert!(e.to_string().contains("5m"), "{e}");
+        assert!(interval("5min")
+            .unwrap_err()
+            .to_string()
+            .contains("no unit"));
+
+        // Regression: the unit used to be taken off by byte, so a
+        // value whose last character is not ASCII split inside that
+        // character and panicked the process instead of returning an
+        // error a person can read.
+        for text in ["5분", "5초", "５m", "5м", "5\u{301}"] {
+            let e = interval(text).unwrap_err();
+            assert!(
+                matches!(
+                    e,
+                    CliError::BadValue {
+                        flag: "interval",
+                        ..
+                    }
+                ),
+                "{text:?}: {e:?}"
+            );
+            // A usage error, which is what exit 2 means — not a crash.
+            assert_eq!(exit_code(&e), 2, "{text:?}");
+        }
+        assert!(interval("mm")
+            .unwrap_err()
+            .to_string()
+            .contains("not a length of time"));
+
+        // The floor: below a minute the timer only polls (§6.3).
+        assert!(interval("0m").is_err());
+        assert!(interval("59s")
+            .unwrap_err()
+            .to_string()
+            .contains("shorter than a minute"));
+        assert!(interval("1m").is_ok());
+        // And the ceiling, past which it is not a timer any more.
+        assert!(interval("24h").is_ok());
+        assert!(interval("25h")
+            .unwrap_err()
+            .to_string()
+            .contains("longer than a day"));
+    }
+
+    #[test]
+    fn a_flag_that_would_be_ignored_is_refused_instead() {
+        // The failure this prevents is silent: a flag accepted and
+        // dropped looks exactly like a flag that worked.
+        //
+        // `--interval` alone changes no schedule, because there is no
+        // timer to change (§8).
+        let e = sync(&["--interval", "5m"]).unwrap_err();
+        assert_eq!(
+            e,
+            CliError::Orphan {
+                flag: "--interval",
+                needs: "--install-timer"
+            }
+        );
+        assert!(e.to_string().contains("only means something with"), "{e}");
+
+        // `--quiet` belongs to a run. A quiet install would swallow
+        // the lines that say how to check the timer, which are why
+        // installing prints anything at all.
+        for timer in ["--install-timer", "--uninstall-timer"] {
+            assert!(
+                matches!(
+                    sync(&[timer, "--quiet"]),
+                    Err(CliError::Orphan {
+                        flag: "--quiet",
+                        ..
+                    })
+                ),
+                "{timer}"
+            );
+        }
+
+        // And removing the timer reads no device file.
+        assert!(matches!(
+            sync(&["--uninstall-timer", "--config", "/root/device.json"]),
+            Err(CliError::Orphan {
+                flag: "--config",
+                ..
+            })
+        ));
+        // Installing one does — that is the path it bakes in.
+        assert!(sync(&["--install-timer", "--config", "/root/device.json"]).is_ok());
+    }
+
+    #[test]
+    fn sync_refuses_what_it_does_not_take() {
+        assert_eq!(
+            parse_args(&["sync", "--domain", "net.example.com"]),
+            Err(CliError::Arg(ArgError::Unknown("--domain".to_string())))
+        );
+        assert_eq!(
+            parse_args(&["sync", "macbook"]),
+            Err(CliError::TooManyArguments("sync"))
+        );
+        assert_eq!(
+            parse_args(&["sync", "--config"]),
+            Err(CliError::Arg(ArgError::MissingValue("config")))
+        );
+    }
+
+    #[test]
+    fn the_help_for_sync_names_every_flag_it_accepts() {
+        let text = help(Some("sync"));
+        for flag in [
+            "--quiet",
+            "--config",
+            "--install-timer",
+            "--uninstall-timer",
+            "--interval",
+        ] {
+            assert!(text.contains(flag), "the help for sync omits {flag}");
+            assert_ne!(
+                parse_args(&["sync", flag]),
+                Err(CliError::Arg(ArgError::Unknown(flag.to_string()))),
+                "{flag} is in the help but not in the spec"
+            );
+        }
+        // The two things a person has to be told rather than discover:
+        // syncing is not what makes the hub reachable, and the path
+        // has to be absolute because a timer has no session.
+        assert!(text.contains("already knows every"), "{text}");
+        assert!(text.contains("full path to device.json"), "{text}");
+        assert!(text.contains("cron"), "{text}");
+    }
+
     #[test]
     fn unknown_commands_are_named_not_guessed() {
         assert_eq!(
@@ -1584,15 +2016,20 @@ mod tests {
 
     #[test]
     fn recognized_but_unbuilt_commands_are_not_usage_errors() {
-        // `anago sync` was understood and refused on purpose; a typo
+        // `anago ping` was understood and refused on purpose; a typo
         // was not understood at all.
-        assert_eq!(exit_code(&parse_args(&["sync"]).unwrap_err()), 1);
         assert_eq!(exit_code(&parse_args(&["ping", "macbook"]).unwrap_err()), 1);
         assert_eq!(
             exit_code(&parse_args(&["server", "status"]).unwrap_err()),
             1
         );
         assert_eq!(exit_code(&parse_args(&["snyc"]).unwrap_err()), 2);
+        // And a flag `sync` does take, given wrongly, is a usage error
+        // like any other.
+        assert_eq!(
+            exit_code(&parse_args(&["sync", "--interval", "5m"]).unwrap_err()),
+            2
+        );
         assert_eq!(exit_code(&parse_args(&["rm"]).unwrap_err()), 2);
         assert_eq!(
             exit_code(&parse_args(&["rm", "--force", "x"]).unwrap_err()),
@@ -1603,14 +2040,22 @@ mod tests {
     #[test]
     fn help_text_covers_every_m0_command() {
         let general = help(None);
-        for command in ["server init", "server renew", "code", "join", "ls", "rm"] {
+        for command in [
+            "server init",
+            "server renew",
+            "sync",
+            "code",
+            "join",
+            "ls",
+            "rm",
+        ] {
             assert!(general.contains(command), "general help omits {command}");
         }
         // And says where the rest went.
         assert!(general.contains("M1"), "{general}");
         assert!(general.contains("M3"), "{general}");
 
-        for topic in ["server", "renew", "join", "code", "ls", "rm"] {
+        for topic in ["server", "renew", "sync", "join", "code", "ls", "rm"] {
             let text = help(Some(topic));
             assert!(text.starts_with("usage: anago "), "{topic}: {text}");
         }
