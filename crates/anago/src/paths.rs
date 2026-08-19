@@ -54,6 +54,18 @@ impl ServerPaths {
         self.root.join("tls")
     }
 
+    /// The certificate anago issued (§9).
+    #[allow(dead_code)]
+    pub fn certificate(&self) -> PathBuf {
+        self.tls_dir().join("fullchain.pem")
+    }
+
+    /// Its private key.
+    #[allow(dead_code)]
+    pub fn private_key(&self) -> PathBuf {
+        self.tls_dir().join("privkey.pem")
+    }
+
     /// The ACME account credentials — the account key, and the URL that
     /// key is known to the CA by (§9.1).
     #[allow(dead_code)]

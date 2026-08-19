@@ -71,6 +71,133 @@ pub fn write_private_owned(
     }
 }
 
+/// Publishes two files that have to agree with each other, 0600.
+///
+/// A certificate and its key are one thing in two files: either half on
+/// its own is a hub that will not start. Writing them with two separate
+/// [`write_private`] calls means an ordinary failure on the second —
+/// a full disk, a bad path — leaves the first already replaced and the
+/// pair mismatched, and the error tells the caller nothing was done.
+///
+/// So nothing is published until everything is ready to be:
+///
+/// 1. both new files are written to temp siblings and made durable;
+/// 2. whatever `first` held is copied to a backup sibling, also
+///    durable. **A previous file that cannot be read stops the whole
+///    thing here**, before anything has changed — the alternative is
+///    publishing a half that cannot be undone.
+/// 3. the two renames.
+///
+/// If the second rename fails, the first is undone: by renaming the
+/// backup back when there was a previous file, and by deleting the file
+/// when there was not (a first issuance has nothing to restore, and
+/// leaving a lone new key beside no certificate is the same mismatch in
+/// a different shape). The undo is a rename, not a rewrite, so it
+/// cannot itself run out of disk halfway. **If it fails anyway, that is
+/// reported** — an error that says "nothing happened" while a mismatched
+/// pair sits on disk is worse than the failure it hides.
+///
+/// What is left is a crash between two renames. That window is real and
+/// this cannot close it; it is a few microseconds wide, and the state it
+/// leaves is visible at startup rather than silent.
+pub fn write_private_pair(first: (&Path, &str), second: (&Path, &str)) -> io::Result<()> {
+    let first_tmp = prepare_private(first.0, first.1.as_bytes())?;
+    let second_tmp = match prepare_private(second.0, second.1.as_bytes()) {
+        Ok(tmp) => tmp,
+        Err(e) => {
+            let _ = fs::remove_file(&first_tmp);
+            return Err(e);
+        }
+    };
+
+    let backup = match back_up(first.0) {
+        Ok(backup) => backup,
+        Err(e) => {
+            let _ = fs::remove_file(&first_tmp);
+            let _ = fs::remove_file(&second_tmp);
+            return Err(e);
+        }
+    };
+
+    if let Err(e) = fs::rename(&first_tmp, first.0) {
+        let _ = fs::remove_file(&first_tmp);
+        let _ = fs::remove_file(&second_tmp);
+        if let Some(backup) = backup {
+            let _ = fs::remove_file(backup);
+        }
+        return Err(e);
+    }
+
+    if let Err(e) = fs::rename(&second_tmp, second.0) {
+        let _ = fs::remove_file(&second_tmp);
+        return Err(undo(first.0, backup, e));
+    }
+
+    if let Some(backup) = backup {
+        let _ = fs::remove_file(backup);
+    }
+    sync_parent(first.0);
+    sync_parent(second.0);
+    Ok(())
+}
+
+/// Copies what `path` holds to a sibling, so it can be renamed back.
+///
+/// `Ok(None)` means there was nothing there — a first issuance. An
+/// unreadable file is an error, and deliberately so: without a copy
+/// there is no undo, and finding that out after publishing is too late.
+fn back_up(path: &Path) -> io::Result<Option<PathBuf>> {
+    let previous = match fs::read(path) {
+        Ok(previous) => previous,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let backup = sibling(path, ".bak")?;
+    let mut file = create_private_new(&backup)?;
+    file.write_all(&previous)?;
+    file.sync_all()?;
+    Ok(Some(backup))
+}
+
+/// Puts `path` back the way it was before the first rename.
+///
+/// The error returned is the one that caused the undo; if the undo
+/// itself fails, both are reported, because at that point the pair on
+/// disk does not match and somebody has to be told which files to look
+/// at.
+fn undo(path: &Path, backup: Option<PathBuf>, cause: io::Error) -> io::Error {
+    let undone = match &backup {
+        Some(backup) => fs::rename(backup, path),
+        // Nothing was there before: the undo is to take the new file
+        // away again.
+        None => fs::remove_file(path),
+    };
+    match undone {
+        Ok(()) => cause,
+        Err(e) => io::Error::new(
+            cause.kind(),
+            format!(
+                "{cause}; and {} could not be put back afterwards ({e}){}",
+                path.display(),
+                match backup {
+                    Some(backup) => format!(" — the previous contents are in {}", backup.display()),
+                    None => String::new(),
+                }
+            ),
+        ),
+    }
+}
+
+/// Writes a temp sibling, 0600, and makes it durable. The rename is the
+/// caller's to do.
+fn prepare_private(path: &Path, contents: &[u8]) -> io::Result<PathBuf> {
+    let tmp = sibling(path, ".tmp")?;
+    let mut file = create_private_new(&tmp)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    Ok(tmp)
+}
+
 /// Creates a directory and everything above it, then makes the leaf
 /// 0700. Existing directories are left alone apart from that mode.
 pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
@@ -90,15 +217,21 @@ pub fn create_new_private(path: &Path, contents: &str) -> io::Result<()> {
 
 /// `path` with `.tmp` appended to its file name.
 fn temp_sibling(path: &Path) -> io::Result<PathBuf> {
+    sibling(path, ".tmp")
+}
+
+/// `path` with `suffix` appended to its file name. A sibling, because
+/// `rename(2)` is only atomic within one filesystem.
+fn sibling(path: &Path, suffix: &str) -> io::Result<PathBuf> {
     let name = path.file_name().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("{path:?} has no file name"),
         )
     })?;
-    let mut tmp = name.to_os_string();
-    tmp.push(".tmp");
-    Ok(path.with_file_name(tmp))
+    let mut sibling = name.to_os_string();
+    sibling.push(suffix);
+    Ok(path.with_file_name(sibling))
 }
 
 /// Creates `path` fresh, 0600, failing if it already exists.

@@ -11,10 +11,22 @@
 //! to be right before any of that starts, because a wrong turn here is
 //! not an error — it is a hub that quietly never renews.
 
+use std::collections::HashMap;
 use std::fmt;
+use std::io;
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
+use anago_core::acme::ChallengeToken;
 use anago_core::state::{Acme, Challenge};
+use axum::extract::{Path as AxumPath, State};
+use axum::http::{header, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use axum::Router;
+use instant_acme::RetryPolicy;
 
 use crate::cfapi::Source;
 use crate::fsutil;
@@ -651,6 +663,529 @@ fn parse_credentials(text: &str) -> Result<instant_acme::AccountCredentials, Str
     serde_json::from_str(text).map_err(|e| e.to_string())
 }
 
+// ------------------------------------------------------ HTTP-01
+
+/// The port an HTTP-01 challenge is fetched on. Not configurable: the
+/// CA connects to port 80 and nothing else (RFC 8555 §8.3), which is
+/// the whole cost of this challenge type (§13).
+pub const CHALLENGE_PORT: u16 = 80;
+
+/// How long to wait for the CA to check the challenge, and then to
+/// issue.
+///
+/// Validation is usually seconds. The generous end of this is for a CA
+/// under load; the point of having a limit at all is that `server init`
+/// must not hang forever on a hub whose port 80 never opens — it has to
+/// fail with something a person can read (§13).
+pub const VALIDATION_TIMEOUT: Duration = Duration::from_secs(90);
+
+fn retry_policy() -> RetryPolicy {
+    RetryPolicy::new()
+        .initial_delay(Duration::from_secs(1))
+        .backoff(2.0)
+        .timeout(VALIDATION_TIMEOUT)
+}
+
+/// A listener that answers exactly one kind of request: the CA fetching
+/// a challenge token.
+///
+/// It exists for the seconds between "the challenge is ready" and "the
+/// CA has looked", and then it stops. Nothing else is routed — a hub
+/// that is briefly on port 80 should not be a web server, even for one
+/// request.
+#[derive(Debug)]
+pub struct Http01 {
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Http01 {
+    /// Binds and starts serving `answers`, keyed by challenge token.
+    ///
+    /// **Both address families are required**, each as its own socket:
+    /// the IPv6 one is opened `IPV6_V6ONLY` so that "IPv6 is bound" and
+    /// "IPv6 and IPv4 are bound" cannot be the same call. Without that
+    /// distinction a foreign process holding one family looks exactly
+    /// like a dual-stack socket covering both — and the CA, which picks
+    /// the family it likes, would be answered by that other process
+    /// while anago reports success.
+    ///
+    /// The one family that may be missing is one this host does not
+    /// have at all ([`family_unavailable`]). That is a fact about the
+    /// machine, not something in the way.
+    ///
+    /// **Human verification needed**: needs a real port 80.
+    pub async fn start(port: u16, answers: HashMap<String, String>) -> Result<Http01, AcmeError> {
+        let app = router(Arc::new(answers));
+        let v6 = bind_v6_only(port);
+        let v4 = bind_v4(port);
+
+        let mut bound = Vec::new();
+        let mut refused = Vec::new();
+        for family in [v6, v4] {
+            match family {
+                Ok(listener) => bound.push(listener),
+                Err(e) => refused.push(e),
+            }
+        }
+        accept_families(port, bound.len(), &refused)?;
+
+        let mut tasks = Vec::new();
+        for listener in bound {
+            let app = app.clone();
+            tasks.push(tokio::spawn(async move {
+                // A failure here is the listener going away, which is
+                // what stopping looks like. There is nobody to tell.
+                let _ = axum::serve(listener, app).await;
+            }));
+        }
+        Ok(Http01 { tasks })
+    }
+
+    /// Stops serving and gives the port back.
+    ///
+    /// Abrupt on purpose: by the time this is called the CA has either
+    /// fetched the token or given up, so there is no request worth
+    /// draining — and a graceful shutdown that waits on a half-open
+    /// connection from anywhere on the internet would hold port 80 for
+    /// as long as a stranger cared to keep it.
+    pub async fn stop(mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+        // Cancelled is the expected outcome; the wait is what makes the
+        // socket closed by the time this returns, which `Drop` alone
+        // cannot promise.
+        for task in std::mem::take(&mut self.tasks) {
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for Http01 {
+    /// Gives the port back even when nobody called [`Http01::stop`].
+    ///
+    /// A `JoinHandle` that is simply dropped detaches: the task keeps
+    /// running and keeps the socket. So if the issuance future is
+    /// cancelled — a timeout above, an abort, a panic unwinding through
+    /// it — port 80 would stay held by a task nothing refers to any
+    /// more, and the next renewal in the same process would find its
+    /// own listener in the way.
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
+/// One route, one answer, nothing else.
+fn router(answers: Arc<HashMap<String, String>>) -> Router {
+    Router::new()
+        .route("/.well-known/acme-challenge/{token}", get(answer))
+        .with_state(answers)
+}
+
+async fn answer(
+    AxumPath(token): AxumPath<String>,
+    State(answers): State<Arc<HashMap<String, String>>>,
+) -> Response {
+    match answers.get(&token) {
+        // RFC 8555 §8.3: the key authorization, and nothing around it.
+        Some(authorization) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/octet-stream")],
+            authorization.clone(),
+        )
+            .into_response(),
+        // A token anago is not waiting for is not this hub's business,
+        // and saying so is better than serving an empty 200 that the CA
+        // would read as a wrong answer.
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// What went wrong with port 80, in the terms a person can act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenProblem {
+    /// Ports below 1024 are privileged.
+    Permission,
+    /// A web server already has it.
+    InUse,
+    Other,
+}
+
+/// Classifies a bind failure. Pure, so the advice below is pinned by
+/// tests rather than by whatever a VPS did once.
+pub fn listen_problem(kind: io::ErrorKind) -> ListenProblem {
+    match kind {
+        io::ErrorKind::PermissionDenied => ListenProblem::Permission,
+        io::ErrorKind::AddrInUse => ListenProblem::InUse,
+        _ => ListenProblem::Other,
+    }
+}
+
+/// Whether the sockets that bound are enough to serve the challenge.
+///
+/// The policy, apart from the binding, so that what it decides is
+/// pinned by tests rather than by what the machine running them happens
+/// to allow:
+///
+/// - **A family that failed for a reason other than not existing stops
+///   the run.** Serving one family while a stranger's process holds the
+///   other is the quiet failure this exists to prevent: the CA picks,
+///   and it may pick theirs.
+/// - **A family this host does not have is fine.** An IPv4-only VPS is
+///   an ordinary VPS.
+/// - **Neither is not.** A hub has to be reachable somehow.
+pub fn accept_families(port: u16, bound: usize, refused: &[io::Error]) -> Result<(), AcmeError> {
+    for failure in refused {
+        if !family_unavailable(failure.raw_os_error(), failure.kind()) {
+            return Err(listen_failure(port, std::slice::from_ref(failure)));
+        }
+    }
+    match bound {
+        0 => Err(AcmeError::NoAddressFamily { port }),
+        _ => Ok(()),
+    }
+}
+
+/// Whether a bind failure means "this host does not do that address
+/// family" rather than "something is in the way".
+///
+/// The difference decides whether anago carries on with one family or
+/// stops: an IPv4-only VPS is ordinary, and a web server holding one
+/// family is not. Both the raw code and the mapped kind are consulted,
+/// because which of them carries the answer depends on the platform and
+/// the standard library's version.
+pub fn family_unavailable(raw: Option<i32>, kind: io::ErrorKind) -> bool {
+    if let Some(raw) = raw {
+        if raw == libc::EAFNOSUPPORT || raw == libc::EPROTONOSUPPORT || raw == libc::EADDRNOTAVAIL {
+            return true;
+        }
+    }
+    matches!(
+        kind,
+        io::ErrorKind::Unsupported | io::ErrorKind::AddrNotAvailable
+    )
+}
+
+/// The failure to report for a family that could not be bound.
+fn listen_failure(port: u16, refused: &[io::Error]) -> AcmeError {
+    let problem = refused
+        .first()
+        .map(|e| listen_problem(e.kind()))
+        .unwrap_or(ListenProblem::Other);
+    let detail = refused
+        .iter()
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join("; ");
+    AcmeError::Listen {
+        port,
+        problem,
+        detail,
+    }
+}
+
+/// An IPv6 listener that serves **only** IPv6.
+///
+/// `std` cannot set `IPV6_V6ONLY`, and its default is the platform's:
+/// on Linux one `[::]` socket usually answers IPv4 too, on the BSDs it
+/// does not. Leaving that to the platform means anago cannot tell which
+/// families it actually holds — see [`Http01::start`] — so the option
+/// is set explicitly and the two families are two sockets everywhere.
+fn bind_v6_only(port: u16) -> io::Result<tokio::net::TcpListener> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    // SAFETY: every call is checked, and the descriptor is owned from
+    // the moment it exists so no path leaks it.
+    let listener = unsafe {
+        let fd = libc::socket(libc::AF_INET6, libc::SOCK_STREAM, 0);
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let owned = OwnedFd::from_raw_fd(fd);
+
+        set_flag(&owned, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY)?;
+        // What `std` does for every listener: a socket in TIME_WAIT
+        // from the previous issuance must not make the next one look
+        // like a busy port.
+        set_flag(&owned, libc::SOL_SOCKET, libc::SO_REUSEADDR)?;
+
+        let mut addr: libc::sockaddr_in6 = std::mem::zeroed();
+        addr.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+        addr.sin6_port = port.to_be();
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+        {
+            addr.sin6_len = std::mem::size_of::<libc::sockaddr_in6>() as u8;
+        }
+        if libc::bind(
+            fd,
+            &addr as *const libc::sockaddr_in6 as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+        ) != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if libc::listen(fd, LISTEN_BACKLOG) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        std::net::TcpListener::from(owned)
+    };
+    from_std(listener)
+}
+
+/// How many pending connections the kernel holds. One CA fetching one
+/// file needs nothing, and this is what `std` uses.
+const LISTEN_BACKLOG: libc::c_int = 128;
+
+fn set_flag(
+    fd: &impl std::os::fd::AsFd,
+    level: libc::c_int,
+    option: libc::c_int,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let on: libc::c_int = 1;
+    // SAFETY: `on` outlives the call and its size is passed with it.
+    let set = unsafe {
+        libc::setsockopt(
+            fd.as_fd().as_raw_fd(),
+            level,
+            option,
+            &on as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    match set {
+        0 => Ok(()),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+fn bind_v4(port: u16) -> io::Result<tokio::net::TcpListener> {
+    from_std(std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, port))?)
+}
+
+/// tokio wants a socket that never blocks the runtime.
+fn from_std(listener: std::net::TcpListener) -> io::Result<tokio::net::TcpListener> {
+    listener.set_nonblocking(true)?;
+    tokio::net::TcpListener::from_std(listener)
+}
+
+/// A certificate, and the key it belongs to.
+pub struct Issued {
+    /// The chain, PEM, leaf first — what goes in `fullchain.pem`.
+    pub certificate: String,
+    /// PEM. Private, because it is the only copy and a `Debug` that
+    /// printed it would end up in a log (§7).
+    private_key: String,
+}
+
+impl Issued {
+    pub fn expose_key(&self) -> &str {
+        &self.private_key
+    }
+}
+
+impl fmt::Debug for Issued {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Issued")
+            .field(
+                "certificate",
+                &format_args!("{} bytes", self.certificate.len()),
+            )
+            .field("private_key", &"redacted")
+            .finish()
+    }
+}
+
+/// Orders a certificate for `domain`, proving control over port 80.
+///
+/// The shape is RFC 8555's: order, authorization, challenge, tell the
+/// CA to look, wait, finalize, collect. What anago adds is the listener
+/// in the middle and the fact that it is **always taken down**, whether
+/// the order worked or not — the port belongs to whatever was using it
+/// before.
+///
+/// **Human verification needed**: this orders a real certificate and
+/// needs a real port 80 reachable from the CA.
+pub async fn issue_http01(
+    account: &instant_acme::Account,
+    domain: &str,
+    port: u16,
+) -> Result<Issued, AcmeError> {
+    let identifiers = [instant_acme::Identifier::Dns(domain.to_string())];
+    let mut order = account
+        .new_order(&instant_acme::NewOrder::new(&identifiers))
+        .await
+        .map_err(|e| AcmeError::Order {
+            domain: domain.to_string(),
+            detail: e.to_string(),
+        })?;
+
+    // First pass: what the CA will ask for. The token's shape is
+    // checked by the core parser, because it is about to be part of a
+    // URL path this process serves.
+    let mut answers = HashMap::new();
+    let mut authorizations = order.authorizations();
+    while let Some(authorization) = authorizations.next().await {
+        let mut authorization = authorization.map_err(|e| AcmeError::Order {
+            domain: domain.to_string(),
+            detail: e.to_string(),
+        })?;
+        // An authorization the CA already considers valid — a recent
+        // order for the same name — needs no challenge at all.
+        if authorization.status == instant_acme::AuthorizationStatus::Valid {
+            continue;
+        }
+        let challenge = authorization
+            .challenge(instant_acme::ChallengeType::Http01)
+            .ok_or_else(|| AcmeError::NoChallenge {
+                domain: domain.to_string(),
+                challenge: Challenge::Http01,
+            })?;
+        let token = ChallengeToken::parse(&challenge.token).map_err(|e| AcmeError::BadToken {
+            detail: e.to_string(),
+        })?;
+        answers.insert(
+            token.as_str().to_string(),
+            challenge.key_authorization().as_str().to_string(),
+        );
+    }
+
+    // Nothing to prove: every authorization was already valid.
+    if answers.is_empty() {
+        return finish(&mut order, domain).await;
+    }
+
+    let paths: Vec<String> = answers
+        .keys()
+        .map(|token| format!("http://{domain}/.well-known/acme-challenge/{token}"))
+        .collect();
+    let listener = Http01::start(port, answers).await?;
+
+    // Second pass: tell the CA each challenge is ready, then wait for
+    // it to look. The authorizations were fetched above, so telling it
+    // makes no extra requests for them.
+    let checked = match tell_the_ca(&mut order, domain).await {
+        Ok(()) => wait_for_ready(&mut order, domain, &paths).await,
+        Err(e) => Err(e),
+    };
+
+    // The port goes back **here**, not at the end: once the CA has
+    // looked, nothing will fetch the token again, and finalizing plus
+    // waiting for the certificate can take another minute and a half.
+    // Holding port 80 through that would turn "stop your web server
+    // for a few seconds" into something else entirely — and it is what
+    // a person was told this would cost (§9.1).
+    listener.stop().await;
+    checked?;
+
+    finish(&mut order, domain).await
+}
+
+/// Marks every pending HTTP-01 challenge ready.
+async fn tell_the_ca(order: &mut instant_acme::Order, domain: &str) -> Result<(), AcmeError> {
+    let mut authorizations = order.authorizations();
+    while let Some(authorization) = authorizations.next().await {
+        let mut authorization = authorization.map_err(|e| AcmeError::Order {
+            domain: domain.to_string(),
+            detail: e.to_string(),
+        })?;
+        if authorization.status == instant_acme::AuthorizationStatus::Valid {
+            continue;
+        }
+        let Some(mut challenge) = authorization.challenge(instant_acme::ChallengeType::Http01)
+        else {
+            continue;
+        };
+        challenge.set_ready().await.map_err(|e| AcmeError::Order {
+            domain: domain.to_string(),
+            detail: e.to_string(),
+        })?;
+    }
+    Ok(())
+}
+
+/// Waits for the CA to check the challenge. Nothing after this needs
+/// the listener.
+async fn wait_for_ready(
+    order: &mut instant_acme::Order,
+    domain: &str,
+    paths: &[String],
+) -> Result<(), AcmeError> {
+    let policy = retry_policy();
+    let status = order
+        .poll_ready(&policy)
+        .await
+        .map_err(|e| AcmeError::Validation {
+            domain: domain.to_string(),
+            urls: paths.to_vec(),
+            detail: e.to_string(),
+        })?;
+    if status != instant_acme::OrderStatus::Ready {
+        return Err(AcmeError::Validation {
+            domain: domain.to_string(),
+            urls: paths.to_vec(),
+            detail: format!("the CA left the order {status:?}"),
+        });
+    }
+    Ok(())
+}
+
+/// Finalizes and collects. The private key is generated here, by the
+/// library, and never leaves this process except into `privkey.pem`.
+async fn finish(order: &mut instant_acme::Order, domain: &str) -> Result<Issued, AcmeError> {
+    let private_key = order.finalize().await.map_err(|e| AcmeError::Finalize {
+        domain: domain.to_string(),
+        detail: e.to_string(),
+    })?;
+    let certificate =
+        order
+            .poll_certificate(&retry_policy())
+            .await
+            .map_err(|e| AcmeError::Finalize {
+                domain: domain.to_string(),
+                detail: e.to_string(),
+            })?;
+    Ok(Issued {
+        certificate,
+        private_key,
+    })
+}
+
+/// Writes the certificate and its key under `/var/lib/anago/tls/`
+/// (§9), 0600 in a 0700 directory.
+///
+/// **The two are published as a pair** ([`fsutil::write_private_pair`]).
+/// A certificate and its key are one thing in two files: either half on
+/// its own is a hub that will not start, so a failure while saving must
+/// not be able to leave one new and one old. Both are written and made
+/// durable before either is published, and an ordinary error — a full
+/// disk, a path that is not writable — leaves the working pair exactly
+/// where it was.
+///
+/// The key goes first of the two, so that in the one case this cannot
+/// close (a crash between two renames) the public half is never the
+/// newer one and the mismatch always points the same way. The recovery
+/// is `server renew --force`.
+pub fn save(certificate: &Path, key: &Path, issued: &Issued) -> Result<(), AcmeError> {
+    if let Some(dir) = key.parent() {
+        fsutil::ensure_private_dir(dir).map_err(|e| AcmeError::Write {
+            path: dir.display().to_string(),
+            detail: e.to_string(),
+        })?;
+    }
+    fsutil::write_private_pair(
+        (key, issued.expose_key()),
+        (certificate, &issued.certificate),
+    )
+    .map_err(|e| AcmeError::Write {
+        path: format!("{} and {}", key.display(), certificate.display()),
+        detail: e.to_string(),
+    })
+}
+
 /// Why the account step failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AcmeError {
@@ -685,6 +1220,43 @@ pub enum AcmeError {
         path: String,
         wrong: Wrong,
         directory: String,
+    },
+    /// Port 80 could not be bound for the challenge.
+    Listen {
+        port: u16,
+        problem: ListenProblem,
+        detail: String,
+    },
+    /// The order itself — creating it, reading its authorizations,
+    /// telling the CA a challenge is ready.
+    Order {
+        domain: String,
+        detail: String,
+    },
+    /// The CA does not offer the challenge type that was chosen.
+    NoChallenge {
+        domain: String,
+        challenge: Challenge,
+    },
+    /// The CA's challenge token is not a shape anago will put in a URL.
+    BadToken {
+        detail: String,
+    },
+    /// Neither IPv6 nor IPv4 exists on this host.
+    NoAddressFamily {
+        port: u16,
+    },
+    /// The CA looked and was not satisfied.
+    Validation {
+        domain: String,
+        urls: Vec<String>,
+        detail: String,
+    },
+    /// The order was authorized and the certificate still did not
+    /// arrive.
+    Finalize {
+        domain: String,
+        detail: String,
     },
 }
 
@@ -744,6 +1316,68 @@ impl fmt::Display for AcmeError {
             AcmeError::WrongAccount { path, .. } => {
                 write!(f, "the ACME account key at {path} could not be checked")
             }
+            AcmeError::Listen {
+                port,
+                problem: ListenProblem::Permission,
+                ..
+            } => write!(
+                f,
+                "port {port} cannot be opened without privilege — ports below 1024 belong \
+                 to root. Run this with sudo, or give the binary CAP_NET_BIND_SERVICE. \
+                 A DNS-01 challenge needs no port at all: pass --acme-challenge dns-01 \
+                 with a Cloudflare token"
+            ),
+            AcmeError::Listen {
+                port,
+                problem: ListenProblem::InUse,
+                ..
+            } => write!(
+                f,
+                "something is already listening on port {port} — a web server (nginx, \
+                 caddy, apache) is the usual answer. anago needs it for the seconds the \
+                 CA takes to fetch one file: stop that server for a moment and run this \
+                 again, or use --acme-challenge dns-01 with a Cloudflare token and leave \
+                 port {port} alone"
+            ),
+            AcmeError::Listen { port, detail, .. } => {
+                write!(f, "port {port} could not be opened: {detail}")
+            }
+            AcmeError::NoAddressFamily { port } => write!(
+                f,
+                "port {port} could not be opened on IPv4 or IPv6 — this host appears to \
+                 have neither. A hub needs one of them to be reachable at all"
+            ),
+            AcmeError::Order { domain, detail } => write!(
+                f,
+                "the certificate order for {domain} did not go through: {detail}"
+            ),
+            AcmeError::NoChallenge { domain, challenge } => write!(
+                f,
+                "the CA does not offer a {} challenge for {domain}",
+                challenge.as_str()
+            ),
+            AcmeError::BadToken { detail } => write!(
+                f,
+                "the CA sent a challenge token anago will not serve: {detail}"
+            ),
+            AcmeError::Validation {
+                domain,
+                urls,
+                detail,
+            } => write!(
+                f,
+                "the CA could not verify {domain}: {detail}. It fetches {} from outside, \
+                 so the thing to check is that port 80 is open all the way in — the cloud \
+                 security group as well as the host firewall — and that the name resolves \
+                 to this server",
+                urls.join(", ")
+            ),
+            AcmeError::Finalize { domain, detail } => write!(
+                f,
+                "{domain} was verified and the certificate still did not arrive: {detail}. \
+                 Nothing was saved; running this again re-uses the authorization the CA \
+                 already granted"
+            ),
             AcmeError::Unreadable { path, detail } => write!(
                 f,
                 "the ACME account key at {path} is not readable as account credentials: \
@@ -1380,6 +2014,542 @@ mod tests {
         assert!(!shown.contains("secret-key-material"), "{shown}");
         assert!(shown.contains(ACCOUNT_KEY), "{shown}");
         assert!(shown.contains("uncommitted: true"), "{shown}");
+    }
+
+    // ----------------------------------------------------- HTTP-01
+
+    const TOKEN: &str = "LoqXcYV8q5ONbJQxbmR7SCTNo3tiAXDfowyjxAjEuX0";
+    const KEY_AUTH: &str =
+        "LoqXcYV8q5ONbJQxbmR7SCTNo3tiAXDfowyjxAjEuX0.9jg46WB3rR_AHD-EBXdN7cBkH1WOu0tA3M9fm21mqTI";
+
+    async fn fetch(path: &str, answers: &[(&str, &str)]) -> (StatusCode, String, String) {
+        use tower::ServiceExt;
+
+        let answers: HashMap<String, String> = answers
+            .iter()
+            .map(|(token, key)| (token.to_string(), key.to_string()))
+            .collect();
+        let request = axum::http::Request::builder()
+            .uri(path)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = router(Arc::new(answers)).oneshot(request).await.unwrap();
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .map(|value| value.to_str().unwrap().to_string())
+            .unwrap_or_default();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        (
+            status,
+            content_type,
+            String::from_utf8(body.to_vec()).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn the_listener_serves_the_key_authorization_and_nothing_else() {
+        let (status, content_type, body) = fetch(
+            &format!("/.well-known/acme-challenge/{TOKEN}"),
+            &[(TOKEN, KEY_AUTH)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body, KEY_AUTH,
+            "the key authorization, and nothing around it"
+        );
+        // RFC 8555 §8.3.
+        assert_eq!(content_type, "application/octet-stream");
+    }
+
+    #[tokio::test]
+    async fn a_token_this_hub_is_not_waiting_for_is_not_answered() {
+        // An empty 200 would be read by the CA as a wrong answer; 404
+        // is the truth and reads as one in a log.
+        let (status, _, body) = fetch(
+            "/.well-known/acme-challenge/some-other-token",
+            &[(TOKEN, KEY_AUTH)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.is_empty(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn nothing_but_the_challenge_path_is_served() {
+        // A hub that is briefly on port 80 must not be a web server.
+        for path in [
+            "/",
+            "/index.html",
+            "/.well-known/acme-challenge/",
+            "/api/v1/peers",
+        ] {
+            let (status, _, _) = fetch(path, &[(TOKEN, KEY_AUTH)]).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+        }
+    }
+
+    #[test]
+    fn a_privileged_port_is_named_as_that_and_not_as_a_mystery() {
+        let error = AcmeError::Listen {
+            port: CHALLENGE_PORT,
+            problem: ListenProblem::Permission,
+            detail: "Permission denied (os error 13)".to_string(),
+        };
+        let message = error.to_string();
+        assert!(message.contains("without privilege"), "{message}");
+        assert!(message.contains("CAP_NET_BIND_SERVICE"), "{message}");
+        // The way out that needs no port at all.
+        assert!(message.contains("dns-01"), "{message}");
+    }
+
+    #[test]
+    fn a_busy_port_says_what_is_probably_holding_it() {
+        let error = AcmeError::Listen {
+            port: CHALLENGE_PORT,
+            problem: ListenProblem::InUse,
+            detail: "Address already in use (os error 48)".to_string(),
+        };
+        let message = error.to_string();
+        assert!(message.contains("nginx"), "{message}");
+        // And that it is only wanted for a moment — the alternative
+        // reading is "anago wants port 80 forever", which is a reason
+        // to give up on the whole thing.
+        assert!(message.contains("seconds"), "{message}");
+        assert!(message.contains("dns-01"), "{message}");
+    }
+
+    #[test]
+    fn a_family_this_host_does_not_have_is_not_something_in_the_way() {
+        // An IPv4-only VPS is an ordinary VPS: the missing family is a
+        // fact about the machine, and carrying on with the other one is
+        // right. Anything else — a web server, a privileged port — is
+        // not, and stops the run.
+        for raw in [
+            libc::EAFNOSUPPORT,
+            libc::EPROTONOSUPPORT,
+            libc::EADDRNOTAVAIL,
+        ] {
+            assert!(
+                family_unavailable(Some(raw), io::ErrorKind::Other),
+                "raw {raw}"
+            );
+        }
+        for kind in [io::ErrorKind::Unsupported, io::ErrorKind::AddrNotAvailable] {
+            assert!(family_unavailable(None, kind), "{kind:?}");
+        }
+        for kind in [
+            io::ErrorKind::AddrInUse,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::Other,
+        ] {
+            assert!(!family_unavailable(None, kind), "{kind:?}");
+            assert!(
+                !family_unavailable(Some(libc::EADDRINUSE), kind),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_family_held_by_somebody_else_stops_the_run() {
+        // The quiet failure this prevents: another process holds one
+        // family, anago binds the other and reports success — and the
+        // CA, which picks, is answered by that other process.
+        let error = accept_families(
+            CHALLENGE_PORT,
+            1,
+            &[io::Error::from(io::ErrorKind::AddrInUse)],
+        )
+        .expect_err("one family is held by somebody else");
+        assert!(
+            matches!(
+                error,
+                AcmeError::Listen {
+                    problem: ListenProblem::InUse,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("already listening"), "{error}");
+
+        // Privilege is the same shape of problem.
+        assert!(matches!(
+            accept_families(
+                CHALLENGE_PORT,
+                1,
+                &[io::Error::from(io::ErrorKind::PermissionDenied)]
+            ),
+            Err(AcmeError::Listen {
+                problem: ListenProblem::Permission,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn one_family_is_enough_when_the_other_does_not_exist_here() {
+        let missing = io::Error::from_raw_os_error(libc::EAFNOSUPPORT);
+        assert_eq!(accept_families(CHALLENGE_PORT, 1, &[missing]), Ok(()));
+        assert_eq!(accept_families(CHALLENGE_PORT, 2, &[]), Ok(()));
+
+        // Neither is not enough — a hub has to be reachable somehow.
+        let error = accept_families(
+            CHALLENGE_PORT,
+            0,
+            &[
+                io::Error::from_raw_os_error(libc::EAFNOSUPPORT),
+                io::Error::from_raw_os_error(libc::EADDRNOTAVAIL),
+            ],
+        )
+        .expect_err("nothing bound");
+        assert!(
+            matches!(error, AcmeError::NoAddressFamily { .. }),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("neither"), "{error}");
+    }
+
+    /// A task that reports having been cancelled, so the lifecycle can
+    /// be checked without a socket — the review environment has no
+    /// permission to bind one, and what is being tested is ownership,
+    /// not networking.
+    fn parked_task(cancelled: &Arc<std::sync::atomic::AtomicBool>) -> tokio::task::JoinHandle<()> {
+        struct Guard(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let guard = Guard(cancelled.clone());
+        tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        })
+    }
+
+    async fn wait_for(flag: &Arc<std::sync::atomic::AtomicBool>) -> bool {
+        for _ in 0..100 {
+            if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                return true;
+            }
+            tokio::task::yield_now().await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn dropping_the_listener_cancels_what_holds_the_port() {
+        // The issuance future can be cancelled — a timeout above, an
+        // abort, a panic. A `JoinHandle` that is merely dropped
+        // detaches, and the serve task would keep the port with nothing
+        // referring to it.
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let listener = Http01 {
+            tasks: vec![parked_task(&cancelled)],
+        };
+        drop(listener);
+        assert!(
+            wait_for(&cancelled).await,
+            "the serving task outlived the listener"
+        );
+    }
+
+    #[tokio::test]
+    async fn stopping_waits_for_the_task_to_be_gone() {
+        // The difference between `stop` and `Drop`: no waiting for the
+        // runtime to get round to it, so the port is free the moment
+        // this returns.
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let listener = Http01 {
+            tasks: vec![parked_task(&cancelled)],
+        };
+        listener.stop().await;
+        assert!(
+            cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            "stop returned before the task was done"
+        );
+    }
+
+    /// A port nothing else is using, or `None` where this process may
+    /// not bind at all (a sandbox, a container without net access).
+    fn spare_port() -> Option<u16> {
+        match std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)) {
+            Ok(probe) => probe.local_addr().ok().map(|addr| addr.port()),
+            Err(_) => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_real_listener_takes_the_port_and_gives_it_back() {
+        // The end-to-end version of the two tests above. Skipped rather
+        // than failed where binding is not allowed: what it adds is
+        // that the socket really is closed, and a sandbox cannot answer
+        // that either way.
+        let Some(port) = spare_port() else {
+            eprintln!("skipped: this environment does not allow binding a socket");
+            return;
+        };
+
+        let listener = Http01::start(port, HashMap::new()).await.expect("bound");
+        assert!(
+            std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).is_err(),
+            "the listener is not actually holding port {port}"
+        );
+
+        listener.stop().await;
+        assert!(
+            std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).is_ok(),
+            "port {port} is still held"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_real_family_held_by_somebody_else_is_refused() {
+        let Some(port) = spare_port() else {
+            eprintln!("skipped: this environment does not allow binding a socket");
+            return;
+        };
+        // The whole address, not just loopback: with SO_REUSEADDR the
+        // BSDs let a wildcard bind sit beside a specific one, so a
+        // loopback listener would not be in the way at all.
+        let Ok(taken) = std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)) else {
+            eprintln!("skipped: this environment does not allow binding a socket");
+            return;
+        };
+
+        let error = Http01::start(port, HashMap::new())
+            .await
+            .expect_err("IPv4 is held by this test");
+        assert!(
+            matches!(
+                error,
+                AcmeError::Listen {
+                    problem: ListenProblem::InUse,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        drop(taken);
+    }
+
+    #[test]
+    fn a_failed_validation_says_which_url_the_ca_asked_for() {
+        // The single most useful thing to print: a person can paste it
+        // into curl from another machine and see the same failure.
+        let error = AcmeError::Validation {
+            domain: "net.example.com".to_string(),
+            urls: vec![format!(
+                "http://net.example.com/.well-known/acme-challenge/{TOKEN}"
+            )],
+            detail: "the CA left the order Invalid".to_string(),
+        };
+        let message = error.to_string();
+        assert!(message.contains(TOKEN), "{message}");
+        assert!(message.contains("http://net.example.com/"), "{message}");
+        // Where the port has to be open: not just on the host.
+        assert!(message.contains("security group"), "{message}");
+    }
+
+    #[test]
+    fn the_certificate_and_its_key_land_private() {
+        let dir = TempDir::new();
+        let paths = crate::paths::ServerPaths::new(dir.path.clone());
+        let issued = Issued {
+            certificate: "-----BEGIN CERTIFICATE-----\nchain\n-----END CERTIFICATE-----\n"
+                .to_string(),
+            private_key: "-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----\n"
+                .to_string(),
+        };
+        save(&paths.certificate(), &paths.private_key(), &issued).expect("saved");
+
+        use std::os::unix::fs::PermissionsExt;
+        for path in [paths.certificate(), paths.private_key()] {
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{}", path.display());
+        }
+        assert_eq!(
+            std::fs::metadata(paths.tls_dir())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::read_to_string(paths.private_key()).unwrap(),
+            issued.expose_key()
+        );
+        assert_eq!(
+            std::fs::read_to_string(paths.certificate()).unwrap(),
+            issued.certificate
+        );
+        // The names the state file records (§9).
+        assert!(paths.certificate().ends_with("tls/fullchain.pem"));
+        assert!(paths.private_key().ends_with("tls/privkey.pem"));
+    }
+
+    #[test]
+    fn a_certificate_that_cannot_be_written_leaves_the_working_pair_alone() {
+        // Not just the crash window: a full disk or an unwritable path
+        // on the *second* file would otherwise leave the new key beside
+        // the old certificate — a mismatched pair, and a hub that will
+        // not start, reported as an error that says nothing happened.
+        let dir = TempDir::new();
+        let paths = crate::paths::ServerPaths::new(dir.path.clone());
+        let working = Issued {
+            certificate: "old chain".to_string(),
+            private_key: "old key".to_string(),
+        };
+        save(&paths.certificate(), &paths.private_key(), &working).expect("the first pair");
+
+        // A directory where the certificate should go: the rename
+        // cannot land, and it is the second of the two.
+        std::fs::remove_file(paths.certificate()).unwrap();
+        std::fs::create_dir(paths.certificate()).unwrap();
+
+        let replacement = Issued {
+            certificate: "new chain".to_string(),
+            private_key: "new key".to_string(),
+        };
+        let error = save(&paths.certificate(), &paths.private_key(), &replacement)
+            .expect_err("the certificate cannot be written");
+        assert!(matches!(error, AcmeError::Write { .. }), "{error:?}");
+
+        assert_eq!(
+            std::fs::read_to_string(paths.private_key()).unwrap(),
+            "old key",
+            "the key that goes with the certificate on disk is the one still there"
+        );
+        // And nothing is left lying around for the next run to trip on.
+        assert!(!paths.private_key().with_extension("pem.tmp").exists());
+    }
+
+    #[test]
+    fn a_first_issuance_that_fails_halfway_leaves_no_lone_key() {
+        // There is nothing to restore on a first issuance, so the undo
+        // is to take the new key away again. Leaving it beside no
+        // certificate is the same mismatch in a different shape — and
+        // the next run would find a key it did not write.
+        let dir = TempDir::new();
+        let paths = crate::paths::ServerPaths::new(dir.path.clone());
+        std::fs::create_dir_all(paths.tls_dir()).unwrap();
+        // A directory where the certificate should go: the rename
+        // cannot land, and it is the second of the two.
+        std::fs::create_dir(paths.certificate()).unwrap();
+
+        let first = Issued {
+            certificate: "chain".to_string(),
+            private_key: "key".to_string(),
+        };
+        assert!(save(&paths.certificate(), &paths.private_key(), &first).is_err());
+        assert!(
+            !paths.private_key().exists(),
+            "a key with no certificate was left behind"
+        );
+        assert!(!paths.private_key().with_extension("pem.bak").exists());
+    }
+
+    #[test]
+    fn a_previous_key_that_cannot_be_read_stops_before_anything_changes() {
+        // Without a copy of what is there, a failed second rename could
+        // not be undone. Finding that out after publishing is too late,
+        // so it is found out before.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new();
+        let paths = crate::paths::ServerPaths::new(dir.path.clone());
+        let working = Issued {
+            certificate: "old chain".to_string(),
+            private_key: "old key".to_string(),
+        };
+        save(&paths.certificate(), &paths.private_key(), &working).expect("the first pair");
+
+        // Unreadable — as a file whose mode says so. Root ignores that,
+        // so this checks what it can and skips the rest.
+        std::fs::set_permissions(paths.private_key(), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        if std::fs::read(paths.private_key()).is_ok() {
+            eprintln!("skipped: this process reads files regardless of mode");
+            return;
+        }
+
+        let replacement = Issued {
+            certificate: "new chain".to_string(),
+            private_key: "new key".to_string(),
+        };
+        assert!(save(&paths.certificate(), &paths.private_key(), &replacement).is_err());
+        assert_eq!(
+            std::fs::read_to_string(paths.certificate()).unwrap(),
+            "old chain",
+            "the certificate was published even though the key could not be backed up"
+        );
+        std::fs::set_permissions(paths.private_key(), std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(paths.private_key()).unwrap(),
+            "old key"
+        );
+    }
+
+    #[test]
+    fn a_pair_that_cannot_be_prepared_publishes_neither_half() {
+        // The first failure mode: the temp write itself fails, before
+        // anything is published.
+        let dir = TempDir::new();
+        let paths = crate::paths::ServerPaths::new(dir.path.clone());
+        let working = Issued {
+            certificate: "old chain".to_string(),
+            private_key: "old key".to_string(),
+        };
+        save(&paths.certificate(), &paths.private_key(), &working).expect("the first pair");
+
+        let nowhere = dir.path.join("gone").join("fullchain.pem");
+        let replacement = Issued {
+            certificate: "new chain".to_string(),
+            private_key: "new key".to_string(),
+        };
+        assert!(save(&nowhere, &paths.private_key(), &replacement).is_err());
+        assert_eq!(
+            std::fs::read_to_string(paths.private_key()).unwrap(),
+            "old key"
+        );
+        assert_eq!(
+            std::fs::read_to_string(paths.certificate()).unwrap(),
+            "old chain"
+        );
+    }
+
+    #[test]
+    fn an_issued_certificate_never_prints_its_key() {
+        let issued = Issued {
+            certificate: "chain".to_string(),
+            private_key: "-----BEGIN PRIVATE KEY-----secret-----".to_string(),
+        };
+        let shown = format!("{issued:?}");
+        assert!(!shown.contains("secret"), "{shown}");
+        assert!(shown.contains("redacted"), "{shown}");
+    }
+
+    #[test]
+    fn the_wait_for_the_ca_is_bounded() {
+        // `server init` must not hang forever on a hub whose port 80
+        // never opens: it has to fail with something readable (§13).
+        assert!(
+            VALIDATION_TIMEOUT >= Duration::from_secs(30),
+            "a CA under load"
+        );
+        assert!(
+            VALIDATION_TIMEOUT <= Duration::from_secs(300),
+            "a person is waiting"
+        );
     }
 
     #[test]
