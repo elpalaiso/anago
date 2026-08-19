@@ -111,6 +111,16 @@ pub const DEVICE_FILE: &str = "device.json";
 /// The join lock's name inside the config directory.
 pub const JOIN_LOCK: &str = "join.lock";
 
+/// The flock target that keeps two `sync` runs from rewriting the same
+/// config at once — the timer against a person typing the command
+/// (§6.3).
+///
+/// Beside the device file rather than beside the WireGuard config,
+/// because that is the directory this run has just read from and is
+/// therefore known to exist. A device with a `device.json` but no
+/// `/etc/wireguard` yet should still be able to report itself in sync.
+pub const SYNC_LOCK: &str = "sync.lock";
+
 /// Paths under a device's config directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientPaths {
@@ -374,11 +384,13 @@ mod tests {
         // against the handle `join` holds). A name with a separator in
         // it would escape that directory and put the check and the
         // write back on different inodes.
-        for name in [DEVICE_FILE, JOIN_LOCK] {
+        for name in [DEVICE_FILE, JOIN_LOCK, SYNC_LOCK] {
             assert!(!name.contains('/'), "{name} is a path, not a name");
             assert_ne!(name, "..");
         }
         assert_ne!(DEVICE_FILE, JOIN_LOCK);
+        assert_ne!(DEVICE_FILE, SYNC_LOCK);
+        assert_ne!(JOIN_LOCK, SYNC_LOCK);
     }
 
     #[test]

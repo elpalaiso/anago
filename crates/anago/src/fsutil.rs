@@ -445,9 +445,33 @@ impl DirHandle {
         }
     }
 
+    /// Who owns `name`, without following a symlink at it.
+    ///
+    /// For the one job that has to hand a file back exactly as it
+    /// found it: a root process rewriting a file in somebody's home
+    /// must not make it root's, or the ordinary commands that read it
+    /// stop working (§9).
+    pub fn owner_of(&self, name: &str) -> io::Result<(u32, u32)> {
+        let c_name = c_name(name)?;
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: both pointers are valid for the call.
+        let result = unsafe {
+            libc::fstatat(
+                self.fd.as_raw_fd(),
+                c_name.as_ptr(),
+                &mut stat,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((stat.st_uid, stat.st_gid))
+    }
+
     /// Reads a file here.
     pub fn read_to_string(&self, name: &str) -> io::Result<String> {
-        let mut file = self.open_file(name, libc::O_RDONLY, 0)?;
+        let mut file = self.open_file(name, libc::O_RDONLY | libc::O_NOFOLLOW, 0)?;
         let mut text = String::new();
         std::io::Read::read_to_string(&mut file, &mut text)?;
         Ok(text)

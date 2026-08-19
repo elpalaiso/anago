@@ -37,6 +37,7 @@ mod rm;
 mod secret;
 mod serve;
 mod store;
+mod sync;
 mod systemd;
 mod tls;
 mod wg;
@@ -147,24 +148,29 @@ fn server_run() -> ! {
     }
 }
 
-/// `anago sync` — on a device, pull the peer list.
-///
-/// Routing is complete; what the command then *does* — the API call,
-/// the wg reconfigure, installing the timer — lands in the slice after
-/// this one. Saying so beats accepting the command and doing nothing.
+/// `anago sync` — on a device, pull the peer list (§6.3).
 fn sync_device(args: &cli::Sync) -> ! {
-    let asked = match args.timer {
-        Some(cli::Timer::Install { interval }) => {
-            format!("install a timer every {}s", interval.as_secs())
+    if args.timer.is_some() {
+        eprintln!("anago: installing the sync timer is not wired up yet — the flags are");
+        eprintln!("       understood, but writing the unit lands next. Meanwhile `anago sync`");
+        eprintln!("       run by hand does the same work (§6.3).");
+        std::process::exit(EXIT_FAILED);
+    }
+
+    let wg_config = paths::wg_config(paths::DEFAULT_WG_DIR);
+    let synced = sync::run(args.config.as_deref(), &wg_config, args.quiet);
+    if !synced.report.is_empty() {
+        // stdout is what the run found; stderr is what it could not
+        // do. `Passed` is the second kind — the hub was not reachable,
+        // or another run had the lock — so it goes there even though
+        // it exits zero (§6.3). Under `--quiet` the report is empty
+        // for both and nothing is printed at all.
+        match synced.ending {
+            sync::Ending::Fine => print!("{}", synced.report),
+            sync::Ending::Passed | sync::Ending::Stop => eprint!("{}", synced.report),
         }
-        Some(cli::Timer::Uninstall) => "remove the timer".to_string(),
-        None => "sync now".to_string(),
-    };
-    eprintln!("anago: `anago sync` is not wired up yet — the flags are understood ({asked}),");
-    eprintln!("       but the run itself lands next. Nothing is unreachable meanwhile: the");
-    eprintln!("       hub knows every peer, and syncing is how this device hears about the");
-    eprintln!("       others (§6.3).");
-    std::process::exit(EXIT_FAILED);
+    }
+    std::process::exit(synced.ending.exit_code());
 }
 
 /// `anago join <domain> <code>`.

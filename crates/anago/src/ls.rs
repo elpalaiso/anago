@@ -387,6 +387,7 @@ mod tests {
                     address: "10.100.0.3".to_string(),
                 },
             ],
+            hub: None,
         };
         let rows = rows_from_response(&response).unwrap();
         assert_eq!(rows.len(), 2);
@@ -410,6 +411,7 @@ mod tests {
                 public_key: key.to_string(),
                 address: address.to_string(),
             }],
+            hub: None,
         };
 
         let e = rows_from_response(&peer("macbook", KEY_ONE, "not an address")).unwrap_err();

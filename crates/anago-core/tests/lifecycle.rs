@@ -345,6 +345,7 @@ fn the_answers_the_hub_gives_survive_the_wire() {
                 address: peer.address.to_string(),
             })
             .collect(),
+        hub: None,
     };
     let text = json::to_string(&listed.to_json());
     assert_eq!(

@@ -82,11 +82,37 @@ pub struct PeerInfo {
     pub address: String,
 }
 
+/// What the hub says about itself, alongside the roster (§6.3).
+///
+/// The same four values `join` handed out, spelled the same way — this
+/// is the hub repeating itself so a device can check its own copy, and
+/// one decoder reads both shapes.
+///
+/// Flat at the top level rather than nested. `server` is already taken
+/// in the state file for something else (§9.1), and the names have to
+/// match [`JoinResponse`]'s for the decoder to be shared.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HubInfo {
+    pub subnet: String,
+    pub server_public_key: String,
+    pub server_endpoint: String,
+    pub server_address: String,
+}
+
 /// `GET /api/v1/peers`. The list includes the calling device itself —
 /// the caller filters by its own name if it wants the others.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PeersResponse {
     pub peers: Vec<PeerInfo>,
+    /// What the hub says about itself, and `None` from an M0 hub that
+    /// says nothing (§6.3).
+    ///
+    /// **The four fields are there together or not at all.** A response
+    /// carrying some of them is a decode error rather than a partial
+    /// answer: `sync` compares the local config against these, and half
+    /// an answer half-believed is how a device decides it matches a hub
+    /// it has not actually checked against.
+    pub hub: Option<HubInfo>,
 }
 
 /// Error body for any failing call. `code` is for programs, `message`
@@ -342,12 +368,32 @@ impl PeerInfo {
     }
 }
 
+/// The four keys [`HubInfo`] occupies, in the order they are written.
+const HUB_FIELDS: [&str; 4] = [
+    "subnet",
+    "server_public_key",
+    "server_endpoint",
+    "server_address",
+];
+
 impl PeersResponse {
     pub fn to_json(&self) -> Value {
-        Value::obj([(
-            "peers",
-            Value::Arr(self.peers.iter().map(PeerInfo::to_json).collect()),
-        )])
+        let peers = Value::Arr(self.peers.iter().map(PeerInfo::to_json).collect());
+        match &self.hub {
+            // An M0 hub's shape, which an M1 client reads as "nothing
+            // to compare against" rather than as a difference (§6.3).
+            None => Value::obj([("peers", peers)]),
+            Some(hub) => Value::obj([
+                ("peers", peers),
+                ("subnet", Value::str(hub.subnet.as_str())),
+                (
+                    "server_public_key",
+                    Value::str(hub.server_public_key.as_str()),
+                ),
+                ("server_endpoint", Value::str(hub.server_endpoint.as_str())),
+                ("server_address", Value::str(hub.server_address.as_str())),
+            ]),
+        }
     }
 
     pub fn from_json(value: &Value) -> Result<PeersResponse, DecodeError> {
@@ -362,7 +408,28 @@ impl PeersResponse {
         for (i, item) in items.iter().enumerate() {
             peers.push(PeerInfo::from_json(item).map_err(|e| e.within(&format!("peers[{i}]")))?);
         }
-        Ok(PeersResponse { peers })
+
+        // All four or none. Half an answer is refused rather than
+        // half-believed: `sync` decides whether the local config still
+        // matches the hub from exactly these values (§6.3).
+        let present = HUB_FIELDS.iter().filter(|name| obj.get(name).is_some());
+        let hub = match present.count() {
+            0 => None,
+            4 => Some(HubInfo {
+                subnet: string_field(obj, "subnet")?,
+                server_public_key: string_field(obj, "server_public_key")?,
+                server_endpoint: string_field(obj, "server_endpoint")?,
+                server_address: string_field(obj, "server_address")?,
+            }),
+            _ => {
+                let missing = HUB_FIELDS
+                    .iter()
+                    .find(|name| obj.get(name).is_none())
+                    .expect("a partial set has at least one absentee");
+                return Err(DecodeError::missing(missing));
+            }
+        };
+        Ok(PeersResponse { peers, hub })
     }
 }
 
@@ -495,6 +562,7 @@ mod tests {
                     address: "10.100.0.3".to_string(),
                 },
             ],
+            hub: None,
         };
         assert_eq!(peers.peers.len(), 2);
         assert_eq!(peers.peers[1].address, "10.100.0.3");
@@ -552,6 +620,55 @@ mod tests {
                     address: "10.100.0.3".to_string(),
                 },
             ],
+            hub: None,
+        }
+    }
+
+    #[test]
+    fn the_hub_describes_itself_or_says_nothing_at_all() {
+        // §6.3: `sync` decides whether a device's config still matches
+        // the hub from exactly these four. Half an answer half-believed
+        // is a device that decides it matches a hub it never checked
+        // against, so a partial set is a decode error.
+        let full = PeersResponse {
+            hub: Some(HubInfo {
+                subnet: "10.100.0.0/24".to_string(),
+                server_public_key: "c2VydmVyIGtleQ==".to_string(),
+                server_endpoint: "net.example.com:51820".to_string(),
+                server_address: "10.100.0.1".to_string(),
+            }),
+            ..sample_peers()
+        };
+        let text = json::to_string(&full.to_json());
+        assert_eq!(
+            PeersResponse::from_json(&json::parse(&text).unwrap()).unwrap(),
+            full
+        );
+
+        // An M0 hub writes none of them, and that decodes as `None` —
+        // not as four empty strings, and not as an error.
+        let bare = sample_peers();
+        let text = json::to_string(&bare.to_json());
+        assert!(!text.contains("server_public_key"), "{text}");
+        assert_eq!(
+            PeersResponse::from_json(&json::parse(&text).unwrap()).unwrap(),
+            bare
+        );
+
+        // Any three of the four is refused, and the error names the
+        // one that is missing.
+        for dropped in HUB_FIELDS {
+            let Value::Obj(obj) = full.to_json() else {
+                unreachable!("a response encodes as an object")
+            };
+            let mut partial = Object::new();
+            for (name, value) in obj.iter().filter(|(name, _)| *name != dropped) {
+                partial.insert(name, value.clone()).expect("no repeats");
+            }
+            let partial = Value::Obj(partial);
+            let e = PeersResponse::from_json(&partial)
+                .expect_err(&format!("{dropped} could go missing"));
+            assert!(e.to_string().contains(dropped), "{dropped}: {e}");
         }
     }
 
@@ -613,7 +730,10 @@ mod tests {
 
     #[test]
     fn empty_peer_list_round_trips() {
-        let empty = PeersResponse { peers: Vec::new() };
+        let empty = PeersResponse {
+            peers: Vec::new(),
+            hub: None,
+        };
         assert_eq!(json::to_string(&empty.to_json()), r#"{"peers":[]}"#);
         assert_eq!(PeersResponse::from_json(&empty.to_json()).unwrap(), empty);
     }

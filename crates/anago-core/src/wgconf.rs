@@ -163,6 +163,30 @@ pub fn export_profile(profile: &ClientProfile) -> SecretText {
     SecretText(render_client(profile, false))
 }
 
+/// Finds this device's private key in its own config.
+///
+/// The one copy of that key is in this file (§9.2) — `device.json`
+/// never holds it — so a `sync` that has to rewrite the config starts
+/// here. `None` when there is no `PrivateKey` line, and then §6.3's
+/// rule applies: do not repair, tell the person to join again, because
+/// there is nothing to build a config out of.
+///
+/// Deliberately forgiving about layout: a person may have reindented
+/// the file or changed its line endings, and neither is a reason to
+/// refuse. It returns the text rather than a validated key because the
+/// shape of a WireGuard key is checked in one place, beside the tools
+/// that print them.
+pub fn private_key_line(config: &str) -> Option<&str> {
+    config.lines().find_map(|line| {
+        let (name, value) = line.trim().split_once('=')?;
+        // `[Peer]` carries no `PrivateKey`, so there is no section to
+        // track: the first one in the file is the interface's.
+        name.trim()
+            .eq_ignore_ascii_case("privatekey")
+            .then(|| value.trim())
+    })
+}
+
 /// The one renderer behind both. The files differ by their comments and
 /// by nothing else, and keeping that true is the point of sharing it:
 /// a phone that works and a laptop that does not would be a bug nobody
@@ -244,6 +268,48 @@ mod tests {
             peers,
             codes: Vec::new(),
         }
+    }
+
+    #[test]
+    fn the_private_key_is_found_wherever_a_person_left_it() {
+        // The one copy of a device's key is in this file (§9.2), so a
+        // `sync` that has to rewrite the config starts by reading it
+        // back. A file somebody reindented or saved with CRLF is not a
+        // reason to refuse.
+        let key = "dGhpcyBkZXZpY2UncyBwcml2YXRlIGtleSA0NCBjaGE=";
+        let profile = ClientProfile {
+            address: "10.100.0.2".parse().unwrap(),
+            subnet: Subnet::parse("10.100.0.0/24").unwrap(),
+            private_key: PrivateKey::new(key),
+            server_public_key: "c2VydmVyIGtleQ==".to_string(),
+            server_endpoint: "net.example.com:51820".to_string(),
+        };
+        assert_eq!(private_key_line(&client_config(&profile)), Some(key));
+
+        for text in [
+            format!("[Interface]\nPrivateKey={key}\n"),
+            format!("[Interface]\n   PrivateKey   =   {key}   \n"),
+            format!("[Interface]\r\nprivatekey = {key}\r\n"),
+            format!("[Interface]\nPRIVATEKEY = {key}\n[Peer]\n"),
+        ] {
+            assert_eq!(private_key_line(&text), Some(key), "{text:?}");
+        }
+
+        // Nothing to find is `None`, and §6.3 turns that into "join
+        // again" rather than into a repair anago cannot make.
+        assert_eq!(private_key_line(""), None);
+        assert_eq!(
+            private_key_line("[Interface]\nAddress = 10.100.0.2/24\n"),
+            None
+        );
+        assert_eq!(
+            private_key_line("[Peer]\nPublicKey = c2VydmVyIGtleQ==\n"),
+            None,
+            "a public key is not a private one"
+        );
+        // A commented-out line is not a setting. wg-quick reads `#`
+        // as a comment, and so does this.
+        assert_eq!(private_key_line(&format!("# PrivateKey = {key}\n")), None);
     }
 
     #[test]

@@ -13,7 +13,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anago_core::json;
 use anago_core::name::DeviceName;
 use anago_core::proto::{
-    ApiError, ErrorCode, JoinRequest, JoinResponse, PeerInfo, PeersResponse, PATH_JOIN, PATH_PEERS,
+    ApiError, ErrorCode, HubInfo, JoinRequest, JoinResponse, PeerInfo, PeersResponse, PATH_JOIN,
+    PATH_PEERS,
 };
 use anago_core::state::{Registration, ServerState};
 use anago_core::token::{DeviceToken, TokenHash};
@@ -246,6 +247,12 @@ fn unauthorized() -> ApiError {
 
 /// The peer list as `GET /peers` reports it — including the caller,
 /// which is how a device sees its own address without storing it twice.
+///
+/// **The hub also describes itself** (§6.3). Without that a device has
+/// nothing to compare its own config against, and `sync` would have to
+/// say "in sync" on no evidence. The four values are the ones `join`
+/// already handed out, built the same way from the same state so the
+/// two answers cannot drift.
 pub fn decide_peers(state: &ServerState) -> PeersResponse {
     PeersResponse {
         peers: state
@@ -257,7 +264,23 @@ pub fn decide_peers(state: &ServerState) -> PeersResponse {
                 address: peer.address.to_string(),
             })
             .collect(),
+        hub: Some(HubInfo {
+            subnet: state.subnet.to_string(),
+            server_public_key: state.server.public_key.clone(),
+            server_endpoint: server_endpoint(state),
+            server_address: state.subnet.server_address().to_string(),
+        }),
     }
+}
+
+/// `host:port` a device dials for the tunnel.
+///
+/// One function because two callers have to agree: `join` hands this to
+/// a device, and `/peers` repeats it so the device can check its copy.
+/// Two spellings would make every sync see a difference that is not
+/// one.
+pub fn server_endpoint(state: &ServerState) -> String {
+    format!("{}:{}", state.domain, state.listen_port)
 }
 
 /// Removes `name`, answering with what was removed.
@@ -334,7 +357,7 @@ pub fn decide_join(
         subnet: state.subnet.to_string(),
         token: token.as_str().to_string(),
         server_public_key: state.server.public_key.clone(),
-        server_endpoint: format!("{}:{}", state.domain, state.listen_port),
+        server_endpoint: server_endpoint(state),
         server_address: state.subnet.server_address().to_string(),
     })
 }
@@ -756,7 +779,7 @@ mod tests {
     }
 
     #[test]
-    fn the_peer_list_carries_identity_and_nothing_else() {
+    fn each_peer_carries_identity_and_nothing_else() {
         let (state, _, _) = network();
         let listed = decide_peers(&state);
         assert_eq!(listed.peers.len(), 2);
@@ -765,15 +788,53 @@ mod tests {
         assert_eq!(listed.peers[1].name, "맥북");
         assert_eq!(listed.peers[1].address, "10.100.0.3");
 
-        // The wire form has no endpoint, no handshake, no token (§8).
-        let text = json::to_string(&listed.to_json());
+        // A peer is a name, a key and an address. No token, and no
+        // liveness — a device's own endpoint is M2's `/endpoint` and
+        // needs a meaning defined first (§9.1).
+        let text = json::to_string(&listed.peers[0].to_json());
         for absent in ["endpoint", "last_seen", "token", "handshake"] {
+            assert!(!text.contains(absent), "{absent} leaked into {text}");
+        }
+
+        let text = json::to_string(&listed.to_json());
+        for absent in ["token", "last_seen", "handshake", "private"] {
             assert!(!text.contains(absent), "{absent} leaked into {text}");
         }
         assert_eq!(
             PeersResponse::from_json(&json::parse(&text).unwrap()).unwrap(),
             listed
         );
+    }
+
+    #[test]
+    fn the_hub_describes_itself_the_same_way_twice() {
+        // §6.3: `sync` compares a device's config against these, so
+        // they have to be the values `join` handed that device — the
+        // same strings, built from the same state. Two spellings would
+        // make every sync see a difference that is not one.
+        let (mut state, _, _) = network();
+        state.codes.push(IssuedCode::issue(
+            JoinCode::parse("STVW-XYZ2").unwrap(),
+            NOW,
+            DEFAULT_TTL_SECS,
+        ));
+        let token = DeviceToken::parse(&"33".repeat(32)).unwrap();
+        let joined = decide_join(
+            &mut state,
+            request("STVW-XYZ2", "laptop"),
+            token.clone(),
+            secret::hash_token(&token),
+            NOW,
+        )
+        .expect("a fresh code");
+
+        let hub = decide_peers(&state)
+            .hub
+            .expect("an M1 hub describes itself");
+        assert_eq!(hub.subnet, joined.subnet);
+        assert_eq!(hub.server_public_key, joined.server_public_key);
+        assert_eq!(hub.server_endpoint, joined.server_endpoint);
+        assert_eq!(hub.server_address, joined.server_address);
     }
 
     #[test]
