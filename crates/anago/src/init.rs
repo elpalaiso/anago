@@ -206,6 +206,25 @@ fn still_yours(state: &ServerState, dns: &Dns, public_ip: Option<Ipv4Addr>, now:
         state.api_port
     ));
     out.push_str(&format!("     {}/udp WireGuard\n", state.listen_port));
+    // A home hub sits behind a consumer router (often two — ISP box
+    // plus your own): the same ports must be forwarded there to this
+    // machine, on every layer (§11.1 결정 5).
+    if cfg!(windows) {
+        out.push_str(&format!(
+            "\n     Windows Defender (elevated PowerShell):\n\
+             \x20      netsh advfirewall firewall add rule name=\"anago api\" dir=in action=allow protocol=TCP localport={}\n\
+             \x20      netsh advfirewall firewall add rule name=\"anago wg\" dir=in action=allow protocol=UDP localport={}\n\
+             \x20    And IPv4 forwarding, so devices can reach each other through this hub:\n\
+             \x20      Set-NetIPInterface -InterfaceAlias anago -Forwarding Enabled\n\
+             \x20    Home network: forward the same ports on your router(s) to this PC.\n",
+            state.api_port, state.listen_port
+        ));
+    } else {
+        out.push_str(
+            "\n     Home network: if this hub sits behind a router, forward the same\n\
+             \x20    ports there to this machine (two routers = forward on both).\n",
+        );
+    }
     if wants_port_80(state) {
         // HTTP-01 answers the challenge on :80 again at every renewal.
         // A firewall that let the first issuance through and was then
@@ -768,20 +787,22 @@ pub fn run(
 
     // No systemd on this host means no unit to install, whatever the
     // flag says — offering one would leave a file nothing reads.
-    let start = if args.systemd && systemd::is_available() {
-        match systemd::install(
+    // The platform's service manager, behind one seam (§11.1 결정 3):
+    // systemd, the Windows SCM, or launchd. No manager on this host
+    // means nothing to install, whatever the flag says.
+    let start = if args.systemd && crate::service::is_available() {
+        match crate::service::install(
             &std::env::current_exe().unwrap_or_else(|_| PathBuf::from("anago")),
             root,
             wg_dir,
             Path::new(&state.tls.cert_path),
             Path::new(&state.tls.key_path),
-            Path::new(systemd::UNIT_DIR),
         ) {
-            Ok(path) => systemd_note(&path),
+            Ok(note) => note,
             Err(e) => {
                 // The hub is configured either way; only the babysitter
                 // is missing, and the operator can still run it by hand.
-                warnings.push(format!("could not install the systemd unit: {e}"));
+                warnings.push(format!("could not install the hub service: {e}"));
                 foreground_hint()
             }
         }

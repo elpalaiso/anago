@@ -47,6 +47,70 @@ pub const LOG: &str = "/var/log/anago-sync.log";
 /// The tool that loads it.
 pub const LAUNCHCTL: &str = "launchctl";
 
+/// The hub daemon's label (§11.1 결정 3) — the sync label minus its
+/// `.sync` suffix, so the two read as one family in `launchctl list`.
+pub const SERVER_LABEL: &str = "com.github.elpalaiso.anago";
+
+/// Where LaunchDaemons live on every mac.
+pub const DAEMONS_DIR: &str = "/Library/LaunchDaemons";
+
+/// Where the hub daemon's output goes.
+pub const SERVER_LOG: &str = "/var/log/anago.log";
+
+/// Full path of the installed hub daemon.
+pub fn server_plist_path(dir: &Path) -> PathBuf {
+    dir.join(format!("{SERVER_LABEL}.plist"))
+}
+
+/// The hub daemon's service target.
+pub fn server_target() -> String {
+    format!("{DOMAIN}/{SERVER_LABEL}")
+}
+
+/// The hub daemon's property list (§11.1 결정 3): start at boot, keep
+/// it alive, both streams to one log. `KeepAlive` is what systemd's
+/// `Restart=` is on Linux — the hub is the coordination plane and the
+/// renewal loop, and a mac mini hub with nobody logged in still has to
+/// answer joins.
+pub fn server_plist(exec: &Path) -> Result<String, Unrepresentable> {
+    let exec = string(exec)?;
+    Ok(format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>{SERVER_LABEL}</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>{exec}</string>
+		<string>server</string>
+		<string>run</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>{SERVER_LOG}</string>
+	<key>StandardErrorPath</key>
+	<string>{SERVER_LOG}</string>
+</dict>
+</plist>
+"#
+    ))
+}
+
+/// `launchctl bootout system/<server label>`.
+pub fn bootout_server() -> Cmd {
+    Cmd::new(LAUNCHCTL, &["bootout", &server_target()])
+}
+
+/// `launchctl print system/<server label>` — exit 0 while loaded.
+pub fn print_server() -> Cmd {
+    Cmd::new(LAUNCHCTL, &["print", &server_target()])
+}
+
 /// Full path of the installed daemon.
 pub fn plist_path(dir: &Path) -> PathBuf {
     dir.join(format!("{LABEL}.plist"))

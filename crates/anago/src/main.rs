@@ -38,6 +38,7 @@ mod renew;
 mod rm;
 mod secret;
 mod serve;
+mod service;
 mod store;
 mod sync;
 mod systemd;
@@ -45,6 +46,7 @@ mod timer;
 mod tls;
 mod wg;
 mod wgapply;
+mod winsvc;
 
 use cli::Command;
 
@@ -75,7 +77,15 @@ fn main() {
         Command::Help(topic) => print!("{}", cli::help(topic.as_deref())),
         Command::ServerInit(args) => server_init(&args),
         Command::ServerRenew(args) => server_renew(&args),
-        Command::ServerRun => server_run(),
+        Command::ServerRun { service } => {
+            #[cfg(windows)]
+            if service {
+                winsvc::run();
+            }
+            #[cfg(not(windows))]
+            let _ = service;
+            server_run()
+        },
         Command::Sync(args) => sync_device(&args),
         Command::Code => match code::run(&paths::default_server_root(), now()) {
             Ok(text) => print!("{text}"),
