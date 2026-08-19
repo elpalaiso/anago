@@ -432,6 +432,7 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use anago_core::code::{IssuedCode, JoinCode, DEFAULT_TTL_SECS};
+    use anago_core::name::DeviceName;
     use anago_core::state::{PrivateKey, ServerKeys, Tls};
     use anago_core::subnet::Subnet;
 
@@ -502,6 +503,100 @@ mod tests {
         assert_eq!(state.peers[0].created_at, NOW);
         // And the code is spent.
         assert_eq!(state.codes[0].used_at, Some(NOW));
+    }
+
+    #[test]
+    fn a_phone_registered_by_export_is_an_ordinary_device_on_the_hub() {
+        // `join --export` registers a phone on another machine's
+        // behalf, and §8 says the hub cannot tell — same endpoint, same
+        // body, same everything. So the test sends the body the export
+        // path actually builds, rather than one shaped like it: if
+        // `request_body` ever drifts, this stops compiling or stops
+        // matching, instead of passing about a body nobody sends.
+        let body = crate::join::request_body(
+            &JoinCode::parse(CODE).unwrap(),
+            &DeviceName::parse("폰").unwrap(),
+            PUBKEY,
+        );
+        let request = JoinRequest::from_json(&json::parse(&body).unwrap()).unwrap();
+
+        let mut state = fresh_state();
+        let response = join_with(&mut state, request).unwrap();
+        assert_eq!(response.name, "폰");
+        assert_eq!(response.address, "10.100.0.2");
+
+        // Registered like anything else: a name, an address, the public
+        // half, and the hash of a token — never the token (§7.1).
+        assert_eq!(state.peers.len(), 1);
+        let phone = &state.peers[0];
+        assert_eq!(phone.name.to_string(), "폰");
+        assert_eq!(phone.address, "10.100.0.2".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(phone.public_key, PUBKEY);
+        assert_eq!(phone.token_hash, secret::hash_token(&token().0));
+        assert_eq!(phone.created_at, NOW);
+        assert_eq!(phone.last_seen, None, "it has never called and never will");
+
+        // The token the hub minted is thrown away by the export path
+        // (§8) — the official app has no anago to spend it with. The
+        // hub does not know that and must not: a device it cannot hear
+        // from is still a device it routes for.
+        assert_eq!(response.token, "ab".repeat(32));
+    }
+
+    #[test]
+    fn ls_and_rm_handle_a_phone_like_any_other_device() {
+        // The consequence of the above, and the thing a person actually
+        // does: the phone shows up in the list and comes out with `rm`.
+        // It cannot do either itself — no anago, no token — so if these
+        // two did not work on it, nothing would.
+        let mut state = fresh_state();
+        state.codes.push(IssuedCode::issue(
+            JoinCode::parse("HJKM-NPQR").unwrap(),
+            NOW,
+            DEFAULT_TTL_SECS,
+        ));
+        join_with(&mut state, request(CODE, "맥북")).unwrap();
+        join_with(
+            &mut state,
+            JoinRequest {
+                public_key: "Xtt7u1I5qnMB8k6yMkjTDpJAc+3tPLPV9dg/yeb+qdE=".to_string(),
+                ..request("HJKM-NPQR", "폰")
+            },
+        )
+        .unwrap();
+
+        // `anago ls` on the hub reads the state file.
+        let rows = crate::ls::rows_from_state(&state, None);
+        assert_eq!(
+            rows.iter().map(|row| row.name.clone()).collect::<Vec<_>>(),
+            ["맥북", "폰"]
+        );
+        let table = anago_core::render::peer_table(&rows, NOW);
+        assert!(table.contains("폰"), "{table}");
+        assert!(table.contains("10.100.0.3"), "{table}");
+
+        // `anago ls` on a *device* reads the API's answer, and the
+        // phone is in that too — the laptop can see it.
+        let listed = decide_peers(&state);
+        assert!(
+            listed.peers.iter().any(|peer| peer.name == "폰"),
+            "{listed:?}"
+        );
+        let rows = crate::ls::rows_from_response(&listed).unwrap();
+        assert!(rows.iter().any(|row| row.name == "폰"));
+
+        // And `anago rm 폰`, from the hub or from the laptop — the same
+        // decision either way.
+        let removed = decide_remove(&mut state, "폰").unwrap();
+        assert_eq!(removed.address, "10.100.0.3");
+        assert_eq!(state.peers.len(), 1, "the laptop stays");
+        assert!(!crate::ls::rows_from_state(&state, None)
+            .iter()
+            .any(|row| row.name == "폰"));
+
+        // Twice is a missing device, not an error about a phone.
+        let e = decide_remove(&mut state, "폰").unwrap_err();
+        assert_eq!(e.code, ErrorCode::NotFound);
     }
 
     #[test]

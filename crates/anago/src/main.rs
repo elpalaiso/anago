@@ -347,9 +347,10 @@ fn export_phone(args: &cli::Join, export: cli::Export) -> ! {
         Ok(exported) => {
             // The config itself has already gone to stdout or to the
             // file; everything else goes to stderr, so a pipe carries
-            // the config alone (§7.3).
+            // the config alone (§7.3). The blank line first is for the
+            // QR, which ends flush against whatever comes next.
             eprintln!(
-                "Registered {name} — the phone is {address} on {subnet}.",
+                "\nRegistered {name} — the phone is {address} on {subnet}.\n",
                 address = exported.config.address,
                 subnet = exported.config.subnet
             );

@@ -716,7 +716,15 @@ impl Drop for Claimed {
 /// of them wrong whenever the guess missed. The same sentence every
 /// time is the one that can be relied on.
 pub fn export_note(name: &DeviceName, handed: &Handed) -> String {
-    let mut note = String::from("This is the phone's private key, in plain text.\n\n");
+    // A QR is not plain text on the screen, and calling it that would
+    // let somebody think the picture is safer than the words. It is the
+    // same key; anything that can read the code has it.
+    let mut note = String::from(match handed {
+        Handed::Qr => {
+            "This code carries the phone's private key. Anything that can\nread it has the key.\n\n"
+        }
+        Handed::Text | Handed::File(_) => "This is the phone's private key, in plain text.\n\n",
+    });
     match handed {
         Handed::File(path) => note.push_str(&indented(&[
             &format!(
@@ -731,10 +739,16 @@ pub fn export_note(name: &DeviceName, handed: &Handed) -> String {
             "~/Documents copies itself somewhere quietly.",
         ])),
         Handed::Text => note.push_str(&indented(&[
-            "Move it to the phone, then clear this terminal's",
-            "scrollback — `clear` does not do that, and some",
-            "terminals keep scrollback on disk. Over SSH it is in",
-            "the scrollback at both ends.",
+            "Move it to the phone, then take it off the screen and out",
+            "of the record. Both: neither on its own is enough.",
+            "",
+            "`clear` (or Ctrl-L) takes it off the screen — and puts it",
+            "in the scrollback. So clear that next, with your terminal's",
+            "own command: Clear Scrollback in its menu, or",
+            "`clear-history` under tmux. In that order nothing is left;",
+            "clearing the record first only files the screen away after",
+            "it. Some terminals keep scrollback on disk, and over SSH",
+            "it is at both ends.",
             "",
             "For a file, use --out rather than `>`: a shell redirect",
             "takes its mode from your umask, which is usually 0644.",
@@ -745,10 +759,18 @@ pub fn export_note(name: &DeviceName, handed: &Handed) -> String {
         // `--export qr` takes none, because anago writes no image
         // files (§10.2).
         Handed::Qr => note.push_str(&indented(&[
-            "Scan it, then clear this terminal's scrollback — `clear`",
-            "does not do that, and some terminals keep scrollback on",
-            "disk. A photograph of the screen keeps it too, and a QR",
-            "is the shape people photograph.",
+            "Scan it, then take it off the screen and out of the",
+            "record. Both: neither on its own is enough.",
+            "",
+            "`clear` (or Ctrl-L) takes it off the screen — and puts it",
+            "in the scrollback. So clear that next, with your terminal's",
+            "own command: Clear Scrollback in its menu, or",
+            "`clear-history` under tmux, which empties the record and",
+            "leaves what is on the pane exactly where it is. In that",
+            "order nothing is left.",
+            "",
+            "A photograph of the screen keeps it too, and a QR is the",
+            "shape people photograph.",
             "",
             "For a file instead, `--export conf --out <path>` writes",
             "one at 0600.",
@@ -1611,6 +1633,12 @@ mod tests {
         assert!(after.to_string().contains("/tmp/phone.conf"), "{after}");
     }
 
+    /// A note's words, with the hand-made wrapping taken back out —
+    /// so an assertion is about what it says, not where a line broke.
+    fn flowed(note: &str) -> String {
+        note.lines().map(str::trim).collect::<Vec<_>>().join(" ")
+    }
+
     #[test]
     fn the_note_says_what_leaked_and_what_to_do_about_it() {
         let name = DeviceName::parse("폰").unwrap();
@@ -1640,6 +1668,41 @@ mod tests {
         assert!(drawn.contains("photograph"), "{drawn}");
         assert!(!drawn.contains("--out rather than"), "{drawn}");
         assert!(drawn.contains("--export conf --out <path>"), "{drawn}");
+        // A picture is not safer than the words, and calling it plain
+        // text would let somebody believe it is.
+        assert!(!drawn.contains("in plain text"), "{drawn}");
+        assert!(
+            flowed(&drawn).contains("Anything that can read it has the key"),
+            "{drawn}"
+        );
+
+        // §7.3: the key is on the screen *and* in the record, and the
+        // two are cleared by different commands. `clear` empties the
+        // screen and files it into the scrollback; `clear-history`
+        // empties the scrollback and leaves the pane as it is. A note
+        // that named only one would read as a complete instruction and
+        // leave the key in the half it did not mention.
+        for screen in [&piped, &drawn] {
+            let said = flowed(screen);
+            assert!(
+                said.contains("off the screen and out of the record"),
+                "{screen}"
+            );
+            assert!(said.contains("neither on its own is enough"), "{screen}");
+            // The screen half, and the record half.
+            assert!(
+                said.contains("`clear` (or Ctrl-L) takes it off the screen"),
+                "{screen}"
+            );
+            assert!(said.contains("puts it in the scrollback"), "{screen}");
+            assert!(said.contains("Clear Scrollback in its menu"), "{screen}");
+            assert!(said.contains("`clear-history` under tmux"), "{screen}");
+            // And the order, which is not arbitrary: clearing the
+            // record first only files the screen away after it.
+            assert!(said.contains("In that order"), "{screen}");
+        }
+        // A file leaves nothing on the screen to clear.
+        assert!(!filed.contains("scrollback"), "{filed}");
 
         for note in [piped, filed, drawn] {
             assert!(note.contains("The hub knows this phone as 폰"), "{note}");
