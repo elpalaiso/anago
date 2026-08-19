@@ -286,6 +286,19 @@ fn join_device(args: &cli::Join) -> ! {
             );
             if outcome.is_working() {
                 print!("{report}");
+                // Advice, not an install: the periodic sync is a
+                // convenience rather than a correctness requirement
+                // (§6.3), so joining does not quietly leave a
+                // recurring root job behind. An unreadable answer
+                // about what is already installed is not join's
+                // problem — the advice is advice.
+                let machine = timer::scheduler_here();
+                let present = timer::present_here(
+                    machine,
+                    std::path::Path::new(systemd::UNIT_DIR),
+                    std::path::Path::new(launchd::DAEMON_DIR),
+                );
+                print!("\n{}", timer::advice(machine, present));
                 std::process::exit(0);
             }
             eprint!("{report}");

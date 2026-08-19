@@ -438,6 +438,17 @@ pub fn disable_sync_timer() -> Cmd {
     Cmd::new(SYSTEMCTL, &["disable", "--now", SYNC_TIMER])
 }
 
+/// `systemctl cat anago-sync.service` — prints the unit, and with it
+/// the `--config` path baked into its command line.
+///
+/// The one command that answers "which device file does the schedule
+/// read?", which §8 makes the question worth asking: a unit resolved
+/// in the wrong user's session reads root's `device.json` and syncs
+/// nothing anybody joined with.
+pub fn cat_sync_service() -> Cmd {
+    Cmd::new(SYSTEMCTL, &["cat", SYNC_SERVICE])
+}
+
 /// `systemctl is-active anago-sync.timer` — exit 0 while it is armed.
 ///
 /// Asked after a stop that failed, to turn "the command returned

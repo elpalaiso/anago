@@ -332,9 +332,10 @@ pub fn report(plan: &Plan, device_file: &Path) -> String {
              {}\n\n     \
              It syncs {device}.\n     \
              `systemctl list-timers 'anago-sync*'` says when it next fires, and\n     \
-             `systemctl cat anago-sync.service` shows the file it reads.\n",
+             `{}` shows the file it reads.\n",
             service.path.display(),
-            timer.path.display()
+            timer.path.display(),
+            systemd::cat_sync_service().display()
         ),
         Plan::Launchd { plist } => format!(
             "The sync daemon is installed and running:\n     \
@@ -562,6 +563,153 @@ pub fn rewind(plan: &Plan, failed: usize) -> Vec<Step> {
     }
 }
 
+/// The schedule already on this machine, if any.
+///
+/// One question, asked by two commands: `--install-timer` refuses when
+/// the answer is not empty, and `join` uses it to decide whether to
+/// mention installing one at all.
+///
+/// **Human verification needed**: looks in `/etc/systemd/system` or
+/// `/Library/LaunchDaemons`.
+pub fn schedule_here(
+    machine: Scheduler,
+    unit_dir: &Path,
+    daemon_dir: &Path,
+) -> Result<Vec<PathBuf>, TimerError> {
+    let mut here = Vec::new();
+    for path in removal(machine, unit_dir, daemon_dir).files() {
+        if look(path)? {
+            here.push(path.to_path_buf());
+        }
+    }
+    Ok(here)
+}
+
+/// How much of a schedule is on this machine.
+///
+/// What the files can support, and nothing beyond it. A unit on disk
+/// does not say whether systemd has it armed, and neither says which
+/// `device.json` is baked into its command line — a schedule installed
+/// from another user's session reads that user's file and syncs
+/// nothing this device joined with (§8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Present {
+    /// None of its files are here.
+    None,
+    /// Some of them, but not all. Nothing runs from that: a
+    /// `anago-sync.timer` with no `anago-sync.service` beside it starts
+    /// nothing, and neither does the reverse.
+    Partial,
+    /// Every file is here.
+    Files,
+}
+
+/// How much of `expected` files turned up.
+pub fn present(expected: usize, found: usize) -> Present {
+    match found {
+        0 => Present::None,
+        found if found >= expected => Present::Files,
+        _ => Present::Partial,
+    }
+}
+
+/// [`present`] against this machine.
+///
+/// **Human verification needed**: looks in `/etc/systemd/system` or
+/// `/Library/LaunchDaemons`.
+pub fn present_here(machine: Scheduler, unit_dir: &Path, daemon_dir: &Path) -> Present {
+    let expected = removal(machine, unit_dir, daemon_dir).files().len();
+    // An answer that cannot be read counts as nothing found. Of the two
+    // ways to be wrong, offering an install that a schedule already
+    // there would loudly refuse beats claiming one is there when it is
+    // not, which nobody ever finds out.
+    let found = schedule_here(machine, unit_dir, daemon_dir)
+        .unwrap_or_default()
+        .len();
+    present(expected, found)
+}
+
+/// What `join` says, once the tunnel is up, about staying in step.
+///
+/// **Advice, never an install.** §6.3 makes the periodic sync a
+/// convenience rather than a correctness requirement: the hub routes
+/// every device, so one that never syncs still reaches all of them.
+/// Two things follow.
+///
+/// Installing a recurring root job as a side effect of joining is a
+/// larger step than the one that was asked for — and it would hand
+/// `join` a way to fail that has nothing to do with whether the tunnel
+/// works, on the command whose whole job is to get the tunnel working.
+/// `server init` installs its unit for the opposite reason: a hub that
+/// is not running is not a hub, while a device that is not syncing is
+/// still on the network.
+///
+/// It also has to be true on the machine it is printed on. Telling
+/// somebody to install a timer they already have, or one this machine
+/// has nothing to install with, is advice that wastes the one moment
+/// they were paying attention.
+///
+/// **And no further than the files reach.** Finding a unit is not
+/// finding a working schedule: it may be disarmed, or switched off in
+/// System Settings, or carrying another user's `--config`. So the
+/// wording for a schedule that is here stops at "here" and hands over
+/// the commands that answer the rest.
+pub fn advice(machine: Scheduler, present: Present) -> String {
+    let every = systemd::span(crate::cli::DEFAULT_INTERVAL);
+    match present {
+        Present::Partial => format!(
+            "Some of a sync schedule's files are here, but not all of them — which\n\
+             runs nothing at all. `sudo anago sync --uninstall-timer` clears what is\n\
+             left, and `--install-timer` then installs a whole one that checks the\n\
+             hub every {every}.\n"
+        ),
+        Present::Files => {
+            // Two questions the files cannot answer, and the commands
+            // that can. On a mac one command answers both, because
+            // `print` shows ProgramArguments alongside the state.
+            let asks = match machine {
+                Scheduler::Launchd => format!(
+                    "     sudo {}\n\n     \
+                     macOS can also switch it off under Login Items & Extensions in\n     \
+                     System Settings, which looks exactly like one that never runs.\n",
+                    launchd::print().display()
+                ),
+                _ => format!(
+                    "     {}\n     {}\n",
+                    systemd::is_active_sync_timer().display(),
+                    systemd::cat_sync_service().display()
+                ),
+            };
+            format!(
+                "A sync schedule is already installed here. That its files are in\n\
+                 place does not say whether it is running, or which device file it\n\
+                 reads:\n\n\
+                 {asks}\n     \
+                 If it is not running, or reads a different device file, `sudo anago\n     \
+                 sync --uninstall-timer` and then `--install-timer` puts one here\n     \
+                 that reads this device's.\n"
+            )
+        }
+        Present::None => match machine {
+            Scheduler::Systemd | Scheduler::Launchd => format!(
+                "Nothing here watches the hub for changes yet, and nothing has to —\n\
+                 the hub routes every device, so this tunnel works either way. A check\n\
+                 every {every} is how you hear about a new server key, or about this\n\
+                 device being removed:\n\n     \
+                 sudo anago sync --install-timer\n\n     \
+                 `anago sync` runs one check now and installs nothing.\n"
+            ),
+            Scheduler::Neither => format!(
+                "Nothing here watches the hub for changes yet, and nothing has to —\n\
+                 the hub routes every device, so this tunnel works either way. This\n\
+                 machine has neither systemd nor launchd, so there is no schedule to\n\
+                 install; `sudo anago sync --install-timer` prints the crontab line for\n\
+                 a check every {every}, and `anago sync` runs one now.\n"
+            ),
+        },
+    }
+}
+
 /// Installs and starts it.
 ///
 /// **Human verification needed**: writes into `/etc/systemd/system` or
@@ -570,15 +718,7 @@ pub fn rewind(plan: &Plan, failed: usize) -> Vec<Step> {
 pub fn install(machine: Scheduler, setup: &Setup) -> Result<String, TimerError> {
     let have = Existing {
         joined: look(setup.device_file)?,
-        schedule: {
-            let mut here = Vec::new();
-            for path in removal(machine, setup.unit_dir, setup.daemon_dir).files() {
-                if look(path)? {
-                    here.push(path.to_path_buf());
-                }
-            }
-            here
-        },
+        schedule: schedule_here(machine, setup.unit_dir, setup.daemon_dir)?,
     };
     let plan = plan(machine, &have, setup)?;
 
@@ -717,7 +857,7 @@ pub fn uninstall(removal: &Removal) -> Result<String, TimerError> {
         return Err(TimerError::NotStopped {
             why,
             confirmed: state == Stopped::StillThere,
-            check: check_command(removal),
+            check: check_command(removal.scheduler()),
         });
     }
     Ok(removal_report(removal, &gone, state))
@@ -750,11 +890,13 @@ fn still_loaded(removal: &Removal) -> Option<bool> {
 
 /// How a person checks for themselves, in the one message that has to
 /// ask them to.
-fn check_command(removal: &Removal) -> String {
-    match removal {
-        Removal::Systemd { .. } => format!("`{}`", systemd::is_active_sync_timer().display()),
-        Removal::Launchd { .. } => format!("`sudo {}`", launchd::print().display()),
-        Removal::Neither => String::new(),
+pub fn check_command(machine: Scheduler) -> String {
+    match machine {
+        Scheduler::Systemd => format!("`{}`", systemd::is_active_sync_timer().display()),
+        // `print` shows ProgramArguments too, so on a mac one command
+        // answers both "is it there?" and "what does it read?".
+        Scheduler::Launchd => format!("`sudo {}`", launchd::print().display()),
+        Scheduler::Neither => String::new(),
     }
 }
 
@@ -1346,6 +1488,164 @@ mod tests {
     }
 
     #[test]
+    fn joining_offers_the_timer_and_never_installs_it() {
+        // §6.3 makes the periodic sync a convenience, not a
+        // correctness requirement — so `join` must not leave a
+        // recurring root job behind as a side effect, and must not
+        // acquire a way to fail that has nothing to do with the tunnel
+        // it was asked to bring up.
+        for machine in [Scheduler::Systemd, Scheduler::Launchd, Scheduler::Neither] {
+            let text = advice(machine, Present::None);
+            assert!(
+                text.contains("sudo anago sync --install-timer"),
+                "{machine:?}: {text}"
+            );
+            // Says what it did not do, in both directions.
+            assert!(text.contains("nothing has to"), "{machine:?}: {text}");
+            assert!(
+                text.contains("works either way"),
+                "the tunnel does not depend on it: {machine:?}: {text}"
+            );
+            for claim in ["is installed", "is running", "was installed"] {
+                assert!(!text.contains(claim), "{machine:?} claims {claim}: {text}");
+            }
+            // The period it offers is the one the command defaults to.
+            assert!(text.contains("5min"), "{machine:?}: {text}");
+        }
+        // The bare offer belongs to an empty machine only: with files
+        // already there, `--install-timer` on its own refuses.
+        for machine in [Scheduler::Systemd, Scheduler::Launchd] {
+            for present in [Present::Files, Present::Partial] {
+                let text = advice(machine, present);
+                assert!(
+                    !text.contains("sudo anago sync --install-timer"),
+                    "{machine:?} {present:?}: {text}"
+                );
+            }
+        }
+
+        // And one check now is always the smaller alternative.
+        assert!(
+            advice(Scheduler::Systemd, Present::None).contains("`anago sync` runs one check now")
+        );
+        assert!(advice(Scheduler::Neither, Present::None).contains("`anago sync` runs one now"));
+    }
+
+    #[test]
+    fn a_machine_that_cannot_schedule_is_told_so_here_too() {
+        // Sending somebody to `--install-timer` and letting them find
+        // out there is the wasted version of the one moment they were
+        // paying attention.
+        let text = advice(Scheduler::Neither, Present::None);
+        assert!(text.contains("neither systemd nor launchd"), "{text}");
+        assert!(text.contains("crontab line"), "{text}");
+        assert!(
+            !text.contains("no schedule to install\n     sudo"),
+            "{text}"
+        );
+        // The two that can schedule do not mention crontabs.
+        for machine in [Scheduler::Systemd, Scheduler::Launchd] {
+            assert!(
+                !advice(machine, Present::None).contains("crontab"),
+                "{machine:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn finding_the_files_is_not_finding_a_working_schedule() {
+        // A unit on disk does not say systemd has it armed, and neither
+        // says which `device.json` is baked into its command line — one
+        // installed from another user's session reads that user's file
+        // and syncs nothing this device joined with. So the wording
+        // stops at what the files support.
+        for (machine, asks) in [
+            (
+                Scheduler::Systemd,
+                vec![
+                    "systemctl is-active anago-sync.timer",
+                    "systemctl cat anago-sync.service",
+                ],
+            ),
+            (
+                Scheduler::Launchd,
+                vec!["sudo launchctl print system/com.github.elpalaiso.anago.sync"],
+            ),
+        ] {
+            let text = advice(machine, Present::Files);
+            // The limit is said outright rather than left to be
+            // inferred from what the sentence did not claim.
+            assert!(
+                text.contains(
+                    "That its files are in\nplace does not say whether it is running, \
+                     or which device file it\nreads"
+                ),
+                "{machine:?}: {text}"
+            );
+            // The claims the old wording made from the same evidence.
+            for claim in ["is watched", "being watched", "will sync", "is syncing"] {
+                assert!(!text.contains(claim), "{machine:?} claims {claim}: {text}");
+            }
+            for ask in asks {
+                assert!(text.contains(ask), "{machine:?} missing {ask}: {text}");
+            }
+            // The repair, when the answer to either question is the
+            // wrong one. `--install-timer` on its own would refuse.
+            let install = text.find("--install-timer").expect("names the repair");
+            let uninstall = text.find("--uninstall-timer").expect("names the repair");
+            assert!(uninstall < install, "{machine:?}: {text}");
+        }
+        // macOS has a third way to look installed and never run.
+        assert!(advice(Scheduler::Launchd, Present::Files).contains("Login Items"));
+    }
+
+    #[test]
+    fn half_a_schedule_is_told_apart_from_a_whole_one() {
+        // A timer with no service beside it starts nothing, and the
+        // reverse starts nothing either — but both leave a file, so
+        // "something is here" would read as "you are covered".
+        assert_eq!(present(2, 0), Present::None);
+        assert_eq!(present(2, 1), Present::Partial);
+        assert_eq!(present(2, 2), Present::Files);
+        // launchd installs one file, so it has no half.
+        assert_eq!(present(1, 0), Present::None);
+        assert_eq!(present(1, 1), Present::Files);
+        // A machine with nothing to install has nothing to find.
+        assert_eq!(present(0, 0), Present::None);
+
+        let text = advice(Scheduler::Systemd, Present::Partial);
+        assert!(text.contains("runs nothing at all"), "{text}");
+        let uninstall = text.find("--uninstall-timer").expect("clears it first");
+        let install = text.find("--install-timer").expect("then installs one");
+        assert!(uninstall < install, "{text}");
+        // Not the sentence for a whole one, and not the offer either.
+        assert!(!text.contains("already installed here"), "{text}");
+        assert!(!text.contains("nothing has to"), "{text}");
+    }
+
+    #[test]
+    fn the_advice_and_the_install_name_the_same_commands() {
+        // Two places tell people how to look at the schedule. They come
+        // from the same builders so they cannot drift into naming units
+        // that no longer exist.
+        assert_eq!(
+            systemd::cat_sync_service().display(),
+            "systemctl cat anago-sync.service"
+        );
+        let installed = report(&plan_for(Scheduler::Systemd, &linux()), linux().device_file);
+        for text in [installed, advice(Scheduler::Systemd, Present::Files)] {
+            assert!(
+                text.contains(&systemd::cat_sync_service().display()),
+                "{text}"
+            );
+        }
+        let mac_report = report(&plan_for(Scheduler::Launchd, &mac()), mac().device_file);
+        for text in [mac_report, advice(Scheduler::Launchd, Present::Files)] {
+            assert!(text.contains(&launchd::print().display()), "{text}");
+        }
+    }
+
+    #[test]
     fn a_schedule_is_never_replaced_in_place() {
         // Overwriting one means a failure at the step after the write
         // leaves neither the old schedule nor the new one, and putting
@@ -1665,11 +1965,11 @@ mod tests {
                 "`sudo launchctl print system/com.github.elpalaiso.anago.sync`",
             ),
         ] {
-            assert_eq!(check_command(&removal), check);
+            assert_eq!(check_command(removal.scheduler()), check);
             let known = TimerError::NotStopped {
                 why: "`launchctl bootout system/…` failed: Operation not permitted".to_string(),
                 confirmed: true,
-                check: check_command(&removal),
+                check: check_command(removal.scheduler()),
             };
             // "the files are gone" is not the same sentence as "it is
             // not running", so the message says both.
@@ -1683,7 +1983,7 @@ mod tests {
             let unknown = TimerError::NotStopped {
                 why: "`launchctl bootout system/…` failed: Operation not permitted".to_string(),
                 confirmed: false,
-                check: check_command(&removal),
+                check: check_command(removal.scheduler()),
             };
             assert!(
                 unknown.to_string().contains("could not be confirmed"),
